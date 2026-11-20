@@ -152,14 +152,19 @@ def run_client(C, frozen, out, label, fd, track, check_deadline):
 
     def expire():
         expired.set()
-        save(
-            directory / "censored.json",
-            {"deadline_mono": deadline, "observed_mono": time.monotonic()},
-        )
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        try:
+            save(
+                directory / "censored.json",
+                {"deadline_mono": deadline, "observed_mono": time.monotonic()},
+            )
+        except OSError:
+            logger.exception(
+                "Client terminated at deadline; censor receipt write failed"
+            )
 
     watchdog = threading.Timer(P["client_timeout_s"], expire)
     watchdog.daemon = True
@@ -523,7 +528,12 @@ def execute(frozen, plan_sha):
                 state["cleanup_error"] = repr(error)
             state["gpu_released"] = released
             state["finished"] = time.time()
-            save(out / "status.json", state)
+            try:
+                save(out / "status.json", state)
+            except OSError as error:
+                logger.exception("Cleanup receipt write failed; release still required")
+                state["state"] = "FAILED"
+                state["cleanup_write_error"] = repr(error)
             if released:
                 os.close(fd)
                 break
