@@ -4,8 +4,9 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
+import re
 import subprocess
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
@@ -219,6 +220,11 @@ def environment():
             "HF_DATASETS_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
             "ATOM_MONO_ENABLE": "1",
+            "ATOM_MONO_POLL_SLEEP_UNITS": "16",
+            "ATOM_MLA_ABSORB_BF16": "1",
+            "AITER_META_DIR": P["aiter_root"],
+            "AITER_ASM_DIR": str(Path(P["aiter_root"]) / "hsa"),
+            "OPUS_GEN_CO_DIR": str(Path(P["aiter_root"]) / "csrc/opus_gemm/gen_co"),
             "ATOM_ENABLE_REPLAYSSM": "1",
             "ATOM_GDN_SSM_DTYPE": "fp32",
             "AITER_SITUV2_A4W4": "1",
@@ -249,11 +255,25 @@ def environment():
             "DOCKER_IMAGE": "rocm/atom-dev:latest",
         }
     )
+    revision = Path(P["model"]) / ".cache/huggingface/download/config.json.metadata"
+    if revision.exists():
+        env["BENCHMARK_MODEL_REVISION"] = revision.read_text().splitlines()[0]
+    info = CLIENT / "venv/lib/python3.12/site-packages/aiperf/_build_info.py"
+    match = info.exists() and re.search(
+        r'COMMIT_SHA = "([0-9a-f]{40})"', info.read_text()
+    )
+    if match:
+        env["ATOM_HARNESS_SHA"] = match[1]
     return env
 
 
 def make_plan(out):
     server, cache, client = commands(out)
+    external = [
+        WS / "harness/common.py",
+        PRIVATE / "runtime-ready.json",
+        PRIVATE / "runtime-imports.json",
+    ]
     return {
         "head": git("rev-parse", "HEAD"),
         "base": P["base"],
@@ -267,6 +287,7 @@ def make_plan(out):
         "invocations": ["u1", "u2", "diagnostic"],
         "official_submission_eligible": False,
         "gpu_authorized_by_plan": False,
+        "readiness": {str(p): sha(p) if p.exists() else None for p in external},
     }
 
 

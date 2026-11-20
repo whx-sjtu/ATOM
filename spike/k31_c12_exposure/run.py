@@ -1,0 +1,461 @@
+"""Execute only the reviewed, bounded exposure plan; never a candidate run."""
+
+import argparse
+import importlib.util
+import json
+import logging
+import os
+import re
+import signal
+import subprocess
+import time
+from http.client import HTTPException
+from pathlib import Path
+from urllib.request import Request, urlopen
+
+from plan import PRIVATE, ROOT, WS, P, git, make_plan
+
+logger = logging.getLogger(__name__)
+COMMON = WS / "harness/common.py"
+LOCK = "/app/agent-team-scratch/g24-gpu.lock"
+PAUSE = WS / "lead/GPU_PAUSE"
+PHASE = re.compile(r"\bPhase \S+ \(profiling\) started\b")
+RANK_EVENT = re.compile(r"Rank (\d+): profiler (started|stop completed)")
+EXPORT = re.compile(r"Rank (\d+): trace exported to (\S+\.json\.gz)")
+RANKS = {str(rank) for rank in range(8)}
+
+
+def save(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
+
+
+def request(url, timeout=2, post=False):
+    with urlopen(Request(url, data=b"" if post else None), timeout=timeout) as response:
+        return response.read().decode()
+
+
+def command(argv, env, timeout, logfile):
+    with logfile.open("ab") as log:
+        result = subprocess.run(
+            argv,
+            check=False,
+            cwd=ROOT,
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+        )
+    if result.returncode:
+        raise RuntimeError(
+            f"command exited {result.returncode}: {argv[0]}; see {logfile}"
+        )
+
+
+def profile_window(url, out, server_log, trace_root):
+    t0 = time.monotonic()
+    cursor = server_log.stat().st_size
+    before = {str(p.resolve()) for p in trace_root.rglob("*.json.gz")}
+    evidence = {
+        "start_request_wall": time.time(),
+        "start_request_mono": t0,
+        "started": {},
+        "stopped": {},
+        "exports": {},
+        "errors": [],
+        "before_files": sorted(before),
+    }
+    pending = b""
+
+    def observe():
+        nonlocal cursor, pending
+        with server_log.open("rb") as source:
+            source.seek(cursor)
+            pending += source.read()
+            cursor = source.tell()
+        lines = pending.split(b"\n")
+        pending = lines.pop()
+        for raw in lines:
+            line = raw.decode(errors="replace")
+            now = time.monotonic()
+            match = RANK_EVENT.search(line)
+            if match:
+                rank, event = match.groups()
+                field = "started" if event == "started" else "stopped"
+                if field == "stopped" and rank not in evidence["started"]:
+                    evidence["errors"].append(f"rank {rank}: stop without fresh start")
+                if rank in evidence[field]:
+                    evidence["errors"].append(f"rank {rank}: duplicate {field}")
+                evidence[field][rank] = now
+            match = EXPORT.search(line)
+            if match:
+                evidence["exports"][match[1]] = match[2]
+            if "profiler stop failed" in line or "failed to export trace" in line:
+                evidence["errors"].append(line)
+
+    try:
+        evidence["start_response"] = json.loads(
+            request(url + "/start_profile", P["profile_start_timeout_s"], True)
+        )
+        evidence["start_ack_mono"] = time.monotonic()
+        end = time.monotonic() + P["profile_hold_s"]
+        while time.monotonic() < end:
+            observe()
+            time.sleep(0.05)
+    except (OSError, ValueError, HTTPException) as error:
+        evidence["errors"].append(f"start: {error!r}")
+    finally:
+        evidence["stop_request_mono"] = time.monotonic()
+        try:
+            evidence["stop_response"] = json.loads(
+                request(url + "/stop_profile", P["trace_export_timeout_s"], True)
+            )
+        except (OSError, ValueError, HTTPException) as error:
+            evidence["errors"].append(f"stop: {error!r}")
+        deadline = evidence["stop_request_mono"] + P["trace_export_timeout_s"]
+        while time.monotonic() < deadline:
+            observe()
+            if set(evidence["stopped"]) == RANKS:
+                break
+            time.sleep(0.1)
+        observe()
+        evidence["upper_bound_s"] = {
+            r: stopped - t0 for r, stopped in evidence["stopped"].items()
+        }
+        if set(evidence["stopped"]) != RANKS or set(evidence["exports"]) != RANKS:
+            evidence["errors"].append(
+                "all-rank stop/export completion was not observed"
+            )
+        save(out, evidence)
+    if evidence["errors"]:
+        raise RuntimeError(f"profiler control/export failed; no further window: {out}")
+    return evidence
+
+
+def run_client(C, frozen, out, label, fd, track, check_deadline):
+    directory = out / label
+    directory.mkdir()
+    argv = frozen["client"] + ["--output-artifact-dir", str(directory)]
+    env = frozen["environment"]
+    save(directory / "launch.json", {"argv": argv, "environment": env})
+    process = C.spawn(
+        argv,
+        env=env,
+        cwd=ROOT,
+        log_path=directory / "console.log",
+        lock_fd=fd,
+        cpus="0-111",
+    )
+    track(process)
+    deadline = time.monotonic() + P["client_timeout_s"]
+    phase, index, windows = None, 0, []
+    while process.poll() is None:
+        check_deadline()
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"{label} exceeded the external client bound")
+        logs = [directory / "logs/aiperf.log", directory / "console.log"]
+        if phase is None:
+            for log in logs:
+                if log.exists() and PHASE.search(log.read_text(errors="replace")):
+                    phase = time.monotonic()
+                    save(
+                        directory / "phase-start.json",
+                        {
+                            "observed_wall": time.time(),
+                            "observed_mono": phase,
+                            "source": str(log),
+                        },
+                    )
+                    break
+        if label == "diagnostic" and phase is not None and index < 2:
+            scheduled = phase + P["profile_offsets_s"][index]
+            if time.monotonic() >= scheduled:
+                if time.monotonic() - scheduled > 1:
+                    windows.append(
+                        {"window": index, "state": "missed; not rescheduled"}
+                    )
+                else:
+                    windows.append(
+                        profile_window(
+                            f"http://127.0.0.1:{P['port']}",
+                            directory / f"window{index}.json",
+                            out / "server.log",
+                            out / "traces",
+                        )
+                    )
+                index += 1
+        time.sleep(0.1)
+    save(
+        directory / "client-result.json",
+        {
+            "exit_code": process.returncode,
+            "phase_observed": phase is not None,
+            "windows": windows,
+            "instrumented": label == "diagnostic",
+        },
+    )
+    if (
+        process.returncode
+        or phase is None
+        or not (directory / "profile_export_aiperf.json").exists()
+    ):
+        raise RuntimeError(f"{label} produced no usable completed invocation")
+    from analyze import request_ledger
+
+    ledger = request_ledger(directory)
+    save(directory / "ledger.json", ledger)
+    if not ledger["usable_completed_requests"]:
+        raise RuntimeError(f"{label} request ledger failed; no implicit retry")
+
+
+def capture_metadata(frozen, out):
+    from atom.benchmarks.results.metadata import capture_config
+
+    env = frozen["environment"]
+    config = capture_config(
+        P["model"],
+        frozen["server"],
+        "agentic",
+        P["concurrency"],
+        {"argv": frozen["server"], "environment": env},
+    )
+    save(out / "installed-metadata-config.json", config)
+    receipt = json.loads((PRIVATE / "runtime-imports.json").read_text())
+    if not Path(receipt["atom_file"]).is_relative_to(ROOT) or not Path(
+        receipt["aiter_file"]
+    ).is_relative_to(P["aiter_root"]):
+        raise RuntimeError(
+            "runtime source receipt does not select the planned repositories"
+        )
+    config["software"]["aiter_sha"] = P["aiter_sha"]
+    config["software"]["aiter_sha_source"] = "verified_runtime_import_root"
+    save(out / "base-config.json", config)
+
+
+def execute(frozen):
+    import psutil
+
+    expected = make_plan(Path(frozen["output"]))
+    if frozen != expected or git("status", "--porcelain"):
+        raise RuntimeError("source or frozen plan changed")
+    if os.environ.get("K31_TASK6_GPU_GRANT") != frozen["head"]:
+        raise RuntimeError("no lease for this exact head")
+    if os.environ.get("KFD_GUARD_LOG") or os.nice(0) != 0:
+        raise RuntimeError("GPU work cannot inherit the CPU guard or nice19")
+    ready = json.loads((PRIVATE / "runtime-ready.json").read_text())
+    if not ready.get("ready"):
+        raise RuntimeError("runtime and cache closure is not ready")
+    spec = importlib.util.spec_from_file_location("owned_lifecycle", COMMON)
+    C = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(C)
+    out = Path(frozen["output"])
+    if out.exists():
+        raise FileExistsError(out)
+    fd = C.GpuLock(LOCK).acquire()
+    out.mkdir()
+    processes, seen = [], {}
+    state = {
+        "state": "STARTING",
+        "head": frozen["head"],
+        "started": time.time(),
+        "errors": [],
+        "admitted": False,
+    }
+    save(out / "plan.json", frozen)
+    deadline = time.monotonic() + P["workload_timeout_s"]
+
+    def track(process=None):
+        if process is not None:
+            processes.append(process)
+        for parent in processes:
+            candidates = {parent.pid, *C.descendants(parent.pid)}
+            for item in psutil.process_iter(["pid", "create_time"]):
+                try:
+                    if os.getpgid(item.pid) == parent.pid:
+                        candidates.add(item.pid)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            for pid in candidates:
+                try:
+                    seen.setdefault(pid, psutil.Process(pid).create_time())
+                except psutil.NoSuchProcess:
+                    pass
+        live = []
+        for pid, created in seen.items():
+            try:
+                proc = psutil.Process(pid)
+                if (
+                    proc.create_time() == created
+                    and proc.status() != psutil.STATUS_ZOMBIE
+                ):
+                    live.append(proc)
+            except psutil.NoSuchProcess:
+                pass
+        return live
+
+    def check_deadline():
+        track()
+        if time.monotonic() >= deadline:
+            raise TimeoutError("whole workload bound exceeded")
+
+    def interrupt(signum, frame):
+        for proc in processes:
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+        raise InterruptedError(f"signal {signum}")
+
+    signal.signal(signal.SIGTERM, interrupt)
+    signal.signal(signal.SIGINT, interrupt)
+    signal.signal(signal.SIGALRM, interrupt)
+    signal.setitimer(signal.ITIMER_REAL, P["workload_timeout_s"])
+    try:
+        state["before"] = C.assert_gpus_idle()
+        state["admitted"] = True
+        if PAUSE.exists():
+            raise RuntimeError("GPU_PAUSE exists")
+        C.assert_ports_free(
+            [
+                P[k]
+                for k in ("port", "cache_port", "cache_http_port", "cache_metrics_port")
+            ]
+        )
+        metadata_env = dict(
+            frozen["environment"], K31_TASK6_METADATA_LEASE=frozen["head"]
+        )
+        command(
+            [
+                "/opt/venv/bin/python",
+                str(Path(__file__).resolve()),
+                "--capture-metadata",
+                str(out / "plan.json"),
+            ],
+            metadata_env,
+            60,
+            out / "metadata.log",
+        )
+        env = frozen["environment"]
+        cache = C.spawn(
+            frozen["cache"],
+            env=env,
+            cwd=ROOT,
+            log_path=out / "cache.log",
+            lock_fd=fd,
+            cpus="0-111",
+        )
+        track(cache)
+        server = C.spawn(
+            frozen["server"],
+            env=env,
+            cwd=ROOT,
+            log_path=out / "server.log",
+            lock_fd=fd,
+            cpus="0-111",
+        )
+        track(server)
+        ready_deadline = time.monotonic() + P["readiness_timeout_s"]
+        while True:
+            check_deadline()
+            if server.poll() is not None or cache.poll() is not None:
+                raise RuntimeError("a server exited during readiness")
+            try:
+                models = json.loads(request(f"http://127.0.0.1:{P['port']}/v1/models"))
+                if any(m["id"] == P["served_name"] for m in models["data"]):
+                    break
+            except (OSError, ValueError):
+                pass
+            if time.monotonic() >= ready_deadline:
+                raise TimeoutError("server readiness bound exceeded")
+            time.sleep(1)
+        state["ready_at"] = time.time()
+        save(out / "status.json", state)
+        for label in ("u1", "u2", "diagnostic"):
+            for suffix, url in (
+                ("server", f"http://127.0.0.1:{P['port']}/metrics"),
+                ("cache", f"http://127.0.0.1:{P['cache_metrics_port']}/metrics"),
+            ):
+                try:
+                    (out / f"before-{label}-{suffix}.prom").write_text(request(url))
+                except OSError as error:
+                    state["errors"].append(f"metrics {suffix}: {error!r}")
+            run_client(C, frozen, out, label, fd, track, check_deadline)
+        state["state"] = "COMPLETED"
+    except BaseException as error:
+        logger.exception("Bounded workload failed")
+        state["state"] = "FAILED"
+        state["errors"].append(repr(error))
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        track()
+        for sig, seconds in ((signal.SIGTERM, 15), (signal.SIGKILL, 15)):
+            for proc in track():
+                try:
+                    proc.send_signal(sig)
+                except psutil.NoSuchProcess:
+                    pass
+            until = time.monotonic() + seconds
+            while track() and time.monotonic() < until:
+                time.sleep(0.5)
+        while True:
+            if not state.get("admitted"):
+                state["no_owned_gpu_work_started"] = True
+                state["finished"] = time.time()
+                save(out / "status.json", state)
+                os.close(fd)
+                break
+            state["alive"] = [p.pid for p in track()]
+            try:
+                released, state["after"] = C.wait_gpus_released(timeout=10)
+                released = (
+                    released
+                    and len(state["after"]["cards"]) == 8
+                    and not state["alive"]
+                )
+            except Exception as error:
+                logger.exception("Release check failed; retaining ownership lock")
+                released = False
+                state["cleanup_error"] = repr(error)
+            state["gpu_released"] = released
+            state["finished"] = time.time()
+            save(out / "status.json", state)
+            if released:
+                os.close(fd)
+                break
+            print("CLEANUP_FAILED_HOLDING_LOCK", flush=True)
+            time.sleep(5)
+    print(
+        json.dumps(
+            {
+                "head": frozen["head"],
+                "state": state["state"],
+                "gpu_released": state.get("gpu_released"),
+                "artifacts": str(out),
+            }
+        )
+    )
+    if state["state"] != "COMPLETED":
+        raise SystemExit(1)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--run-plan", type=Path)
+    group.add_argument("--capture-metadata", type=Path)
+    args = parser.parse_args()
+    if args.capture_metadata:
+        frozen = json.loads(args.capture_metadata.read_text())
+        if os.environ.get("K31_TASK6_METADATA_LEASE") != frozen["head"]:
+            raise RuntimeError("metadata device query requires the owned lease")
+        capture_metadata(frozen, Path(frozen["output"]))
+    else:
+        execute(json.loads(args.run_plan.read_text()))
+
+
+if __name__ == "__main__":
+    main()

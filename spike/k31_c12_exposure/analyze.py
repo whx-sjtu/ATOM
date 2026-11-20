@@ -1,0 +1,284 @@
+"""Preserve canonical metrics, classify invalid completions, and qualify traces."""
+
+import argparse
+import gzip
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+from plan import PRIVATE, ROOT
+
+RANKS = {str(rank) for rank in range(8)}
+SENT = re.compile(
+    r"Phase (\S+) \(profiling\) sending complete \| sent=([\d,]+), completed=([\d,]+), in_flight=([\d,]+)"
+)
+DONE = re.compile(
+    r"Phase (\S+) \(profiling\) complete \| completed=([\d,]+), cancelled=([\d,]+), errors=([\d,]+)"
+)
+
+
+def read(path):
+    return json.loads(path.read_text())
+
+
+def write(path, value):
+    path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
+
+
+def request_ledger(directory):
+    from atom.benchmarks.results.records import from_aiperf
+
+    log = directory / "logs/aiperf.log"
+    text = (
+        log.read_text(errors="replace")
+        if log.exists()
+        else (directory / "console.log").read_text(errors="replace")
+    )
+    sent, done = SENT.findall(text), DONE.findall(text)
+    records = directory / "profile_export.jsonl"
+    result = {
+        "ledger_source": str(log),
+        "sent": None,
+        "completed": None,
+        "cancelled": None,
+        "errors": None,
+        "zero_or_missing_output_success": [],
+        "profile_success_records": 0,
+        "usable_completed_requests": False,
+    }
+    if sent and done and sent[-1][0] == done[-1][0]:
+        result["sent"] = int(sent[-1][1].replace(",", ""))
+        result.update(
+            dict(
+                zip(
+                    ("completed", "cancelled", "errors"),
+                    (int(x.replace(",", "")) for x in done[-1][1:]),
+                )
+            )
+        )
+    if not records.exists():
+        result["missing"] = "raw AIPerf request JSONL"
+        return result
+    with records.open() as source:
+        for index, line in enumerate(source):
+            row = from_aiperf(json.loads(line), index)
+            if row.get("phase") != "profiling" or row.get("status") != "success":
+                continue
+            result["profile_success_records"] += 1
+            if row.get("output_tokens", 0) <= 0:
+                result["zero_or_missing_output_success"].append(row["request_id"])
+    result["usable_completed_requests"] = bool(
+        sent
+        and done
+        and result["profile_success_records"] > 0
+        and result["completed"] == result["profile_success_records"]
+        and result["errors"] == 0
+        and not result["zero_or_missing_output_success"]
+        and result["sent"] == result["completed"] + result["cancelled"]
+    )
+    result["scope"] = (
+        "Raw final ledger including grace. HTTP 200 and zero output is not a usable completion."
+    )
+    return result
+
+
+def union_us(intervals):
+    total, end = 0.0, None
+    for start, stop in sorted(intervals):
+        total += stop - start if end is None or start > end else max(0.0, stop - end)
+        end = stop if end is None else max(end, stop)
+    return total
+
+
+def qualify_window(record, trace_root):
+    reasons = []
+    if record.get("errors"):
+        reasons.append("control/export error")
+    if (
+        set(record.get("started", {})) != RANKS
+        or set(record.get("stopped", {})) != RANKS
+    ):
+        reasons.append("all-rank lifecycle unproven")
+    upper = record.get("upper_bound_s", {})
+    if set(upper) != RANKS or any(not 0 <= value <= 10 for value in upper.values()):
+        reasons.append("all-rank active-time upper bound unproven")
+    if set(record.get("exports", {})) != RANKS:
+        reasons.append("all-rank exports missing")
+    traces = {}
+    for rank, filename in record.get("exports", {}).items():
+        path = Path(filename).resolve()
+        try:
+            if not path.is_relative_to(trace_root.resolve() / f"rank_{rank}") or str(
+                path
+            ) in record.get("before_files", []):
+                raise ValueError("not a fresh export from this rank")
+            with gzip.open(path, "rb") as source:
+                body = source.read(512 * 2**20 + 1)
+            if len(body) > 512 * 2**20:
+                raise ValueError(
+                    "trace exceeds bounded parser capacity; raw file retained"
+                )
+            events = json.loads(body)["traceEvents"]
+            kernels = [
+                e for e in events if e.get("ph") == "X" and e.get("cat") == "kernel"
+            ]
+            if not kernels:
+                raise ValueError("no complete GPU kernel events")
+            families = {}
+            for event in kernels:
+                name = event["name"]
+                family = (
+                    "mono_k2"
+                    if "k3_mono_k2" in name
+                    else (
+                        "mono_k1"
+                        if "k3_mono_k1" in name
+                        else (
+                            "communication"
+                            if re.search(
+                                r"nccl|rccl|all_reduce|all_gather|reduce_scatter",
+                                name,
+                                re.IGNORECASE,
+                            )
+                            else "other"
+                        )
+                    )
+                )
+                families.setdefault(family, []).append(
+                    (event["ts"], event["ts"] + event["dur"])
+                )
+            labels = [
+                e
+                for e in events
+                if e.get("ph") == "X"
+                and (
+                    e.get("name", "").startswith("ATOM::")
+                    or re.match(r"(prefill|decode|eager_decode)\[", e.get("name", ""))
+                )
+            ]
+            traces[rank] = {
+                "path": filename,
+                "kernel_count": len(kernels),
+                "kernel_union_us": union_us(
+                    [(e["ts"], e["ts"] + e["dur"]) for e in kernels]
+                ),
+                "family_union_us_nonadditive": {
+                    k: union_us(v) for k, v in families.items()
+                },
+                "host_scopes": [
+                    {"name": e["name"], "ts": e["ts"], "dur": e["dur"]} for e in labels
+                ],
+                "mono_kernel_rows": sorted(
+                    {
+                        int(m[1])
+                        for e in kernels
+                        if (m := re.search(r"k3_mono_k[12]_s(\d+)_", e["name"]))
+                    }
+                ),
+                "complete_mla_tail_gpu_cost": None,
+                "embedded_k2_communication_cost": None,
+            }
+        except (OSError, ValueError, KeyError) as error:
+            reasons.append(f"rank {rank}: {error}")
+    return {
+        "qualified": not reasons,
+        "reasons": reasons,
+        "ranks": traces,
+        "scope": "Trace-visible intervals only. Families can overlap; host scopes are not GPU wall time.",
+    }
+
+
+def build_cases(out):
+    from atom.benchmarks.results.bundle import build_bundle
+    from atom.benchmarks.results.metadata import capture_hf_dataset
+
+    base = read(out / "base-config.json")
+    for label in ("u1", "u2", "diagnostic"):
+        directory = out / label
+        export = directory / "profile_export_aiperf.json"
+        if not export.exists():
+            continue
+        ledger = request_ledger(directory)
+        write(directory / "ledger.json", ledger)
+        config = json.loads(json.dumps(base))
+        config["validity"]["instrumented"] = label == "diagnostic"
+        identity = capture_hf_dataset(PRIVATE / "hf-datasets", export)
+        write(directory / "dataset-identity.json", identity)
+        bundle = directory / "bundle"
+        if not bundle.exists():
+            build_bundle(
+                config,
+                directory / "profile_export.jsonl",
+                bundle,
+                record_format="aiperf",
+                raw_dir=directory,
+                logs={
+                    "client": directory / "logs/aiperf.log",
+                    "server": out / "server.log",
+                },
+                exit_code=0 if ledger["usable_completed_requests"] else 1,
+                client_launch=directory / "launch.json",
+            )
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "atom.benchmarks.results",
+                "verify",
+                str(bundle),
+                "--require-full",
+            ],
+            check=False,
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            timeout=60,
+        )
+        write(
+            directory / "verification.json",
+            {
+                "exit_code": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            },
+        )
+
+
+def summarize(out):
+    result = {
+        "head": read(out / "plan.json")["head"],
+        "official_submission_eligible": False,
+        "unprofiled": {},
+        "diagnostics": [],
+        "unknown": ["full-workload cost distribution", "strict B300 headroom"],
+    }
+    for label in ("u1", "u2"):
+        path = out / label / "bundle/summary.json"
+        if path.exists():
+            data = read(path)
+            result["unprofiled"][label] = {
+                "request_metrics": data.get("request_metrics"),
+                "accounting": data.get("accounting"),
+                "ledger": read(out / label / "ledger.json"),
+            }
+        else:
+            result["unprofiled"][label] = {"missing": "canonical bundle"}
+    for path in sorted((out / "diagnostic").glob("window*.json")):
+        result["diagnostics"].append(qualify_window(read(path), out / "traces"))
+    result["conclusion"] = (
+        "Observed exposure only; missing complete boundaries remain unknown. No candidate or acceptance claim."
+    )
+    write(out / "exposure.json", result)
+    return result
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("out", type=Path)
+    parser.add_argument("--build-bundles", action="store_true")
+    args = parser.parse_args()
+    if args.build_bundles:
+        build_cases(args.out)
+    print(json.dumps(summarize(args.out)))
