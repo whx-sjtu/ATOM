@@ -1,0 +1,349 @@
+path,code,message,source,count
+.github/scripts/accuracy_to_dashboard.py,FURB188,Prefer `str.removeprefix()` over conditionally replacing with slice.,"        if model_name.startswith(""accuracy-""):",1
+.github/scripts/atomesh/atomesh_mocker_benchmark_summary.py,EXE001,Shebang is present but file is not executable,#!/usr/bin/env python3,1
+.github/scripts/atomesh/process_result.py,EXE001,Shebang is present but file is not executable,#!/usr/bin/env python3,1
+.github/scripts/catalog.py,EXE001,Shebang is present but file is not executable,#!/usr/bin/env python3,1
+.github/scripts/dashboard_models_map.py,EXE001,Shebang is present but file is not executable,#!/usr/bin/env python3,1
+.github/scripts/dashboard_models_map.py,RUF100,Unused `noqa` directive (non-enabled: `E402`),from catalog import load_variants  # noqa: E402,1
+.github/scripts/list_jobs.py,EXE001,Shebang is present but file is not executable,#!/usr/bin/env python3,1
+.github/scripts/list_jobs.py,SIM118,Use `key in dict` instead of `key in dict.keys()`,        job_ids = [job_id for job_id in jobs_dict.keys() if job_id not in excluded_jobs],1
+.github/scripts/query_job_status.py,EXE001,Shebang is present but file is not executable,#!/usr/bin/env python3,1
+.github/scripts/query_job_status.py,FURB105,Unnecessary empty string passed to `print`,"        print("""")",1
+.github/scripts/query_job_status.py,FURB192,Prefer `min` over `sorted()` to compute the minimum value in a sequence,"    return sorted(candidates, key=lambda value: (-len(value), value.lower()))[0]",1
+.github/scripts/query_job_status.py,SIM103,"Return the condition `bool(actual_name.startswith(f""{filter_name} / ""))` directly","    if actual_name.startswith(f""{filter_name} / ""):",1
+.github/scripts/query_job_status.py,UP028,Replace `yield` over `for` loop with `yield from`,        for job in jobs:,1
+.github/scripts/resolve_atom_image.py,EXE001,Shebang is present but file is not executable,#!/usr/bin/env python3,1
+.github/scripts/resolve_atom_image.py,FLY002,Consider f-string instead of string join,"MANIFEST_ACCEPT = "", "".join(",1
+.github/scripts/resolve_atom_image.py,UP012,Unnecessary UTF-8 `encoding` argument to `encode`,"        creds = base64.b64encode(f""{docker_user}:{docker_pass}"".encode(""utf-8"")).decode(",1
+.github/scripts/resolve_atom_image.py,UP035,Import from `collections.abc` instead: `Iterable`,from typing import Iterable,1
+.github/scripts/resolve_sglang_metadata.py,EXE001,Shebang is present but file is not executable,#!/usr/bin/env python3,1
+.github/scripts/validate_catalog.py,EXE001,Shebang is present but file is not executable,#!/usr/bin/env python3,1
+atom/benchmarks/backend_request_func.py,BLE001,Do not catch blind exception: `Exception`,        except Exception:,3
+atom/benchmarks/backend_request_func.py,UP007,Use `X | Y` for type annotations,") -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:",1
+atom/benchmarks/backend_request_func.py,UP045,Use `X | None` for type annotations,    extra_body: Optional[dict] = None,1
+atom/benchmarks/backend_request_func.py,UP045,Use `X | None` for type annotations,    logprobs: Optional[int] = None,1
+atom/benchmarks/backend_request_func.py,UP045,Use `X | None` for type annotations,    model_name: Optional[str] = None,1
+atom/benchmarks/backend_request_func.py,UP045,Use `X | None` for type annotations,    multi_modal_content: Optional[dict] = None,1
+atom/benchmarks/backend_request_func.py,UP045,Use `X | None` for type annotations,"    pbar: Optional[tqdm] = None,",5
+atom/benchmarks/benchmark_serving.py,BLE001,Do not catch blind exception: `Exception`,    except Exception:,1
+atom/benchmarks/benchmark_serving.py,C419,Unnecessary list comprehension,"            is_good_req = all([s >= r for s, r in zip(slo_values, req_metric)])",1
+atom/benchmarks/benchmark_serving.py,SIM117,Use a single `with` statement with multiple contexts instead of nested `with` statements,        async with aiohttp.ClientSession() as session:,1
+atom/benchmarks/benchmark_utils.py,PLW1508,Invalid type for environment variable default; expected `str` or `None`,"    if not os.environ.get(""SAVE_TO_PYTORCH_BENCHMARK_FORMAT"", False):",1
+atom/benchmarks/benchmark_utils.py,UP006,Use `dict` instead of `Dict` for type annotation,"    args: argparse.Namespace, metrics: Dict[str, List], extra_info: Dict[str, Any]",2
+atom/benchmarks/benchmark_utils.py,UP006,Use `list` instead of `List` for type annotation,"    args: argparse.Namespace, metrics: Dict[str, List], extra_info: Dict[str, Any]",1
+atom/benchmarks/benchmark_utils.py,UP006,Use `list` instead of `List` for type annotation,) -> List:,1
+atom/benchmarks/benchmark_utils.py,UP035,"`typing.Dict` is deprecated, use `dict` instead","from typing import Any, Dict, List",1
+atom/benchmarks/benchmark_utils.py,UP035,"`typing.List` is deprecated, use `list` instead","from typing import Any, Dict, List",1
+atom/examples/simple_inference.py,I001,Import block is un-sorted or un-formatted,import argparse,1
+atom/kv_transfer/disaggregation/moriio/moriio_common.py,UP045,Use `X | None` for type annotations,    _instance: Optional[_RoleManager] = None,1
+atom/kv_transfer/disaggregation/moriio/moriio_common.py,UP045,Use `X | None` for type annotations,    kv_caches_base_addr: Optional[list[int]] = None,1
+atom/kv_transfer/disaggregation/moriio/moriio_engine.py,BLE001,Do not catch blind exception: `Exception`,            except Exception as e:,1
+atom/kv_transfer/disaggregation/moriio/moriio_engine.py,I001,Import block is un-sorted or un-formatted,from __future__ import annotations,1
+atom/kv_transfer/disaggregation/moriio/moriio_engine.py,RUF059,Unpacked variable `identity` is never used,"                        identity, msg = sock.recv_multipart()",1
+atom/kv_transfer/disaggregation/utils.py,UP037,Remove quotes from type annotation,"    kv_cache: ""torch.Tensor"",",1
+atom/model_config/qwen3_5.py,RUF012,Mutable default value for class attribute,    base_model_pp_plan = {,1
+atom/model_config/qwen3_5.py,RUF012,Mutable default value for class attribute,    base_model_tp_plan = {,1
+atom/model_config/qwen3_5.py,RUF012,Mutable default value for class attribute,"    keys_to_ignore_at_inference = [""past_key_values""]",2
+atom/model_config/qwen3_5.py,RUF012,Mutable default value for class attribute,    sub_configs = {,1
+atom/model_config/qwen3_5_moe.py,RUF012,Mutable default value for class attribute,    base_model_pp_plan = {,1
+atom/model_config/qwen3_5_moe.py,RUF012,Mutable default value for class attribute,    base_model_tp_plan = {,1
+atom/model_config/qwen3_5_moe.py,RUF012,Mutable default value for class attribute,"    keys_to_ignore_at_inference = [""past_key_values""]",2
+atom/model_config/qwen3_5_moe.py,RUF012,Mutable default value for class attribute,    sub_configs = {,1
+atom/model_config/qwen3_next.py,RUF012,Mutable default value for class attribute,    base_model_pp_plan = {,1
+atom/model_config/qwen3_next.py,RUF012,Mutable default value for class attribute,    base_model_tp_plan = {,1
+atom/model_config/qwen3_next.py,RUF012,Mutable default value for class attribute,"    keys_to_ignore_at_inference = [""past_key_values""]",1
+atom/model_config/qwen3_next.py,RUF100,Unused `noqa` directive (non-enabled: `E501`),"    """"""  # noqa: E501",1
+atom/model_engine/engine_core_mgr.py,BLE001,Do not catch blind exception: `Exception`,                except Exception as e:,1
+atom/model_engine/engine_core_mgr.py,BLE001,Do not catch blind exception: `Exception`,            except Exception:,1
+atom/model_engine/engine_core_mgr.py,S110,"`try`-`except`-`pass` detected, consider logging the exception",            except Exception:,1
+atom/model_ops/activation.py,I001,Import block is un-sorted or un-formatted,            from aiter.ops.triton.fused_fp8_quant import (,1
+atom/model_ops/activation.py,I001,Import block is un-sorted or un-formatted,import torch,1
+atom/model_ops/activation.py,UP045,Use `X | None` for type annotations,"        quant_config: Optional[QuantizationConfig] = None,",1
+atom/model_ops/activation.py,UP045,Use `X | None` for type annotations,"        self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None",2
+atom/model_ops/attentions/triton_merge_attn_states.py,I001,Import block is un-sorted or un-formatted,import torch,1
+atom/model_ops/base_config.py,UP006,Use `type` instead of `Type` for type annotation,def method_has_implemented_embedding(method_class: Type[QuantizeMethodBase]) -> bool:,1
+atom/model_ops/base_config.py,UP035,"`typing.Type` is deprecated, use `type` instead",from typing import Type,1
+atom/model_ops/eplb.py,C401,Unnecessary generator (rewrite as a set comprehension),        new_set = set(x for x in new_r if x >= 0),1
+atom/model_ops/eplb.py,C401,Unnecessary generator (rewrite as a set comprehension),        old_set = set(x for x in old_r if x >= 0),1
+atom/model_ops/fla_ops/chunk.py,C417,Unnecessary `map()` usage (rewrite using a generator expression),"        q, k, v, beta, g = map(",1
+atom/model_ops/fla_ops/chunk.py,RUF013,PEP 484 prohibits implicit `Optional`,"    scale: float = None,",1
+atom/model_ops/fla_ops/chunk.py,RUF059,Unpacked variable `A` is never used,"        g, o, A, final_state, w, h, v_new = chunk_gated_delta_rule_fwd(",1
+atom/model_ops/fla_ops/chunk.py,RUF059,Unpacked variable `v_new` is never used,"        g, o, A, final_state, w, h, v_new = chunk_gated_delta_rule_fwd(",1
+atom/model_ops/fla_ops/chunk.py,RUF059,Unpacked variable `w` is never used,"        g, o, A, final_state, w, h, v_new = chunk_gated_delta_rule_fwd(",1
+atom/model_ops/fla_ops/chunk_delta_h.py,I001,Import block is un-sorted or un-formatted,import torch,1
+atom/model_ops/fla_ops/chunk_delta_h.py,RUF100,Unused `noqa` directive (non-enabled: `E501`),# ruff: noqa: E501,1
+atom/model_ops/fla_ops/chunk_delta_h_vk.py,RUF100,Unused `noqa` directive (non-enabled: `E501`),# ruff: noqa: E501,1
+atom/model_ops/fla_ops/chunk_fused.py,I001,Import block is un-sorted or un-formatted,from __future__ import annotations,1
+atom/model_ops/fla_ops/chunk_fused.py,RUF059,Unpacked variable `B` is never used,"    B, T, Hg, K = q.shape",1
+atom/model_ops/fla_ops/chunk_o_vk.py,RUF100,Unused `noqa` directive (non-enabled: `E501`),# ruff: noqa: E501,1
+atom/model_ops/fla_ops/chunk_scaled_dot_kkt.py,I001,Import block is un-sorted or un-formatted,import torch,1
+atom/model_ops/fla_ops/chunk_scaled_dot_kkt.py,RUF100,Unused `noqa` directive (non-enabled: `E501`),# ruff: noqa: E501,1
+atom/model_ops/fla_ops/chunk_vk.py,RUF013,PEP 484 prohibits implicit `Optional`,"    scale: float = None,",1
+atom/model_ops/fla_ops/chunk_vk.py,RUF059,Unpacked variable `A` is never used,"        g, o, A, final_state, w, h, v_new = chunk_gated_delta_rule_fwd_vk(",1
+atom/model_ops/fla_ops/chunk_vk.py,RUF059,Unpacked variable `h` is never used,"        g, o, A, final_state, w, h, v_new = chunk_gated_delta_rule_fwd_vk(",1
+atom/model_ops/fla_ops/chunk_vk.py,RUF059,Unpacked variable `v_new` is never used,"        g, o, A, final_state, w, h, v_new = chunk_gated_delta_rule_fwd_vk(",1
+atom/model_ops/fla_ops/chunk_vk.py,RUF059,Unpacked variable `w` is never used,"        g, o, A, final_state, w, h, v_new = chunk_gated_delta_rule_fwd_vk(",1
+atom/model_ops/fla_ops/chunk_vk.py,RUF100,Unused `noqa` directive (non-enabled: `E501`),# ruff: noqa: E501,1
+atom/model_ops/fla_ops/cumsum.py,I001,Import block is un-sorted or un-formatted,import warnings,1
+atom/model_ops/fla_ops/cumsum.py,RUF100,Unused `noqa` directive (non-enabled: `E501`),# ruff: noqa: E501,1
+atom/model_ops/fla_ops/fused_cumsum_kkt.py,UP009,UTF-8 encoding declaration is unnecessary,# -*- coding: utf-8 -*-,1
+atom/model_ops/fla_ops/fused_cumsum_kkt.py,UP045,Use `X | None` for type annotations,"    cu_seqlens: Optional[torch.Tensor] = None,",1
+atom/model_ops/fla_ops/fused_merge_recompute.py,UP009,UTF-8 encoding declaration is unnecessary,# -*- coding: utf-8 -*-,1
+atom/model_ops/fla_ops/fused_merge_recompute.py,UP045,Use `X | None` for type annotations,"    cu_seqlens: Optional[torch.Tensor] = None,",1
+atom/model_ops/fla_ops/fused_sigmoid_gating.py,I001,Import block is un-sorted or un-formatted,import torch,1
+atom/model_ops/fla_ops/fused_sigmoid_gating.py,PIE808,Unnecessary `start` argument in `range`,"    for i_t in range(0, T):",1
+atom/model_ops/fla_ops/fused_sigmoid_gating.py,RUF013,PEP 484 prohibits implicit `Optional`,"    scale: float = None,",1
+atom/model_ops/fla_ops/index.py,I001,Import block is un-sorted or un-formatted,import torch,1
+atom/model_ops/fla_ops/index.py,RUF100,Unused `noqa` directive (non-enabled: `E501`),# ruff: noqa: E501,1
+atom/model_ops/fla_ops/l2norm.py,I001,Import block is un-sorted or un-formatted,import os,1
+atom/model_ops/fla_ops/layernorm_guard.py,I001,Import block is un-sorted or un-formatted,from functools import lru_cache,1
+atom/model_ops/fla_ops/layernorm_guard.py,PLR0402,Use `from torch import nn` in lieu of alias,import torch.nn as nn,1
+atom/model_ops/fla_ops/layernorm_guard.py,RUF013,PEP 484 prohibits implicit `Optional`,"    group_size: int = None,",1
+atom/model_ops/fla_ops/layernorm_guard.py,RUF100,Unused `noqa` directive (non-enabled: `E501`),# ruff: noqa: E501,1
+atom/model_ops/fla_ops/op.py,RET501,Do not explicitly `return None` in function if it is the only possible return value,        return None,1
+atom/model_ops/fla_ops/solve_tril.py,I001,Import block is un-sorted or un-formatted,import os,1
+atom/model_ops/fla_ops/solve_tril.py,RUF100,Unused `noqa` directive (non-enabled: `E501`),# ruff: noqa: E501,1
+atom/model_ops/fla_ops/utils.py,BLE001,Do not catch blind exception: `BaseException`,    except BaseException:,1
+atom/model_ops/fla_ops/utils.py,BLE001,Do not catch blind exception: `Exception`,    except Exception:,1
+atom/model_ops/fla_ops/utils.py,RUF100,Unused `noqa` directive (non-enabled: `E501`),# ruff: noqa: E501,1
+atom/model_ops/fla_ops/wy_fast.py,I001,Import block is un-sorted or un-formatted,import torch,1
+atom/model_ops/fla_ops/wy_fast.py,RUF100,Unused `noqa` directive (non-enabled: `E501`),# ruff: noqa: E501,1
+atom/model_ops/fused_moe/utils.py,I001,Import block is un-sorted or un-formatted,import functools,1
+atom/model_ops/quant_v4.py,UP045,Use `X | None` for type annotations,"    x: torch.Tensor, block_size: int = 128, scale_fmt: Optional[str] = None",1
+atom/model_ops/sparse_attn_v4.py,RUF059,Unpacked variable `N` is never used,"    _, N, D_kv = kv.shape",1
+atom/model_ops/sparse_attn_v4.py,UP006,Use `tuple` instead of `Tuple` for type annotation,") -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:",1
+atom/model_ops/sparse_attn_v4.py,UP035,"`typing.Tuple` is deprecated, use `tuple` instead",from typing import Tuple,1
+atom/model_ops/topK.py,N999,Invalid module name: 'topK',# SPDX-License-Identifier: MIT,1
+atom/model_ops/triton_rmsnorm_nw.py,I001,Import block is un-sorted or un-formatted,import torch,1
+atom/models/deepseek_v4_mtp.py,RUF012,Mutable default value for class attribute,    packed_modules_mapping = {,1
+atom/models/deepseek_v4_mtp.py,RUF012,Mutable default value for class attribute,    weights_mapping = {,1
+atom/models/eagle3_deepseek_mla.py,RUF012,Mutable default value for class attribute,    packed_modules_mapping = {,1
+atom/models/eagle3_llama.py,RUF012,Mutable default value for class attribute,    packed_modules_mapping = {,1
+atom/models/eagle3_llama.py,RUF012,Mutable default value for class attribute,"    weights_mapping = {""layers.0."": ""midlayer.""}",1
+atom/models/glm4_moe.py,RUF012,Mutable default value for class attribute,    packed_modules_mapping = {,1
+atom/models/glm4_moe_mtp.py,RUF012,Mutable default value for class attribute,    packed_modules_mapping = {,1
+atom/models/gpt_oss.py,RUF012,Mutable default value for class attribute,    packed_modules_mapping = {,1
+atom/models/gpt_oss.py,RUF012,Mutable default value for class attribute,    weights_mapping = {,1
+atom/models/gpt_oss.py,UP045,Use `X | None` for type annotations,"        quant_config: Optional[QuantizationConfig] = None,",1
+atom/models/kimi_k25.py,RUF012,Mutable default value for class attribute,    quant_exclude_name_mapping = {,1
+atom/models/kimi_k25.py,RUF012,Mutable default value for class attribute,    skip_weight_prefixes = [,1
+atom/models/kimi_k25.py,UP007,Use `X | Y` for type annotations,"    ) -> Union[torch.Tensor, IntermediateTensors]:",1
+atom/models/kimi_k25.py,UP045,Use `X | None` for type annotations,"        inputs_embeds: Optional[torch.Tensor] = None,",1
+atom/models/kimi_k25.py,UP045,Use `X | None` for type annotations,"        intermediate_tensors: Optional[IntermediateTensors] = None,",1
+atom/models/kimi_k25.py,UP045,Use `X | None` for type annotations,    ) -> Optional[torch.Tensor]:,1
+atom/models/llama.py,C408,Unnecessary `tuple()` call (rewrite as a literal),        self.aux_hidden_state_layers: tuple[int] = tuple(),1
+atom/models/llama.py,RUF012,Mutable default value for class attribute,    packed_modules_mapping = {,1
+atom/models/llama.py,UP007,Use `X | Y` for type annotations,    ) -> Union[,1
+atom/models/llama.py,UP007,Use `X | Y` for type annotations,"    ) -> Union[torch.Tensor, IntermediateTensors]:",1
+atom/models/llama.py,UP045,Use `X | None` for type annotations,"        input_ids: Optional[torch.Tensor],",1
+atom/models/llama.py,UP045,Use `X | None` for type annotations,"        inputs_embeds: Optional[torch.Tensor] = None,",2
+atom/models/llama.py,UP045,Use `X | None` for type annotations,"        intermediate_tensors: Optional[IntermediateTensors] = None,",1
+atom/models/llama.py,UP045,Use `X | None` for type annotations,"        intermediate_tensors: Optional[IntermediateTensors],",1
+atom/models/llama.py,UP045,Use `X | None` for type annotations,"        quant_config: Optional[QuantizationConfig] = None,",1
+atom/models/llama.py,UP045,Use `X | None` for type annotations,"        quant_config: Optional[QuantizationConfig],",1
+atom/models/llama.py,UP045,Use `X | None` for type annotations,"        residual: Optional[torch.Tensor],",1
+atom/models/llama.py,UP045,Use `X | None` for type annotations,"        rope_scaling: Optional[dict[str, Any]] = None,",1
+atom/models/llama.py,UP045,Use `X | None` for type annotations,"        rope_scaling: Optional[dict[str, Any]],",1
+atom/models/llama.py,UP045,Use `X | None` for type annotations,"        x_scale: Optional[torch.Tensor] = None,",1
+atom/models/llama.py,UP045,Use `X | None` for type annotations,    ) -> Optional[torch.Tensor]:,1
+atom/models/llama.py,UP045,Use `X | None` for type annotations,"    def forward(self, x, x_scale: Optional[torch.Tensor] = None):",1
+atom/models/mimo_v2.py,RUF012,Mutable default value for class attribute,    packed_modules_mapping = {,1
+atom/models/mimo_v2.py,RUF059,Unpacked variable `num_tokens` is never used,"        num_tokens, hidden_dim = hidden_states.shape",1
+atom/models/mimo_v2.py,UP007,Use `X | Y` for type annotations,"    ) -> Union[torch.Tensor, IntermediateTensors]:",1
+atom/models/mimo_v2.py,UP045,Use `X | None` for type annotations,"        quant_config: Optional[QuantizationConfig] = None,",2
+atom/models/mimo_v2.py,UP045,Use `X | None` for type annotations,    ) -> Optional[torch.Tensor]:,1
+atom/models/mimo_v2_mtp.py,RUF012,Mutable default value for class attribute,    packed_modules_mapping = {,1
+atom/models/minimax_m2.py,RUF012,Mutable default value for class attribute,    packed_modules_mapping = {,1
+atom/models/minimax_m2.py,RUF059,Unpacked variable `num_tokens` is never used,"        num_tokens, hidden_dim = hidden_states.shape",1
+atom/models/minimax_m2.py,UP007,Use `X | Y` for type annotations,"    ) -> Union[torch.Tensor, IntermediateTensors]:",1
+atom/models/minimax_m2.py,UP045,Use `X | None` for type annotations,"        quant_config: Optional[QuantizationConfig] = None,",3
+atom/models/minimax_m2.py,UP045,Use `X | None` for type annotations,"    def compute_logits(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:",1
+atom/models/mistral3.py,RUF012,Mutable default value for class attribute,    quant_exclude_name_mapping = {,1
+atom/models/mistral3.py,RUF012,Mutable default value for class attribute,    skip_weight_prefixes = [,1
+atom/models/mistral3.py,RUF012,Mutable default value for class attribute,    weights_mapping = {},1
+atom/models/mistral3.py,UP045,Use `X | None` for type annotations,"        inputs_embeds: Optional[torch.Tensor] = None,",1
+atom/models/mistral3.py,UP045,Use `X | None` for type annotations,"        intermediate_tensors: Optional[IntermediateTensors] = None,",1
+atom/models/mixtral.py,RUF012,Mutable default value for class attribute,    packed_modules_mapping = {,1
+atom/models/mixtral.py,UP007,Use `X | Y` for type annotations,"    ) -> Union[torch.Tensor, IntermediateTensors]:",2
+atom/models/mixtral.py,UP045,Use `X | None` for type annotations,"        dp_size: Optional[int] = None,",1
+atom/models/mixtral.py,UP045,Use `X | None` for type annotations,"        inputs_embeds: Optional[torch.Tensor] = None,",2
+atom/models/mixtral.py,UP045,Use `X | None` for type annotations,"        intermediate_tensors: Optional[IntermediateTensors] = None,",1
+atom/models/mixtral.py,UP045,Use `X | None` for type annotations,"        intermediate_tensors: Optional[IntermediateTensors],",1
+atom/models/mixtral.py,UP045,Use `X | None` for type annotations,"        quant_config: Optional[QuantizationConfig] = None,",3
+atom/models/mixtral.py,UP045,Use `X | None` for type annotations,"        residual: Optional[torch.Tensor],",1
+atom/models/mixtral.py,UP045,Use `X | None` for type annotations,"        tp_size: Optional[int] = None,",1
+atom/models/mixtral.py,UP045,Use `X | None` for type annotations,    ) -> Optional[torch.Tensor]:,1
+atom/models/qwen3.py,RUF012,Mutable default value for class attribute,    packed_modules_mapping = {,1
+atom/models/qwen3.py,UP007,Use `X | Y` for type annotations,"    ) -> Union[torch.Tensor, tuple[torch.Tensor, dict[int, torch.Tensor]]]:",1
+atom/models/qwen3.py,UP035,Import from `collections.abc` instead: `Iterable`,"from typing import Any, Iterable, Union",1
+atom/models/qwen3_5_mtp.py,RUF012,Mutable default value for class attribute,    packed_modules_mapping = {,1
+atom/models/qwen3_5_mtp.py,RUF012,Mutable default value for class attribute,"    weights_mapping = {""mtp."": ""model.""}",1
+atom/models/qwen3_5_vl.py,PLR0402,Use `from torch import nn` in lieu of alias,import torch.nn as nn,1
+atom/models/qwen3_5_vl.py,RUF059,Unpacked variable `C` is never used,"        L, C = x.shape",1
+atom/models/qwen3_moe.py,RUF012,Mutable default value for class attribute,    packed_modules_mapping = {,1
+atom/models/qwen3_moe.py,RUF059,Unpacked variable `num_tokens` is never used,"        num_tokens, hidden_dim = hidden_states.shape",1
+atom/models/qwen3_moe.py,UP007,Use `X | Y` for type annotations,"    ) -> Union[torch.Tensor, IntermediateTensors]:",1
+atom/models/qwen3_moe.py,UP045,Use `X | None` for type annotations,"        quant_config: Optional[QuantizationConfig] = None,",1
+atom/models/qwen3_moe.py,UP045,Use `X | None` for type annotations,    ) -> Optional[torch.Tensor]:,1
+atom/models/qwen3_next_mtp.py,RUF012,Mutable default value for class attribute,    packed_modules_mapping = {,1
+atom/models/qwen3_next_mtp.py,RUF012,Mutable default value for class attribute,"    weights_mapping = {""mtp."": ""model.""}",1
+atom/plugin/__init__.py,I001,Import block is un-sorted or un-formatted,from .prepare import (,1
+atom/plugin/__init__.py,RUF022,`__all__` is not sorted,__all__ = [,1
+atom/plugin/graph_capture_patch.py,BLE001,Do not catch blind exception: `Exception`,    except Exception as e:,1
+atom/plugin/graph_capture_patch.py,BLE001,Do not catch blind exception: `Exception`,    except Exception:,1
+atom/plugin/graph_capture_patch.py,SIM117,Use a single `with` statement with multiple contexts instead of nested `with` statements,        with aiter_ca_context:,1
+atom/plugin/rtpllm/attention_backend/attention_gdn.py,PLR0402,Use `from atom.model_ops import attention_gdn` in lieu of alias,    import atom.model_ops.attention_gdn as attention_gdn,1
+atom/plugin/rtpllm/attention_backend/attention_switch.py,I001,Import block is un-sorted or un-formatted,    import atom.model_ops as ops,1
+atom/plugin/rtpllm/attention_backend/rtp_full_attention.py,PLR1711,Useless `return` statement at end of function,        return,1
+atom/plugin/rtpllm/attention_backend/rtp_full_attention.py,UP045,Use `X | None` for type annotations,"        positions: Optional[torch.Tensor] = None,",1
+atom/plugin/rtpllm/attention_backend/rtp_full_attention.py,UP045,Use `X | None` for type annotations,"        q_scale: Optional[torch.Tensor] = None,",1
+atom/plugin/rtpllm/attention_backend/rtp_mla_attention.py,B009,Do not call `getattr` with a constant attribute value. It is not any safer than normal property access.,"            topk_tokens = getattr(self, ""index_topk"")",1
+atom/plugin/rtpllm/attention_backend/rtp_mla_attention.py,BLE001,Do not catch blind exception: `Exception`,    except Exception:,1
+atom/plugin/rtpllm/attention_backend/rtp_mla_attention.py,PLR0402,Use `from atom.models import deepseek_v2` in lieu of alias,            import atom.models.deepseek_v2 as deepseek_v2,1
+atom/plugin/rtpllm/attention_backend/rtp_mla_attention.py,SIM103,"Return the condition `not getattr(context, ""is_dummy_run"", False)` directly","    if getattr(context, ""is_dummy_run"", False):",1
+atom/plugin/rtpllm/attention_backend/rtp_mla_attention.py,UP045,Use `X | None` for type annotations,"        explicit_topk_indices: Optional[torch.Tensor],",1
+atom/plugin/rtpllm/attention_backend/rtp_mla_attention.py,UP045,Use `X | None` for type annotations,"        positions: Optional[torch.Tensor] = None,",1
+atom/plugin/rtpllm/attention_backend/rtp_mla_attention.py,UP045,Use `X | None` for type annotations,"        positions: Optional[torch.Tensor],",1
+atom/plugin/rtpllm/attention_backend/rtp_mla_attention.py,UP045,Use `X | None` for type annotations,"        q_scale: Optional[torch.Tensor] = None,",1
+atom/plugin/rtpllm/attention_backend/rtp_mla_attention.py,UP045,Use `X | None` for type annotations,"        q_scale: Optional[torch.Tensor],",1
+atom/plugin/rtpllm/attention_backend/rtp_mla_attention.py,UP045,Use `X | None` for type annotations,"        self, query: torch.Tensor, q_scale: Optional[torch.Tensor]",1
+atom/plugin/rtpllm/attention_backend/rtp_mla_attention.py,UP045,Use `X | None` for type annotations,"        topk_indices: Optional[torch.Tensor] = None,",1
+atom/plugin/rtpllm/attention_backend/rtp_mla_attention.py,UP045,Use `X | None` for type annotations,    ) -> Optional[torch.Tensor]:,1
+atom/plugin/rtpllm/models/qwen3_next.py,PLR0402,Use `from atom.models import qwen3_next` in lieu of alias,    import atom.models.qwen3_next as qwen3_next,1
+atom/plugin/sglang/attention_backend/deepseek_v4_backend.py,PLR1711,Useless `return` statement at end of function,        return None,1
+atom/plugin/sglang/attention_backend/deepseek_v4_backend.py,RET501,Do not explicitly `return None` in function if it is the only possible return value,        return None,1
+atom/plugin/sglang/attention_backend/full_attention/__init__.py,I001,Import block is un-sorted or un-formatted,from .radix_attention import RadixAttention,1
+atom/plugin/sglang/attention_backend/full_attention/__init__.py,RUF022,`__all__` is not sorted,__all__ = [,1
+atom/plugin/sglang/attention_backend/full_attention/pa_metadata.py,UP045,Use `X | None` for type annotations,"    tp_q_head_num: Optional[int] = None,",1
+atom/plugin/sglang/attention_backend/minimax_m3_sparse.py,B009,Do not call `getattr` with a constant attribute value. It is not any safer than normal property access.,"    return int(getattr(forward_batch, ""batch_size""))",1
+atom/plugin/sglang/attention_backend/minimax_m3_sparse.py,BLE001,Do not catch blind exception: `Exception`,    except Exception:,1
+atom/plugin/sglang/attention_backend/minimax_m3_sparse.py,I001,Import block is un-sorted or un-formatted,from __future__ import annotations,1
+atom/plugin/sglang/models/glm52_dsa_attention.py,PLR0402,Use `from atom.models import deepseek_v2` in lieu of alias,    import atom.models.deepseek_v2 as deepseek_v2,1
+atom/plugin/sglang/models/kimi_k25.py,SIM117,Use a single `with` statement with multiple contexts instead of nested `with` statements,"        with plugin_runtime_scope(framework=""sglang"", atom_config=self.atom_config):",1
+atom/plugin/sglang/models/kimi_k25.py,UP045,Use `X | None` for type annotations,"        input_embeds: Optional[torch.Tensor] = None,",1
+atom/plugin/sglang/models/kimi_k25.py,UP045,Use `X | None` for type annotations,"        input_ids: Optional[torch.Tensor],",1
+atom/plugin/sglang/models/kimi_k25.py,UP045,Use `X | None` for type annotations,"        pp_proxy_tensors: Optional[PPProxyTensors] = None,",1
+atom/plugin/sglang/models/kimi_k25.py,UP045,Use `X | None` for type annotations,"        quant_config: Optional[QuantizationConfig] = None,",1
+atom/plugin/sglang/runtime/context.py,UP007,Use `X | Y` for type annotations,"            Union[ForwardBatch, ""SGLangForwardBatchMetadata""]",1
+atom/plugin/sglang/runtime/context.py,UP037,Remove quotes from type annotation,"            Union[ForwardBatch, ""SGLangForwardBatchMetadata""]",1
+atom/plugin/sglang/runtime/context.py,UP037,Remove quotes from type annotation,"        metadata: Optional[""SGLangForwardBatchMetadata""],",1
+atom/plugin/sglang/runtime/context.py,UP037,Remove quotes from type annotation,"    ) -> Optional[""SGLangForwardBatchMetadata""]:",1
+atom/plugin/sglang/runtime/context.py,UP037,Remove quotes from type annotation,"    _current: ClassVar[ContextVar[Optional[""SGLangForwardBatchMetadata""]]] = ContextVar(",1
+atom/plugin/sglang/runtime/context.py,UP037,Remove quotes from type annotation,"    def bind(cls, metadata: Optional[""SGLangForwardBatchMetadata""]):",1
+atom/plugin/sglang/runtime/context.py,UP037,Remove quotes from type annotation,"    def current(cls) -> Optional[""SGLangForwardBatchMetadata""]:",1
+atom/plugin/sglang/runtime/context.py,UP045,Use `X | None` for type annotations,        forward_batch: Optional[,1
+atom/plugin/sglang/runtime/context.py,UP045,Use `X | None` for type annotations,"        metadata: Optional[""SGLangForwardBatchMetadata""],",1
+atom/plugin/sglang/runtime/context.py,UP045,Use `X | None` for type annotations,"        pp_proxy_tensors: Optional[PPProxyTensors] = None,",1
+atom/plugin/sglang/runtime/context.py,UP045,Use `X | None` for type annotations,"        save_kv_cache: Optional[bool] = None,",1
+atom/plugin/sglang/runtime/context.py,UP045,Use `X | None` for type annotations,"    ) -> Optional[""SGLangForwardBatchMetadata""]:",1
+atom/plugin/sglang/runtime/context.py,UP045,Use `X | None` for type annotations,"    _current: ClassVar[ContextVar[Optional[""SGLangForwardBatchMetadata""]]] = ContextVar(",1
+atom/plugin/sglang/runtime/context.py,UP045,Use `X | None` for type annotations,"    def bind(cls, metadata: Optional[""SGLangForwardBatchMetadata""]):",1
+atom/plugin/sglang/runtime/context.py,UP045,Use `X | None` for type annotations,"    def current(cls) -> Optional[""SGLangForwardBatchMetadata""]:",1
+atom/plugin/sglang/runtime/context.py,UP045,Use `X | None` for type annotations,    forward_batch: Optional[ForwardBatch],1
+atom/plugin/sglang/runtime/context.py,UP045,Use `X | None` for type annotations,"    framework: Optional[str] = None,",1
+atom/plugin/sglang/runtime/context.py,UP045,Use `X | None` for type annotations,    pp_proxy_tensors: Optional[PPProxyTensors] = None,1
+atom/plugin/sglang/runtime/context.py,UP045,Use `X | None` for type annotations,_current_forward_batch: ContextVar[Optional[ForwardBatch]] = ContextVar(,1
+atom/plugin/sglang/runtime/context.py,UP045,Use `X | None` for type annotations,def bind_current_forward_batch(forward_batch: Optional[ForwardBatch]):,1
+atom/plugin/vllm/__init__.py,RUF022,`__all__` is not sorted,"__all__ = [""register_platform"", ""register_model""]",1
+atom/plugin/vllm/attention/layer.py,I001,Import block is un-sorted or un-formatted,from typing import Optional,1
+atom/plugin/vllm/attention/layer.py,UP045,Use `X | None` for type annotations,"        mla_modules: Optional[MLAModules] = None,",1
+atom/plugin/vllm/attention/layer_gdn.py,C417,Unnecessary `map()` usage (rewrite using a generator expression),"        query, key = map(",1
+atom/plugin/vllm/attention/layer_gdn.py,I001,Import block is un-sorted or un-formatted,import torch,1
+atom/plugin/vllm/attention/layer_gdn.py,RUF100,Unused `noqa` directive (non-enabled: `E501`),        )  # noqa: E501,2
+atom/plugin/vllm/attention/ops.py,UP045,Use `X | None` for type annotations,"    key: Optional[torch.Tensor],",2
+atom/plugin/vllm/attention/ops.py,UP045,Use `X | None` for type annotations,"    positions: Optional[torch.Tensor] = None,",2
+atom/plugin/vllm/attention/ops.py,UP045,Use `X | None` for type annotations,"    q_scale: Optional[torch.Tensor] = None,",2
+atom/plugin/vllm/attention/ops.py,UP045,Use `X | None` for type annotations,"    qkv: Optional[torch.Tensor] = None,",2
+atom/plugin/vllm/attention/ops.py,UP045,Use `X | None` for type annotations,"    value: Optional[torch.Tensor],",2
+atom/plugin/vllm/model_wrapper.py,BLE001,Do not catch blind exception: `Exception`,    except Exception:,2
+atom/plugin/vllm/model_wrapper.py,S110,"`try`-`except`-`pass` detected, consider logging the exception",    except Exception:,1
+atom/plugin/vllm/model_wrapper.py,TRY004,Prefer `TypeError` exception for invalid type,            raise RuntimeError(,2
+atom/plugin/vllm/models/qwen3_5.py,RUF012,Mutable default value for class attribute,    packed_modules_mapping = {,3
+atom/plugin/vllm/models/qwen3_next.py,I001,Import block is un-sorted or un-formatted,import torch,1
+atom/plugin/vllm/moe.py,I001,Import block is un-sorted or un-formatted,"from typing import Type, TypeVar",1
+atom/plugin/vllm/moe.py,UP006,Use `type` instead of `Type` for type annotation,def FusedMoEDecoratorForPluginMode(cls: Type[T]) -> Type[T]:,2
+atom/plugin/vllm/moe.py,UP006,Use `type` instead of `Type` for type annotation,def _apply_moe_decoration(original_cls: Type[T]) -> Type[T]:,2
+atom/plugin/vllm/moe.py,UP035,"`typing.Type` is deprecated, use `type` instead","from typing import Type, TypeVar",1
+atom/plugin/vllm/register.py,BLE001,Do not catch blind exception: `Exception`,    except Exception:,1
+atom/plugin/vllm/register.py,RUF012,Mutable default value for class attribute,    text_config_override_attrs = {,1
+atom/plugin/vllm/register.py,S110,"`try`-`except`-`pass` detected, consider logging the exception",    except Exception:,1
+atom/plugin/vllm/register.py,SIM102,Use a single `if` statement instead of nested `if` statements,        if existing is not None:,1
+atom/plugin/vllm/req_id_passthrough_patch.py,BLE001,Do not catch blind exception: `Exception`,    except Exception as e:  # pragma: no cover - import guard,1
+atom/plugin/vllm/spec_decode_patch.py,BLE001,Do not catch blind exception: `Exception`,    except Exception:,2
+atom/plugin/vllm/tp_group_reuse.py,BLE001,Do not catch blind exception: `Exception`,    except Exception as e:,1
+atom/rollout/__init__.py,I001,Import block is un-sorted or un-formatted,"from atom.rollout.weight_sync import load_weights_via_shm, load_weights_via_ipc",1
+atom/rollout/__init__.py,RUF022,`__all__` is not sorted,__all__ = [,1
+atom/utils/backends.py,BLE001,Do not catch blind exception: `Exception`,        except Exception:,1
+atom/utils/backends.py,PLW0602,Using global for `compilation_start_time` but no assignment is done,            global compilation_start_time,1
+atom/utils/backends.py,SIM103,Return the condition directly,"    if node.op == ""call_function"" and (",1
+atom/utils/block_convert.py,PIE808,Unnecessary `start` argument in `range`,"    for j in range(0, bs):",1
+atom/utils/block_convert.py,PIE808,Unnecessary `start` argument in `range`,"    for r_i in range(0, ratio):",1
+atom/utils/compiler_inferface.py,BLE001,Do not catch blind exception: `Exception`,        except Exception:,2
+atom/utils/compiler_inferface.py,BLE001,Do not catch blind exception: `Exception`,    except Exception:,1
+atom/utils/compiler_inferface.py,S110,"`try`-`except`-`pass` detected, consider logging the exception",        except Exception:,2
+atom/utils/compiler_inferface.py,S110,"`try`-`except`-`pass` detected, consider logging the exception",    except Exception:,1
+atom/utils/cuda_piecewise_backend.py,I001,Import block is un-sorted or un-formatted,import dataclasses,1
+atom/utils/cuda_piecewise_backend.py,PLR0402,Use `from torch import fx` in lieu of alias,import torch.fx as fx,1
+atom/utils/cuda_piecewise_backend.py,RUF100,Unused blanket `noqa` directive,        self.compiled_graph_for_general_shape = compiled_graph_for_general_shape  # noqa,1
+atom/utils/cuda_piecewise_backend.py,UP035,Import from `collections.abc` instead: `Callable`,"from typing import Any, Callable",1
+atom/utils/debug_helper/__init__.py,RUF022,`__all__` is not sorted,__all__ = [,1
+atom/utils/debug_helper/compare.py,PLR0124,"Name compared with itself, consider replacing `cos != cos`",    if cos != cos:  # NaN,1
+atom/utils/debug_helper/compare.py,UP045,Use `X | None` for type annotations,") -> Optional[tuple[int, str, int]]:",1
+atom/utils/debug_helper/compare.py,UP045,Use `X | None` for type annotations,def main(argv: Optional[list[str]] = None) -> int:,1
+atom/utils/debug_helper/dump.py,SIM115,Use a context manager for opening files,"    fp = open(out_path, ""a"", encoding=""utf-8"") if out_path else sys.stderr",1
+atom/utils/debug_helper/ref_patch.py,UP035,"Import from `collections.abc` instead: `Callable`, `Iterator`","from typing import Callable, Iterator, Optional",1
+atom/utils/debug_helper/ref_patch.py,UP045,Use `X | None` for type annotations,"    cls_name_override: Optional[str] = None,",1
+atom/utils/debug_helper/ref_patch.py,UP045,Use `X | None` for type annotations,"    extra_stages: Optional[dict[str, Callable]] = None,",1
+atom/utils/debug_helper/ref_patch.py,UP045,Use `X | None` for type annotations,") -> Optional[Callable[[str, torch.Tensor], None]]:",1
+atom/utils/decorators.py,BLE001,Do not catch blind exception: `Exception`,                except Exception:,1
+atom/utils/decorators.py,BLE001,Do not catch blind exception: `Exception`,            except Exception:,1
+atom/utils/decorators.py,BLE001,Do not catch blind exception: `Exception`,    except Exception:,3
+atom/utils/decorators.py,S110,"`try`-`except`-`pass` detected, consider logging the exception",                except Exception:,1
+atom/utils/decorators.py,S110,"`try`-`except`-`pass` detected, consider logging the exception",            except Exception:,1
+atom/utils/decorators.py,S110,"`try`-`except`-`pass` detected, consider logging the exception",    except Exception:,1
+atom/utils/decorators.py,UP045,Use `X | None` for type annotations,"                    Optional[torch.Tensor],",1
+atom/utils/graph_marker_instrumentation.py,BLE001,Do not catch blind exception: `Exception`,    except Exception:,2
+atom/utils/graph_marker_instrumentation.py,UP035,Import from `collections.abc` instead: `Iterable`,"from typing import Iterable, Optional",1
+atom/utils/graph_marker_instrumentation.py,UP045,Use `X | None` for type annotations,    in_str: Optional[str] = None,2
+atom/utils/graph_marker_instrumentation.py,UP045,Use `X | None` for type annotations,"    layer_id: Optional[int] = None,",1
+atom/utils/graph_marker_instrumentation.py,UP045,Use `X | None` for type annotations,def _extract_graph_marker_name(line: str) -> Optional[str]:,1
+atom/utils/graph_marker_instrumentation.py,UP045,Use `X | None` for type annotations,"def _find_matching_paren(s: str, open_idx: int) -> Optional[int]:",1
+atom/utils/graph_marker_instrumentation.py,UP045,Use `X | None` for type annotations,"def _initial_docstring_span(lines: list[str]) -> Optional[tuple[int, int]]:",1
+atom/utils/graph_marker_instrumentation.py,UP045,Use `X | None` for type annotations,def _layer_id_from_wrapper_path(path: str) -> Optional[int]:,1
+atom/utils/graph_marker_instrumentation.py,UP045,Use `X | None` for type annotations,def _parse_graph_marker_assignment_line(line: str) -> Optional[_ParsedMarkerAssignment]:,1
+atom/utils/graph_marker_instrumentation.py,UP045,Use `X | None` for type annotations,"def _parse_graph_marker_call_expr(expr: str) -> Optional[tuple[str, str]]:",1
+atom/utils/graph_marker_instrumentation.py,UP045,Use `X | None` for type annotations,"def _prefix_and_kind(name: str) -> Optional[tuple[str, str]]:",1
+atom/utils/network.py,BLE001,Do not catch blind exception: `Exception`,    except Exception:,2
+atom/utils/network.py,S110,"`try`-`except`-`pass` detected, consider logging the exception",    except Exception:,2
+atom/utils/numa_utils.py,BLE001,Do not catch blind exception: `Exception`,    except Exception as e:,2
+atom/utils/numa_utils.py,BLE001,Do not catch blind exception: `Exception`,    except Exception:,1
+scripts/performance/save_csv.py,BLE001,Do not catch blind exception: `Exception`,    except Exception as e:,1
+scripts/performance/save_csv.py,I001,Import block is un-sorted or un-formatted,import os,1
+setup.py,I001,Import block is un-sorted or un-formatted,from __future__ import annotations,1
+tests/entrypoints/test_api_server_helpers.py,BLE001,Do not catch blind exception: `Exception`,        except Exception:,1
+tests/plugin/test_sglang_plugin.py,C408,Unnecessary `dict()` call (rewrite as a literal),    defaults = dict(,1
+tests/plugin/test_sglang_plugin.py,SIM117,Use a single `with` statement with multiple contexts instead of nested `with` statements,"    with patch.dict(sys.modules, sgl_mods):",2
+tests/test_dspark_swa_fp8_2buff.py,EXE001,Shebang is present but file is not executable,#!/usr/bin/env python3,1
+tests/test_kv_events.py,C408,Unnecessary `dict()` call (rewrite as a literal),    kwargs = dict(,1
+tests/test_prefill_scheduler.py,RUF059,Unpacked variable `seqs` is never used,"    batch, seqs = sched.schedule()",1
+tests/test_prefix_cache_accuracy.py,BLE001,Do not catch blind exception: `Exception`,        except Exception as e:,1
+tests/test_prefix_cache_accuracy.py,BLE001,Do not catch blind exception: `Exception`,    except Exception as e:,1
+tests/test_prefix_cache_accuracy.py,EXE001,Shebang is present but file is not executable,#!/usr/bin/env python3,1
+tests/test_profiler_regression.py,BLE001,Do not catch blind exception: `Exception`,    except Exception:,1
+tests/test_profiler_regression.py,PLR1722,Use `sys.exit()` instead of `exit`,        exit(0),2
+tests/test_profiler_regression.py,PLR1722,Use `sys.exit()` instead of `exit`,        exit(1),1
+tests/test_profiler_regression.py,PLW1510,`subprocess.run` without explicit `check` argument,        result = subprocess.run(,1
+tests/test_profiler_regression.py,RUF059,Unpacked variable `prof` is never used,"        trace, prof = _profile_graph_replay(model, g, static_input)",1
+tests/test_profiler_regression.py,S110,"`try`-`except`-`pass` detected, consider logging the exception",    except Exception:,1
+tests/test_transfer_engine.py,RUF059,Unpacked variable `n` is never used,"            n, load = sched.get_num_new_matched_tokens(seq)",1
+tests/test_transfer_engine.py,SIM118,Use `key in dict` instead of `key in dict.keys()`,                for k in received_layer_meta.keys(),1
+tests/test_utils.py,RUF059,Unpacked variable `host` is never used,"        scheme, host, port = split_zmq_path(""inproc://my-endpoint"")",1
+tests/test_utils.py,RUF059,Unpacked variable `host` is never used,"        scheme, host, port = split_zmq_path(""ipc:///tmp/test.sock"")",1
+tests/test_utils.py,RUF059,Unpacked variable `port` is never used,"        scheme, host, port = split_zmq_path(""ipc:///tmp/test.sock"")",1
+tools/analyze_trace_summary.py,EXE001,Shebang is present but file is not executable,#!/usr/bin/env python3,1
+tools/analyze_trace_summary.py,UP045,Use `X | None` for type annotations,    current: Optional[DecodeIteration] = None,1
+tools/analyze_trace_summary.py,UP045,Use `X | None` for type annotations,    decode: Optional[StepEvent] = None,1
+tools/backfill_dashboard_gpu_name.py,EXE001,Shebang is present but file is not executable,#!/usr/bin/env python3,1
+tools/parse_trace.py,EXE001,Shebang is present but file is not executable,#!/usr/bin/env python3,1
+tools/parse_trace.py,FURB105,Unnecessary empty string passed to `print`,"    print("""")",4
+tools/parse_trace.py,FURB188,Prefer `str.removeprefix()` over conditionally replacing with slice.,"    if prefix.startswith(""capture_graph_""):",1
