@@ -31,6 +31,9 @@ UNSET = (
     "AITER_REBUILD",
     "ATOM_MONO_COMPILE_INDEX",
     "FLYDSL_RUNTIME_RUN_ONLY",
+    "CK_DIR",
+    "HIP_KITTENS_DIR",
+    "OPUS_GEN_CO_DIR",
 )
 
 
@@ -117,7 +120,9 @@ def environment(args, k, selection):
         ARCH="gfx950",
         AITER_JIT_DIR=selection["native_jit_dir"],
         AITER_CACHE_DIR=selection["native_cache_dir"],
+        AITER_META_DIR=selection["aiter_root"],
         AITER_ASM_DIR=str(Path(selection["aiter_root"]) / "hsa"),
+        OPUS_GEN_CO_DIR=str(Path(selection["aiter_root"]) / "csrc/opus_gemm/gen_co"),
         HF_HOME=str(cache / "hf"),
         HF_MODULES_CACHE=str(cache / "hf_modules"),
         TIKTOKEN_CACHE_DIR=str(cache / "tiktoken"),
@@ -300,6 +305,24 @@ def verify(args):
     if Path(data["model"]).resolve() != Path(args.model).resolve():
         raise ValueError("prepared inputs used another tokenizer source")
     cache = verify_cache(args)
+    if sha256(args.assets_receipt) != args.assets_sha:
+        raise RuntimeError("assembly asset receipt changed")
+    assets = json.loads(args.assets_receipt.read_text())
+    native_root = Path(cache["aiter_selection"]["aiter_root"]).resolve()
+    expected = {
+        "aiter_root": native_root,
+        "asm_dir": native_root / "hsa",
+        "opus_gen_co_dir": native_root / "csrc/opus_gemm/gen_co",
+    }
+    if (
+        assets.get("ready") is not True
+        or any(Path(assets[key]).resolve() != path for key, path in expected.items())
+        or not assets["artifacts"]
+    ):
+        raise RuntimeError("assembly asset selection differs")
+    for path, digest in assets["artifacts"].items():
+        if sha256(path) != digest:
+            raise RuntimeError(f"assembly asset changed: {path}")
     return data, cache
 
 
@@ -457,6 +480,7 @@ def run(args):
                     "ARCH",
                     "HSA_ENABLE_IPC_MODE_LEGACY",
                     "MOONCAKE_DISABLE_HIP_DMABUF",
+                    "OPUS_GEN_CO_DIR",
                 )
             }
             save(
@@ -465,6 +489,7 @@ def run(args):
                     "head": args.head,
                     "base": args.base,
                     "model_pins_sha256": sha256(args.model_pins),
+                    "assets_receipt_sha256": sha256(args.assets_receipt),
                     "cache_identity": cache["identity_fingerprint"],
                     "removed_environment_prefixes": ["ATOM_", "AITER_", "FLYDSL_"],
                     "argv": cmd,
@@ -551,9 +576,17 @@ def main():
         "inputs-sha",
         "cache-sha",
         "model-pins-sha",
+        "assets-sha",
     ):
         parser.add_argument("--" + name, required=True)
-    for name in ("inputs", "cache", "cache-receipt", "model-pins", "output"):
+    for name in (
+        "inputs",
+        "cache",
+        "cache-receipt",
+        "model-pins",
+        "assets-receipt",
+        "output",
+    ):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--python", default="/opt/venv/bin/python")
     parser.add_argument("--port", type=int, default=8654)

@@ -192,6 +192,8 @@ def test_child_environment_removes_inherited_synthetic_settings(monkeypatch, tmp
     monkeypatch.setenv("FLYDSL_RUNTIME_RUN_ONLY", "1")
     monkeypatch.setenv("ATOM_MONO_DEBUG", "1")
     monkeypatch.setenv("FLYDSL_KTRACE_ENABLE", "1")
+    monkeypatch.setenv("OPUS_GEN_CO_DIR", "/other/source")
+    monkeypatch.setenv("AITER_META_DIR", "/other/source")
     env = environment(
         SimpleNamespace(cache=tmp_path),
         3,
@@ -207,6 +209,8 @@ def test_child_environment_removes_inherited_synthetic_settings(monkeypatch, tmp
     assert "ATOM_MONO_DEBUG" not in env
     assert "FLYDSL_KTRACE_ENABLE" not in env
     assert env["AITER_ASM_DIR"] == "/private/aiter/hsa"
+    assert env["AITER_META_DIR"] == "/private/aiter"
+    assert env["OPUS_GEN_CO_DIR"] == "/private/aiter/csrc/opus_gemm/gen_co"
     assert env["ATOM_MONO_POLL_SLEEP_UNITS"] == "16"
     assert env["ATOM_ENABLE_RELAXED_MTP"] == "0"
     assert env["ATOM_SPEC_LOSSLESS_SAMPLING"] == "0"
@@ -342,7 +346,24 @@ def good_verify(monkeypatch, tmp_path):
             }
         )
     )
+    asm_file = tmp_path / "hsa" / "kernel.co"
+    asm_file.parent.mkdir()
+    asm_file.write_bytes(b"ELF-asset")
+    assets_file = tmp_path / "assets.json"
+    assets_file.write_text(
+        json.dumps(
+            {
+                "ready": True,
+                "aiter_root": str(tmp_path),
+                "asm_dir": str(tmp_path / "hsa"),
+                "opus_gen_co_dir": str(tmp_path / "csrc/opus_gemm/gen_co"),
+                "artifacts": {str(asm_file): client.sha256(asm_file)},
+            }
+        )
+    )
     args = SimpleNamespace(
+        assets_receipt=assets_file,
+        assets_sha=client.sha256(assets_file),
         repeats=2,
         startup_timeout=1,
         run_timeout=2,
@@ -511,3 +532,26 @@ def test_cleanup_rechecks_birth_before_signal(monkeypatch, tmp_path):
     monkeypatch.setattr(run.signal, "signal", lambda *a: run.signal.SIG_DFL)
     run.cleanup(SimpleNamespace(pid=12345), {12345: "original"}, tmp_path)
     assert not killed
+
+
+def test_verify_rejects_changed_assembly_selection(good_verify):
+    import json
+
+    from spike.k31_draft_width import client, run
+
+    args, _ = good_verify
+    assets = json.loads(args.assets_receipt.read_text())
+    assets["asm_dir"] += "/gfx950"
+    args.assets_receipt.write_text(json.dumps(assets))
+    args.assets_sha = client.sha256(args.assets_receipt)
+    with pytest.raises(RuntimeError, match="assembly asset selection differs"):
+        run.verify(args)
+
+
+def test_verify_rejects_changed_assembly_bytes(good_verify):
+    from spike.k31_draft_width import run
+
+    args, _ = good_verify
+    (args.cache / "hsa/kernel.co").write_bytes(b"changed")
+    with pytest.raises(RuntimeError, match="assembly asset changed"):
+        run.verify(args)
