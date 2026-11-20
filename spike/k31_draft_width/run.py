@@ -16,6 +16,7 @@ from pathlib import Path
 import httpx
 
 from spike.k31_draft_width.client import (
+    cache_changes,
     cache_inventory,
     measure,
     save,
@@ -517,6 +518,14 @@ def run(args):
                 )
             ] + [Path(env["HOME"]) / ".cache"]
             initial_cache = cache_inventory(cache_roots)
+            save(
+                output / "startup-cache-before.json",
+                {
+                    "epoch_ns": time.time_ns(),
+                    "cache_roots": [str(path) for path in cache_roots],
+                    "files": initial_cache,
+                },
+            )
             with (output / "server.log").open("wb") as log:
                 proc = subprocess.Popen(
                     ["taskset", "-c", "0-111", *cmd],
@@ -579,6 +588,19 @@ def run(args):
                 cleanup(proc, known, output)
                 for sig, handler in previous.items():
                     signal.signal(sig, handler)
+                save(
+                    output / "cache-after-cleanup.json",
+                    {
+                        "epoch_ns": time.time_ns(),
+                        "reached_http_ready": (output / "ready.json").exists(),
+                        "reached_timed_phase": (
+                            output / "measurement/startup.json"
+                        ).exists(),
+                        "changes": cache_changes(
+                            initial_cache, cache_inventory(cache_roots)
+                        ),
+                    },
+                )
     finally:
         os.close(fd)
 

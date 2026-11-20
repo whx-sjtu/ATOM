@@ -670,3 +670,52 @@ def test_startup_cache_writes_are_recorded_and_timed_writes_rejected(
         startup = json.loads((output / "startup.json").read_text())
         assert str(cache / "new_kernel.so") in startup["untimed_cache_changes"]
         assert json.loads((output / "summary.json").read_text())["complete"]
+
+
+def test_startup_failure_keeps_before_and_after_cache_evidence(
+    good_verify, monkeypatch, tmp_path
+):
+    import json
+
+    from spike.k31_draft_width import run
+
+    args, inputs = good_verify
+    args.cache, args.output = tmp_path / "runtime", tmp_path / "failed-run"
+    args.python, args.port = "unused-python", 0
+    args.pause, args.lock = tmp_path / "pause", str(tmp_path / "gpu.lock")
+    native = tmp_path / "native"
+    cache = {
+        "identity_fingerprint": "test",
+        "aiter_selection": {
+            "aiter_root": str(tmp_path / "aiter"),
+            "native_cache_dir": str(native),
+            "native_jit_dir": str(native),
+        },
+    }
+    monkeypatch.setenv("K31_SPIKE_GPU_GRANTED", "1")
+    monkeypatch.delenv("KFD_GUARD_LOG", raising=False)
+    monkeypatch.setattr(run.os, "getpriority", lambda *args: 0)
+    monkeypatch.setattr(run, "verify", lambda args: (inputs, cache))
+    monkeypatch.setattr(run, "vram", lambda: {str(i): 0 for i in range(8)})
+    # No process with this out-of-range PID exists; cleanup must own no real PID.
+    monkeypatch.setattr(
+        run.subprocess,
+        "Popen",
+        lambda *a, **kw: SimpleNamespace(pid=2**30, poll=lambda: None),
+    )
+
+    async def fail_startup(*args):
+        assert (tmp_path / "failed-run/k4/startup-cache-before.json").exists()
+        native.mkdir()
+        (native / "new_kernel.so").write_bytes(b"new")
+        raise RuntimeError("startup failure")
+
+    monkeypatch.setattr(run, "wait_ready", fail_startup)
+    with pytest.raises(RuntimeError, match="startup failure"):
+        run.run(args)
+    arm = tmp_path / "failed-run/k4"
+    after = json.loads((arm / "cache-after-cleanup.json").read_text())
+    assert not after["reached_http_ready"] and not after["reached_timed_phase"]
+    assert after["changes"][str(native / "new_kernel.so")]["before"] is None
+    assert json.loads((arm / "cleanup.json").read_text())["released"]
+    assert not (tmp_path / "failed-run/k3").exists()
