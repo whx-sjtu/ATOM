@@ -411,7 +411,8 @@ def execute(frozen, plan_sha):
                     os.killpg(proc.pid, signal.SIGTERM)
                 except ProcessLookupError:
                     pass
-        raise InterruptedError(f"signal {signum}")
+        # Cancellation must bypass request handlers that retry OSError.
+        raise KeyboardInterrupt(f"signal {signum}")
 
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGINT, interrupt)
