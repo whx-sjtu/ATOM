@@ -267,6 +267,12 @@ async def wait_ready(proc, url, timeout):
     raise TimeoutError("model startup deadline exceeded")
 
 
+def linked_receipt(reference):
+    if sha256(reference["path"]) != reference["sha256"]:
+        raise RuntimeError("linked receipt changed")
+    return json.loads(Path(reference["path"]).read_text())
+
+
 def verify(args):
     validate_repeats(args.repeats)
     if args.startup_timeout <= 0 or args.run_timeout <= args.startup_timeout:
@@ -324,6 +330,12 @@ def verify(args):
         or not assets["artifacts"]
     ):
         raise RuntimeError("assembly asset selection differs")
+    headers = list(assets.get("generated_headers", []))
+    if "base_receipt" in assets:
+        headers += linked_receipt(assets["base_receipt"]).get("generated_headers", [])
+    for header in headers:
+        if sha256(header["path"]) != header["sha256"]:
+            raise RuntimeError("assembly generated header changed")
     for path, digest in assets["artifacts"].items():
         if sha256(path) != digest:
             raise RuntimeError(f"assembly asset changed: {path}")
@@ -391,10 +403,7 @@ def verify_cache(args):
             or sha256(path) != expected
         ):
             raise RuntimeError(f"cache artifact changed: {path}")
-    native_ref = identity["native_receipt"]
-    if sha256(native_ref["path"]) != native_ref["sha256"]:
-        raise RuntimeError("native receipt changed")
-    native = json.loads(Path(native_ref["path"]).read_text())
+    native = linked_receipt(identity["native_receipt"])
     if (
         native.get("native_cpu_ready") is not True
         or native["identity"]["selection"] != selection
@@ -417,16 +426,30 @@ def verify_cache(args):
         ).strip()
         if head != revision or dirty:
             raise RuntimeError("native source revision changed")
-    bound = {
-        **native["artifacts"],
-        **native["compiled_inputs"],
-        **{
-            str(Path(source["source_root"]) / path): value
-            for path, value in source["source_files_sha256"].items()
-        },
-    }
-    if not native["artifacts"] or not native["compiled_inputs"]:
+    provenance, bound = native, dict(native["artifacts"])
+    if "base_receipt" in native:
+        provenance = linked_receipt(native["base_receipt"])
+        for key in ("observed_receipt", "rope_fallback_receipt"):
+            for module in linked_receipt(native[key]):
+                for item in [
+                    module["artifact"],
+                    module["linked_artifact"],
+                    module["ninja"],
+                    *module["sources"],
+                ]:
+                    bound[item["path"]] = item["sha256"]
+    build_source = provenance["identity"]["source"]
+    if any(build_source[key] != source[key] for key in ("aiter_commit", "ck_commit")):
+        raise RuntimeError("reused native source revision differs")
+    if not native["artifacts"] or not provenance["compiled_inputs"]:
         raise RuntimeError("native receipt has no artifact/source binding")
+    bound.update(provenance["compiled_inputs"])
+    bound.update(
+        {
+            str(Path(build_source["source_root"]) / path): value
+            for path, value in build_source["source_files_sha256"].items()
+        }
+    )
     for path, expected in bound.items():
         if sha256(path) != expected:
             raise RuntimeError(f"native artifact/source changed: {path}")

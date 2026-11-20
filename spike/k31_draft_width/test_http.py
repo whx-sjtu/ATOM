@@ -719,3 +719,45 @@ def test_startup_failure_keeps_before_and_after_cache_evidence(
     assert after["changes"][str(native / "new_kernel.so")]["before"] is None
     assert json.loads((arm / "cleanup.json").read_text())["released"]
     assert not (tmp_path / "failed-run/k3").exists()
+
+
+@pytest.mark.parametrize("tampered", ["observed.json", "new-source.cu"])
+def test_recovery_native_build_chain_is_verified(good_verify, tampered):
+    import json
+
+    from spike.k31_draft_width import client, run
+
+    args, _ = good_verify
+    cache = json.loads(args.cache_receipt.read_text())
+    native_file = args.cache / "native.json"
+    native = json.loads(native_file.read_text())
+    base = args.cache / "base-native.json"
+    base.write_text(json.dumps(native))
+    source = args.cache / "new-source.cu"
+    source.write_text("pinned source")
+    artifact = {"path": str(source), "sha256": client.sha256(source)}
+    module = {
+        "artifact": artifact,
+        "linked_artifact": artifact,
+        "ninja": artifact,
+        "sources": [artifact],
+    }
+    observed, rope = args.cache / "observed.json", args.cache / "rope.json"
+    observed.write_text(json.dumps([module]))
+    rope.write_text(json.dumps([module]))
+    native.pop("compiled_inputs")
+    native["identity"]["source"].pop("source_files_sha256")
+    for key, path in (
+        ("base_receipt", base),
+        ("observed_receipt", observed),
+        ("rope_fallback_receipt", rope),
+    ):
+        native[key] = {"path": str(path), "sha256": client.sha256(path)}
+    native_file.write_text(json.dumps(native))
+    cache["identity"]["native_receipt"]["sha256"] = client.sha256(native_file)
+    args.cache_receipt.write_text(json.dumps(cache))
+    args.cache_sha = client.sha256(args.cache_receipt)
+    run.verify(args)
+    (args.cache / tampered).write_text("changed")
+    with pytest.raises(RuntimeError, match="changed"):
+        run.verify(args)
