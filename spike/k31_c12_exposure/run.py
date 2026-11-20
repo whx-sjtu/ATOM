@@ -311,7 +311,7 @@ def capture_metadata(frozen, out):
 
 
 def metrics(out, label, state):
-    for suffix, port in (("server", P["port"]), ("cache", P["cache_metrics_port"])):
+    for suffix, port in (("server", P["port"]), ("cache", P["cache_http_port"])):
         try:
             (out / f"{label}-{suffix}.prom").write_text(
                 request(f"http://127.0.0.1:{port}/metrics")
@@ -462,12 +462,16 @@ def execute(frozen, plan_sha):
         while True:
             check_deadline()
             try:
-                request(f"http://127.0.0.1:{P['cache_metrics_port']}/metrics")
-                break
-            except (OSError, HTTPException):
-                if time.monotonic() >= ready_deadline:
-                    raise TimeoutError("cache readiness bound exceeded")
-                time.sleep(0.2)
+                health = json.loads(
+                    request(f"http://127.0.0.1:{P['cache_http_port']}/healthcheck")
+                )
+                if isinstance(health, dict) and health.get("status") == "healthy":
+                    break
+            except (OSError, HTTPException, ValueError):
+                pass
+            if time.monotonic() >= ready_deadline:
+                raise TimeoutError("cache readiness bound exceeded")
+            time.sleep(0.2)
         server = C.spawn(
             frozen["server"],
             env=env,
