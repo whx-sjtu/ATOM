@@ -63,12 +63,13 @@ def request_ledger(directory):
     with records.open() as source:
         for index, line in enumerate(source):
             row = from_aiperf(json.loads(line), index)
-            if row.get("phase") != "profiling" or row.get("status") != "success":
+            if row.get("status") != "success":
                 continue
-            result["profile_success_records"] += 1
-            result["profile_output_tokens"] += row.get("output_tokens", 0)
             if row.get("output_tokens", 0) <= 0:
                 result["zero_or_missing_output_success"].append(row["request_id"])
+            if row.get("phase") == "profiling":
+                result["profile_success_records"] += 1
+                result["profile_output_tokens"] += row.get("output_tokens", 0)
     result["usable_completed_requests"] = bool(
         sent
         and done
