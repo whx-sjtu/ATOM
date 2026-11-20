@@ -132,6 +132,8 @@ def environment(args, k, selection):
         FLYDSL_RUNTIME_CACHE_DIR=str(cache / "flydsl"),
         TRITON_CACHE_DIR=str(cache / "triton"),
         TORCHINDUCTOR_CACHE_DIR=str(cache / "torchinductor"),
+        TORCHINDUCTOR_COMPILE_THREADS="1",
+        HOME=str(cache / "runs" / args.output.name / "home"),
         TMPDIR=str(cache / "tmp"),
     )
     return env
@@ -454,6 +456,7 @@ def run(args):
             env, cmd = environment(args, k, selection), command(args, k)
             for key in (
                 "TMPDIR",
+                "HOME",
                 "FLYDSL_RUNTIME_CACHE_DIR",
                 "TRITON_CACHE_DIR",
                 "TORCHINDUCTOR_CACHE_DIR",
@@ -475,6 +478,7 @@ def run(args):
                 in (
                     "PYTHONPATH",
                     "TMPDIR",
+                    "HOME",
                     "HIP_VISIBLE_DEVICES",
                     "GPU_ARCHS",
                     "ARCH",

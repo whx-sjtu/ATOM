@@ -195,7 +195,7 @@ def test_child_environment_removes_inherited_synthetic_settings(monkeypatch, tmp
     monkeypatch.setenv("OPUS_GEN_CO_DIR", "/other/source")
     monkeypatch.setenv("AITER_META_DIR", "/other/source")
     env = environment(
-        SimpleNamespace(cache=tmp_path),
+        SimpleNamespace(cache=tmp_path, output=tmp_path / "run-test"),
         3,
         {
             "aiter_root": "/private/aiter",
@@ -555,3 +555,55 @@ def test_verify_rejects_changed_assembly_bytes(good_verify):
     (args.cache / "hsa/kernel.co").write_bytes(b"changed")
     with pytest.raises(RuntimeError, match="assembly asset changed"):
         run.verify(args)
+
+
+@pytest.mark.parametrize("k", [3, 4])
+def test_real_cache_resolver_uses_private_child_home(monkeypatch, tmp_path, k):
+    import json
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    from spike.k31_draft_width.run import environment
+
+    polluted = tmp_path / "inherited-shared"
+    for key in (
+        "HOME",
+        "XDG_CACHE_HOME",
+        "TORCHINDUCTOR_CACHE_DIR",
+        "VLLM_CACHE_ROOT",
+        "ATOM_CACHE_ROOT",
+    ):
+        monkeypatch.setenv(key, str(polluted))
+    monkeypatch.setenv("TORCHINDUCTOR_COMPILE_THREADS", "32")
+    args = SimpleNamespace(
+        cache=tmp_path / "private-cache", output=tmp_path / "run-one"
+    )
+    env = environment(
+        args,
+        k,
+        {
+            "aiter_root": str(tmp_path / "aiter"),
+            "native_jit_dir": str(tmp_path / "native/jit"),
+            "native_cache_dir": str(tmp_path / "native"),
+        },
+    )
+    code = """import json
+from atom.utils.backends import VLLM_CACHE_ROOT
+from torch._inductor.config import compile_threads
+print(json.dumps({"cache_root": VLLM_CACHE_ROOT, "compile_threads": compile_threads}))
+"""
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    observed = json.loads(result.stdout)
+    expected = args.cache / f"k{k}" / "runs/run-one/home/.cache/atom"
+    assert Path(observed["cache_root"]) == expected
+    assert observed["compile_threads"] == 1
+    assert os.environ["HOME"] == str(polluted)
+    assert not polluted.exists()
