@@ -18,6 +18,7 @@ HERE = Path(__file__).resolve().parent
 P = json.loads((HERE / "protocol.json").read_text())
 PRIVATE = Path(P["private_root"])
 logger = logging.getLogger(__name__)
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGALRM)
 
 
 def sha(path):
@@ -278,16 +279,20 @@ def execute(path):
                 K31_TASK7_PLAN_SHA=sha(path),
             )
             command = frozen["command"][:-1] + [str(rank)]
-            owned.add(
-                C.spawn(
-                    command,
-                    env=env,
-                    cwd=ROOT,
-                    log_path=out / f"rank-{rank}.log",
-                    lock_fd=fd,
-                    cpus="0-111",
+            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+            try:
+                owned.add(
+                    C.spawn(
+                        command,
+                        env=env,
+                        cwd=ROOT,
+                        log_path=out / f"rank-{rank}.log",
+                        lock_fd=fd,
+                        cpus="0-111",
+                    )
                 )
-            )
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         wait_for(
             out,
             owned,
@@ -335,7 +340,11 @@ def execute(path):
         signal.setitimer(signal.ITIMER_REAL, 0)
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGALRM):
             signal.signal(sig, signal.SIG_IGN)
-        (out / "abort").touch()
+        try:
+            (out / "abort").touch()
+        except OSError as error:
+            logger.exception("Abort marker failed; continuing owned cleanup")
+            state["abort_error"] = repr(error)
         try:
             owned.stop()
         except Exception as error:
@@ -402,7 +411,7 @@ def self_check():
             "ready",
         )
         try:
-            wait_for(out, owned, lambda rows: False, time.monotonic() - 1, "pair")
+            wait_for(out, owned, lambda rows: True, time.monotonic() - 1, "pair")
         except TimeoutError:
             results["parent_deadline_rejected"] = True
         else:

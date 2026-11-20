@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import signal
 import sys
 import time
 import traceback
@@ -75,7 +76,9 @@ def self_check():
 
 
 def worker(plan_path, rank):
-    from run import load_frozen, save
+    from run import STOP_SIGNALS, load_frozen, save
+
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
 
     frozen = load_frozen(plan_path, require_grant=True)
     protocol = frozen["protocol"]
