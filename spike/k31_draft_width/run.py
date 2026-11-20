@@ -16,6 +16,7 @@ from pathlib import Path
 import httpx
 
 from spike.k31_draft_width.client import (
+    cache_inventory,
     measure,
     save,
     sha256,
@@ -506,6 +507,16 @@ def run(args):
                     "run_timeout_s": args.run_timeout,
                 },
             )
+            cache_roots = [
+                Path(env[key])
+                for key in (
+                    "AITER_JIT_DIR",
+                    "FLYDSL_RUNTIME_CACHE_DIR",
+                    "TRITON_CACHE_DIR",
+                    "TORCHINDUCTOR_CACHE_DIR",
+                )
+            ] + [Path(env["HOME"]) / ".cache"]
+            initial_cache = cache_inventory(cache_roots)
             with (output / "server.log").open("wb") as log:
                 proc = subprocess.Popen(
                     ["taskset", "-c", "0-111", *cmd],
@@ -558,6 +569,8 @@ def run(args):
                         k,
                         args.repeats,
                         output / "measurement",
+                        cache_roots=cache_roots,
+                        initial_cache=initial_cache,
                     )
                 )
             finally:

@@ -30,6 +30,28 @@ def save(path, value):
     temporary.replace(path)
 
 
+def cache_inventory(roots):
+    files = {}
+    for root in roots:
+        for path in Path(root).rglob("*"):
+            if (
+                path.is_file()
+                and path.name not in ("lock", ".ninja_lock")
+                and not (path.name.startswith("lock_") or path.name.endswith(".lock"))
+            ):
+                stat = path.stat()
+                files[str(path)] = [stat.st_size, stat.st_mtime_ns]
+    return files
+
+
+def cache_changes(before, after):
+    return {
+        path: {"before": before.get(path), "after": after.get(path)}
+        for path in before.keys() | after.keys()
+        if before.get(path) != after.get(path)
+    }
+
+
 def validate_inputs(data, model=None):
     definition = json.loads((HERE / "fixtures.json").read_text())
     if (
@@ -185,7 +207,17 @@ async def observe(client):
     return result
 
 
-async def measure(url, model, inputs, k, repeats, output, client=None):
+async def measure(
+    url,
+    model,
+    inputs,
+    k,
+    repeats,
+    output,
+    client=None,
+    cache_roots=(),
+    initial_cache=None,
+):
     validate_inputs(inputs)
     validate_repeats(repeats)
     output = Path(output)
@@ -194,11 +226,24 @@ async def measure(url, model, inputs, k, repeats, output, client=None):
     client = client or httpx.AsyncClient(
         base_url=url, timeout=httpx.Timeout(180), trust_env=False
     )
-    ledger, rounds = [], []
+    ledger, rounds, measured_cache = [], [], None
     stages = [("prime", 4, 0, 8)] + [("warm", c, 0, 128) for c in (1, 2, 4)]
     stages += [("measure", c, r, 128) for c in (1, 2, 4) for r in range(repeats)]
     try:
         for stage, concurrency, repeat, limit in stages:
+            if stage == "measure" and measured_cache is None and cache_roots:
+                measured_cache = cache_inventory(cache_roots)
+                save(
+                    output / "startup.json",
+                    {
+                        "warmup_finished_epoch_ns": time.time_ns(),
+                        "cache_roots": [str(path) for path in cache_roots],
+                        "cache_after_warmup": measured_cache,
+                        "untimed_cache_changes": cache_changes(
+                            initial_cache or {}, measured_cache
+                        ),
+                    },
+                )
             before = await observe(client)
             semaphore = asyncio.Semaphore(concurrency)
 
@@ -223,6 +268,11 @@ async def measure(url, model, inputs, k, repeats, output, client=None):
 
             records = await asyncio.gather(*(one(item) for item in inputs["requests"]))
             save(output / "requests.json", ledger)
+            if stage == "measure" and measured_cache is not None:
+                changes = cache_changes(measured_cache, cache_inventory(cache_roots))
+                if changes:
+                    save(output / "timed-cache-changes.json", changes)
+                    raise RuntimeError("compiler cache changed during timed requests")
             summary = summarize(records)
             rounds.append(
                 {

@@ -607,3 +607,66 @@ print(json.dumps({"cache_root": VLLM_CACHE_ROOT, "compile_threads": compile_thre
     assert observed["compile_threads"] == 1
     assert os.environ["HOME"] == str(polluted)
     assert not polluted.exists()
+
+
+@pytest.mark.parametrize("write_request", [1, 5])
+def test_startup_cache_writes_are_recorded_and_timed_writes_rejected(
+    good_verify, tmp_path, write_request
+):
+    import json
+
+    from spike.k31_draft_width.client import measure
+
+    _, inputs = good_verify
+    cache = tmp_path / "runtime-jit"
+    cache.mkdir()
+    output = tmp_path / "measurement"
+    requests = 0
+
+    def respond(request):
+        nonlocal requests
+        if request.url.path.startswith("/debug/"):
+            return httpx.Response(200, json={})
+        body = json.loads(request.content)
+        requests += 1
+        if requests == write_request:
+            (cache / "new_kernel.so").write_bytes(b"compiled")
+        return httpx.Response(
+            200,
+            json={
+                "id": "test",
+                "prompt_token_ids": body["prompt_token_ids"],
+                "usage": {
+                    "prompt_tokens": len(body["prompt_token_ids"]),
+                    "completion_tokens": body["max_tokens"],
+                },
+                "choices": [{"finish_reason": "length"}],
+            },
+        )
+
+    async def experiment():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(respond), base_url="http://test"
+        ) as client:
+            return await measure(
+                "http://test",
+                "test",
+                inputs,
+                3,
+                2,
+                output,
+                client=client,
+                cache_roots=[cache],
+                initial_cache={},
+            )
+
+    if write_request == 5:
+        with pytest.raises(RuntimeError, match="compiler cache changed"):
+            asyncio.run(experiment())
+        assert not (output / "summary.json").exists()
+        assert json.loads((output / "timed-cache-changes.json").read_text())
+    else:
+        asyncio.run(experiment())
+        startup = json.loads((output / "startup.json").read_text())
+        assert str(cache / "new_kernel.so") in startup["untimed_cache_changes"]
+        assert json.loads((output / "summary.json").read_text())["complete"]
