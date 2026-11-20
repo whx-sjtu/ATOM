@@ -1,0 +1,29 @@
+{
+  "atom_base": "8a7afa1f54a2f78826b2d781cbf319595b85a582",
+  "aiter_root": "/app/k31-agent-team-private/task-6/aiter-572232d",
+  "aiter_sha": "572232d23661a094fbc4e98e879713f0e7d2d5f4",
+  "private_root": "/app/k31-agent-team-private/task-7",
+  "runtime_python": "/opt/venv/bin/python",
+  "world_size": 8,
+  "global_keys": [
+    393216,
+    401408
+  ],
+  "repetitions": 3,
+  "comm_timeout_s": 60,
+  "pair_timeout_s": 30,
+  "whole_timeout_s": 180,
+  "term_timeout_s": 15,
+  "kill_timeout_s": 15,
+  "master_port": 29807,
+  "common": "/share_nfs/whx/work/k31_perf_opt/.opt-team/harness/common.py",
+  "common_sha256": "1479cc118a3d667cc19c570dae34f779c6c7fcac5df8bd061c6537a9fbddd3ab",
+  "native_receipt": "/app/k31-agent-team-private/task-7/native-cache.json",
+  "native_receipt_sha256": "591edfa9178a01f4dfb80d14c51e415a7a00034a7aadd9384d0863f835555d60",
+  "source_sha256": {
+    "atom/distributed/dcp_utils.py": "b55e425a98b794a667e2f11c14fa4e27fe12c8a2babfce5c53658eee8f6e8537",
+    "atom/model_ops/indexer/indexer_forward.py": "ba55e2ad99ee1813e2d8303a65da5613c83b3ed4180b7222fe8c6cd0098deff5",
+    "/app/k31-agent-team-private/task-6/aiter-572232d/aiter/dist/parallel_state.py": "973fb78b5b3cb34983e85441f8a8f89e3dcaa62d2952085d6570cdbfeb6760f2",
+    "/opt/venv/lib/python3.12/site-packages/torch/__init__.py": "51c90fe34a7cf869517d1bab4cd114498790e169ec668f1a154c35ec64117a5e"
+  }
+}
