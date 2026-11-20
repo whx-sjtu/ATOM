@@ -176,6 +176,8 @@ def worker(plan_path, rank):
                 )
                 for plane in (0, 1)
             ]
+            if not all(t.is_contiguous() and t.dtype == torch.uint8 for t in inputs):
+                raise RuntimeError("expected contiguous uint8 inputs")
             current = torch.cuda.current_stream()
             start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
                 enable_timing=True

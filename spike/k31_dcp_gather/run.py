@@ -226,12 +226,12 @@ def wait_for(out, owned, predicate, deadline, phase):
         errors = [s for s in states if s["phase"] == "error"]
         if errors:
             raise RuntimeError(f"rank failure: {errors[0]['error']}")
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"{phase} deadline exceeded")
         if len(states) == 8 and predicate(states):
             return states
         if any(p.poll() is not None for p in owned.roots):
             raise RuntimeError("rank exited before the phase completed")
-        if time.monotonic() >= deadline:
-            raise TimeoutError(f"{phase} deadline exceeded")
         time.sleep(0.01)
 
 
@@ -309,6 +309,7 @@ def execute(path):
                 deadline,
                 f"pair {index}",
             )
+        state["phase"] = "teardown"
         (out / "finish").touch()
         state["ranks"] = wait_for(
             out,
@@ -320,6 +321,8 @@ def execute(path):
         for child in owned.roots:
             if child.wait(timeout=max(0.01, whole - time.monotonic())) != 0:
                 raise RuntimeError("rank failed after verification")
+        if time.monotonic() >= whole:
+            raise TimeoutError("whole execution deadline exceeded")
         state.update(
             outcome="PASS", phase="complete", elapsed_s=time.monotonic() - start
         )
