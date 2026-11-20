@@ -761,3 +761,35 @@ def test_recovery_native_build_chain_is_verified(good_verify, tampered):
     (args.cache / tampered).write_text("changed")
     with pytest.raises(RuntimeError, match="changed"):
         run.verify(args)
+
+
+def test_port_probe_allows_time_wait_but_rejects_active_listener():
+    import errno
+    import socket
+
+    from spike.k31_draft_width.run import check_port
+
+    with socket.socket() as listener:
+        # asyncio's POSIX server sockets enable SO_REUSEADDR, as Uvicorn does.
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.settimeout(3)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        with pytest.raises(OSError) as occupied:
+            check_port(port)
+        assert occupied.value.errno == errno.EADDRINUSE
+        with socket.create_connection(("127.0.0.1", port), timeout=3) as client:
+            peer, _ = listener.accept()
+            with peer:
+                peer.settimeout(3)
+                peer.shutdown(socket.SHUT_WR)
+                assert client.recv(1) == b""
+                client.close()
+                assert peer.recv(1) == b""
+        listener.close()
+        # The server's active close leaves TIME_WAIT after its listener is gone.
+        with socket.socket() as old_probe, pytest.raises(OSError) as old_error:
+            old_probe.bind(("127.0.0.1", port))
+        assert old_error.value.errno == errno.EADDRINUSE
+        check_port(port)

@@ -141,6 +141,12 @@ def environment(args, k, selection):
     return env
 
 
+def check_port(port):
+    with socket.socket() as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        probe.bind(("127.0.0.1", port))
+
+
 def vram():
     result = {
         str(p): int(p.read_text())
@@ -491,8 +497,7 @@ def run(args):
                 "XDG_CACHE_HOME",
             ):
                 Path(env[key]).mkdir(parents=True, exist_ok=True)
-            with socket.socket() as port:
-                port.bind(("127.0.0.1", args.port))
+            check_port(args.port)
             recorded = {
                 key: value
                 for key, value in env.items()
