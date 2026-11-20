@@ -1,7 +1,7 @@
 {
   "base": "8a7afa1f54a2f78826b2d781cbf319595b85a582",
   "aiter_sha": "572232d23661a094fbc4e98e879713f0e7d2d5f4",
-  "aiter_root": "/app/k31-agent-team-private/task-4-aiter-572232d/src",
+  "aiter_root": "/app/k31-agent-team-private/task-6/aiter-572232d",
   "model": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro",
   "draft": "/app/agent-team-scratch/models/Kimi-K3.1-Pro-DSpark-preview-6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94",
   "draft_revision": "6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94",
@@ -51,5 +51,6 @@
   "trace_export_timeout_s": 120,
   "max_profile_upper_bound_s": 10,
   "state_policy": "Fresh service and private LMCache namespace once; retain state across u1/u2/diagnostic. Identical client seed/warmup policy is not KV/SSM state equivalence.",
-  "scope": "Bounded exposure only; not official submission. No candidate, GSM8K or 3600-second client run."
+  "scope": "Bounded exposure only; not official submission. No candidate, GSM8K or 3600-second client run.",
+  "ck_sha": "f93c029e09f67c983696eecac8e0e0350f3dbb54"
 }

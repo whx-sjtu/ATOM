@@ -31,11 +31,9 @@ def request_ledger(directory):
     from atom.benchmarks.results.records import from_aiperf
 
     log = directory / "logs/aiperf.log"
-    text = (
-        log.read_text(errors="replace")
-        if log.exists()
-        else (directory / "console.log").read_text(errors="replace")
-    )
+    if not log.exists():
+        log = directory / "console.log"
+    text = log.read_text(errors="replace")
     sent, done = SENT.findall(text), DONE.findall(text)
     records = directory / "profile_export.jsonl"
     result = {
@@ -46,6 +44,7 @@ def request_ledger(directory):
         "errors": None,
         "zero_or_missing_output_success": [],
         "profile_success_records": 0,
+        "profile_output_tokens": 0,
         "usable_completed_requests": False,
     }
     if sent and done and sent[-1][0] == done[-1][0]:
@@ -67,6 +66,7 @@ def request_ledger(directory):
             if row.get("phase") != "profiling" or row.get("status") != "success":
                 continue
             result["profile_success_records"] += 1
+            result["profile_output_tokens"] += row.get("output_tokens", 0)
             if row.get("output_tokens", 0) <= 0:
                 result["zero_or_missing_output_success"].append(row["request_id"])
     result["usable_completed_requests"] = bool(
@@ -92,6 +92,23 @@ def union_us(intervals):
     return total
 
 
+def row_fields(name):
+    match = re.match(
+        r"((?:dummy_)?(?:prefill|decode|eager_decode))\[bs=(\d+)(?:/(\d+))?(?: tok=(\d+)(?:/(\d+))?)?",
+        name,
+    )
+    if not match:
+        return None
+    kind, batch, running, tokens, rows = match.groups()
+    return {
+        "kind": kind,
+        "scheduled_batch": int(batch),
+        "running_batch": int(running or batch),
+        "scheduled_tokens": int(tokens) if tokens else None,
+        "running_rows": int(rows or tokens) if tokens else None,
+    }
+
+
 def qualify_window(record, trace_root):
     reasons = []
     if record.get("errors"):
@@ -104,6 +121,12 @@ def qualify_window(record, trace_root):
     upper = record.get("upper_bound_s", {})
     if set(upper) != RANKS or any(not 0 <= value <= 10 for value in upper.values()):
         reasons.append("all-rank active-time upper bound unproven")
+    if any(
+        record["stopped"][r] < start or start < record["start_request_mono"]
+        for r, start in record.get("started", {}).items()
+        if r in record.get("stopped", {})
+    ):
+        reasons.append("unordered lifecycle")
     if set(record.get("exports", {})) != RANKS:
         reasons.append("all-rank exports missing")
     traces = {}
@@ -129,23 +152,28 @@ def qualify_window(record, trace_root):
             families = {}
             for event in kernels:
                 name = event["name"]
-                family = (
-                    "mono_k2"
-                    if "k3_mono_k2" in name
-                    else (
-                        "mono_k1"
-                        if "k3_mono_k1" in name
-                        else (
-                            "communication"
-                            if re.search(
-                                r"nccl|rccl|all_reduce|all_gather|reduce_scatter",
-                                name,
-                                re.IGNORECASE,
-                            )
-                            else "other"
+                family = next(
+                    (
+                        label
+                        for stem, label in (
+                            ("k3_mono_k2", "mono_k2"),
+                            ("k3_mono_kda_pre", "mono_k1"),
+                            ("mono_dsa_indexer_", "mono_indexer"),
                         )
-                    )
+                        if stem in name
+                    ),
+                    None,
                 )
+                if family is None:
+                    family = (
+                        "communication"
+                        if re.search(
+                            r"nccl|rccl|all_reduce|all_gather|reduce_scatter",
+                            name,
+                            re.IGNORECASE,
+                        )
+                        else "other"
+                    )
                 families.setdefault(family, []).append(
                     (event["ts"], event["ts"] + event["dur"])
                 )
@@ -155,7 +183,7 @@ def qualify_window(record, trace_root):
                 if e.get("ph") == "X"
                 and (
                     e.get("name", "").startswith("ATOM::")
-                    or re.match(r"(prefill|decode|eager_decode)\[", e.get("name", ""))
+                    or row_fields(e.get("name", "")) is not None
                 )
             ]
             traces[rank] = {
@@ -168,19 +196,27 @@ def qualify_window(record, trace_root):
                     k: union_us(v) for k, v in families.items()
                 },
                 "host_scopes": [
-                    {"name": e["name"], "ts": e["ts"], "dur": e["dur"]} for e in labels
+                    {
+                        "name": e["name"],
+                        "ts": e["ts"],
+                        "dur": e["dur"],
+                        "rows": row_fields(e["name"]),
+                    }
+                    for e in labels
                 ],
                 "mono_kernel_rows": sorted(
                     {
                         int(m[1])
                         for e in kernels
-                        if (m := re.search(r"k3_mono_k[12]_s(\d+)_", e["name"]))
+                        if (
+                            m := re.search(r"k3_mono_(?:k2|kda_pre)_s(\d+)_", e["name"])
+                        )
                     }
                 ),
                 "complete_mla_tail_gpu_cost": None,
                 "embedded_k2_communication_cost": None,
             }
-        except (OSError, ValueError, KeyError) as error:
+        except (OSError, ValueError, KeyError, TypeError) as error:
             reasons.append(f"rank {rank}: {error}")
     return {
         "qualified": not reasons,
@@ -261,15 +297,41 @@ def summarize(out):
             result["unprofiled"][label] = {
                 "request_metrics": data.get("request_metrics"),
                 "accounting": data.get("accounting"),
+                "window": data.get("window"),
+                "capabilities": data.get("capabilities"),
+                "validity": data.get("validity"),
+                "verification": read(out / label / "verification.json"),
                 "ledger": read(out / label / "ledger.json"),
             }
         else:
             result["unprofiled"][label] = {"missing": "canonical bundle"}
     for path in sorted((out / "diagnostic").glob("window*.json")):
         result["diagnostics"].append(qualify_window(read(path), out / "traces"))
+    qualified = [d for d in result["diagnostics"] if d["qualified"]]
     result["conclusion"] = (
-        "Observed exposure only; missing complete boundaries remain unknown. No candidate or acceptance claim."
+        "Missing observation: complete native MLA tail and embedded K2 communication boundaries. Trace family intervals and host scopes cannot establish either optimization benefit."
+        if qualified
+        else "Missing observation: a qualified all-rank diagnostic window with complete trace exports within the active-time bound."
     )
+    result["reproduction_range"] = {}
+    for name, path in (
+        ("input_throughput", ("throughput", "per_gpu", "input_tput_tps")),
+        ("full_response_interactivity", ("latency", "full_response_intvty", "mean")),
+    ):
+        values = []
+        for item in result["unprofiled"].values():
+            if item.get("ledger", {}).get("usable_completed_requests"):
+                value = item.get("request_metrics", {})
+                for key in path:
+                    value = value.get(key) if isinstance(value, dict) else None
+                if isinstance(value, (int, float)):
+                    values.append(value)
+        result["reproduction_range"][name] = (
+            {"min": min(values), "max": max(values), "samples": values}
+            if len(values) == 2
+            else None
+        )
+
     write(out / "exposure.json", result)
     return result
 

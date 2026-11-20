@@ -8,12 +8,13 @@ import os
 import re
 import signal
 import subprocess
+import threading
 import time
 from http.client import HTTPException
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-from plan import PRIVATE, ROOT, WS, P, git, make_plan
+from plan import PRIVATE, ROOT, WS, P, git, make_plan, sha
 
 logger = logging.getLogger(__name__)
 COMMON = WS / "harness/common.py"
@@ -35,23 +36,6 @@ def request(url, timeout=2, post=False):
         return response.read().decode()
 
 
-def command(argv, env, timeout, logfile):
-    with logfile.open("ab") as log:
-        result = subprocess.run(
-            argv,
-            check=False,
-            cwd=ROOT,
-            env=env,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            timeout=timeout,
-        )
-    if result.returncode:
-        raise RuntimeError(
-            f"command exited {result.returncode}: {argv[0]}; see {logfile}"
-        )
-
-
 def profile_window(url, out, server_log, trace_root):
     t0 = time.monotonic()
     cursor = server_log.stat().st_size
@@ -66,15 +50,21 @@ def profile_window(url, out, server_log, trace_root):
         "before_files": sorted(before),
     }
     pending = b""
+    with server_log.open("rb") as source:
+        source.seek(max(0, cursor - 1))
+        skip_partial = bool(cursor and source.read(1) != b"\n")
 
     def observe():
-        nonlocal cursor, pending
+        nonlocal cursor, pending, skip_partial
         with server_log.open("rb") as source:
             source.seek(cursor)
             pending += source.read()
             cursor = source.tell()
         lines = pending.split(b"\n")
         pending = lines.pop()
+        if skip_partial and lines:
+            lines.pop(0)
+            skip_partial = False
         for raw in lines:
             line = raw.decode(errors="replace")
             now = time.monotonic()
@@ -89,7 +79,12 @@ def profile_window(url, out, server_log, trace_root):
                 evidence[field][rank] = now
             match = EXPORT.search(line)
             if match:
-                evidence["exports"][match[1]] = match[2]
+                rank = match[1]
+                if rank in evidence["exports"] or rank not in evidence["started"]:
+                    evidence["errors"].append(
+                        f"rank {rank}: unordered/duplicate export"
+                    )
+                evidence["exports"][rank] = match[2]
             if "profiler stop failed" in line or "failed to export trace" in line:
                 evidence["errors"].append(line)
 
@@ -126,6 +121,11 @@ def profile_window(url, out, server_log, trace_root):
             evidence["errors"].append(
                 "all-rank stop/export completion was not observed"
             )
+        if any(
+            v > P["max_profile_upper_bound_s"]
+            for v in evidence["upper_bound_s"].values()
+        ):
+            evidence["errors"].append("profile active-time upper bound exceeded")
         save(out, evidence)
     if evidence["errors"]:
         raise RuntimeError(f"profiler control/export failed; no further window: {out}")
@@ -148,11 +148,49 @@ def run_client(C, frozen, out, label, fd, track, check_deadline):
     )
     track(process)
     deadline = time.monotonic() + P["client_timeout_s"]
-    phase, index, windows = None, 0, []
+    expired = threading.Event()
+
+    def expire():
+        expired.set()
+        save(
+            directory / "censored.json",
+            {"deadline_mono": deadline, "observed_mono": time.monotonic()},
+        )
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    watchdog = threading.Timer(P["client_timeout_s"], expire)
+    watchdog.daemon = True
+    watchdog.start()
+    windows = []
+    try:
+        _monitor_client(process, directory, label, out, windows, check_deadline)
+    finally:
+        watchdog.cancel()
+        watchdog.join()
+    if expired.is_set():
+        raise TimeoutError(f"{label} censored by external client bound")
+    result = json.loads((directory / "client-result.json").read_text())
+    if (
+        process.returncode
+        or not result["phase_observed"]
+        or not (directory / "profile_export_aiperf.json").exists()
+    ):
+        raise RuntimeError(f"{label} produced no usable completed invocation")
+    from analyze import request_ledger
+
+    ledger = request_ledger(directory)
+    save(directory / "ledger.json", ledger)
+    if not ledger["usable_completed_requests"]:
+        raise RuntimeError(f"{label} request ledger failed; no implicit retry")
+
+
+def _monitor_client(process, directory, label, out, windows, check_deadline):
+    phase, index = None, 0
     while process.poll() is None:
         check_deadline()
-        if time.monotonic() >= deadline:
-            raise TimeoutError(f"{label} exceeded the external client bound")
         logs = [directory / "logs/aiperf.log", directory / "console.log"]
         if phase is None:
             for log in logs:
@@ -194,21 +232,13 @@ def run_client(C, frozen, out, label, fd, track, check_deadline):
             "instrumented": label == "diagnostic",
         },
     )
-    if (
-        process.returncode
-        or phase is None
-        or not (directory / "profile_export_aiperf.json").exists()
-    ):
-        raise RuntimeError(f"{label} produced no usable completed invocation")
-    from analyze import request_ledger
-
-    ledger = request_ledger(directory)
-    save(directory / "ledger.json", ledger)
-    if not ledger["usable_completed_requests"]:
-        raise RuntimeError(f"{label} request ledger failed; no implicit retry")
 
 
 def capture_metadata(frozen, out):
+    import aiter
+    import aiter_worker_limits
+
+    import atom
     from atom.benchmarks.results.metadata import capture_config
 
     env = frozen["environment"]
@@ -220,30 +250,73 @@ def capture_metadata(frozen, out):
         {"argv": frozen["server"], "environment": env},
     )
     save(out / "installed-metadata-config.json", config)
-    receipt = json.loads((PRIVATE / "runtime-imports.json").read_text())
-    if not Path(receipt["atom_file"]).is_relative_to(ROOT) or not Path(
-        receipt["aiter_file"]
-    ).is_relative_to(P["aiter_root"]):
-        raise RuntimeError(
-            "runtime source receipt does not select the planned repositories"
-        )
-    config["software"]["aiter_sha"] = P["aiter_sha"]
-    config["software"]["aiter_sha_source"] = "verified_runtime_import_root"
+    actual = {}
+    for name, module, root, commit in (
+        ("atom", atom, ROOT, frozen["head"]),
+        ("aiter", aiter, Path(P["aiter_root"]), P["aiter_sha"]),
+        (
+            "aiter_worker_limits",
+            aiter_worker_limits,
+            Path(P["aiter_root"]),
+            P["aiter_sha"],
+        ),
+    ):
+        path = Path(module.__file__).resolve()
+        source_sha = subprocess.check_output(
+            ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
+        ).strip()
+        dirty = subprocess.check_output(
+            ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=no"],
+            text=True,
+        ).strip()
+        actual[name] = {"path": str(path), "sha": source_sha, "dirty": dirty}
+        if not path.is_relative_to(root.resolve()) or source_sha != commit or dirty:
+            raise RuntimeError(f"runtime source mismatch: {name}: {actual[name]}")
+    ck_sha = subprocess.check_output(
+        [
+            "git",
+            "-C",
+            str(Path(P["aiter_root"]) / "3rdparty/composable_kernel"),
+            "rev-parse",
+            "HEAD",
+        ],
+        text=True,
+    ).strip()
+    if ck_sha != P["ck_sha"]:
+        raise RuntimeError("CK source revision changed")
+    actual["ck_sha"] = ck_sha
+    save(out / "runtime-imports.json", actual)
+    config["software"]["aiter_sha"] = actual["aiter"]["sha"]
+    config["software"]["aiter_sha_source"] = "verified_runtime_import_and_git"
     save(out / "base-config.json", config)
 
 
-def execute(frozen):
+def metrics(out, label, state):
+    for suffix, port in (("server", P["port"]), ("cache", P["cache_metrics_port"])):
+        try:
+            (out / f"{label}-{suffix}.prom").write_text(
+                request(f"http://127.0.0.1:{port}/metrics")
+            )
+        except (OSError, HTTPException) as error:
+            state["errors"].append(f"metrics {suffix}: {error!r}")
+
+
+def execute(frozen, plan_sha):
     import psutil
 
     expected = make_plan(Path(frozen["output"]))
     if frozen != expected or git("status", "--porcelain"):
         raise RuntimeError("source or frozen plan changed")
-    if os.environ.get("K31_TASK6_GPU_GRANT") != frozen["head"]:
-        raise RuntimeError("no lease for this exact head")
+    if (
+        os.environ.get("K31_TASK6_GPU_GRANT") != frozen["head"]
+        or os.environ.get("K31_TASK6_PLAN_SHA") != plan_sha
+    ):
+        raise RuntimeError("no lease for this exact head and plan file")
     if os.environ.get("KFD_GUARD_LOG") or os.nice(0) != 0:
         raise RuntimeError("GPU work cannot inherit the CPU guard or nice19")
     ready = json.loads((PRIVATE / "runtime-ready.json").read_text())
-    if not ready.get("ready"):
+    dataset = json.loads((PRIVATE / "dataset-ready.json").read_text())
+    if not ready.get("ready") or not dataset.get("ready"):
         raise RuntimeError("runtime and cache closure is not ready")
     spec = importlib.util.spec_from_file_location("owned_lifecycle", COMMON)
     C = importlib.util.module_from_spec(spec)
@@ -253,7 +326,7 @@ def execute(frozen):
         raise FileExistsError(out)
     fd = C.GpuLock(LOCK).acquire()
     out.mkdir()
-    processes, seen = [], {}
+    processes, seen, services = [], {}, []
     state = {
         "state": "STARTING",
         "head": frozen["head"],
@@ -295,6 +368,8 @@ def execute(frozen):
 
     def check_deadline():
         track()
+        if any(p.poll() is not None for p in services):
+            raise RuntimeError("a persistent server exited")
         if time.monotonic() >= deadline:
             raise TimeoutError("whole workload bound exceeded")
 
@@ -325,17 +400,22 @@ def execute(frozen):
         metadata_env = dict(
             frozen["environment"], K31_TASK6_METADATA_LEASE=frozen["head"]
         )
-        command(
+        metadata = C.spawn(
             [
                 "/opt/venv/bin/python",
                 str(Path(__file__).resolve()),
                 "--capture-metadata",
                 str(out / "plan.json"),
             ],
-            metadata_env,
-            60,
-            out / "metadata.log",
+            env=metadata_env,
+            cwd=ROOT,
+            log_path=out / "metadata.log",
+            lock_fd=fd,
+            cpus="0-111",
         )
+        track(metadata)
+        if metadata.wait(timeout=60):
+            raise RuntimeError("metadata capture failed; see metadata.log")
         env = frozen["environment"]
         cache = C.spawn(
             frozen["cache"],
@@ -346,6 +426,17 @@ def execute(frozen):
             cpus="0-111",
         )
         track(cache)
+        services.append(cache)
+        ready_deadline = time.monotonic() + P["readiness_timeout_s"]
+        while True:
+            check_deadline()
+            try:
+                request(f"http://127.0.0.1:{P['cache_metrics_port']}/metrics")
+                break
+            except (OSError, HTTPException):
+                if time.monotonic() >= ready_deadline:
+                    raise TimeoutError("cache readiness bound exceeded")
+                time.sleep(0.2)
         server = C.spawn(
             frozen["server"],
             env=env,
@@ -355,7 +446,7 @@ def execute(frozen):
             cpus="0-111",
         )
         track(server)
-        ready_deadline = time.monotonic() + P["readiness_timeout_s"]
+        services.append(server)
         while True:
             check_deadline()
             if server.poll() is not None or cache.poll() is not None:
@@ -372,15 +463,11 @@ def execute(frozen):
         state["ready_at"] = time.time()
         save(out / "status.json", state)
         for label in ("u1", "u2", "diagnostic"):
-            for suffix, url in (
-                ("server", f"http://127.0.0.1:{P['port']}/metrics"),
-                ("cache", f"http://127.0.0.1:{P['cache_metrics_port']}/metrics"),
-            ):
-                try:
-                    (out / f"before-{label}-{suffix}.prom").write_text(request(url))
-                except OSError as error:
-                    state["errors"].append(f"metrics {suffix}: {error!r}")
-            run_client(C, frozen, out, label, fd, track, check_deadline)
+            metrics(out, f"before-{label}", state)
+            try:
+                run_client(C, frozen, out, label, fd, track, check_deadline)
+            finally:
+                metrics(out, f"after-{label}", state)
         state["state"] = "COMPLETED"
     except BaseException as error:
         logger.exception("Bounded workload failed")
@@ -454,7 +541,7 @@ def main():
             raise RuntimeError("metadata device query requires the owned lease")
         capture_metadata(frozen, Path(frozen["output"]))
     else:
-        execute(json.loads(args.run_plan.read_text()))
+        execute(json.loads(args.run_plan.read_text()), sha(args.run_plan))
 
 
 if __name__ == "__main__":
