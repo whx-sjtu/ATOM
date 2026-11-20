@@ -115,11 +115,16 @@ def worker(plan_path, rank):
             .is_relative_to(Path(protocol["aiter_root"]))
         ):
             raise RuntimeError("unexpected AITER import")
+        count = torch.cuda.device_count()
+        mark("hardware", device_count=count)
+        if count != protocol["world_size"]:
+            raise RuntimeError(f"unexpected device count: {count}")
+        properties = torch.cuda.get_device_properties(rank)
+        hardware = {key: getattr(properties, key) for key in protocol["hardware"]}
+        mark("hardware", device_properties=hardware)
+        if hardware != protocol["hardware"]:
+            raise RuntimeError(f"unexpected device properties: {hardware}")
         torch.cuda.set_device(rank)
-        if torch.cuda.device_count() != 8 or "MI355" not in torch.cuda.get_device_name(
-            rank
-        ):
-            raise RuntimeError("expected eight MI355X local devices")
         ps.init_distributed_environment(world_size=8, rank=rank, local_rank=rank)
         ps.initialize_model_parallel(
             tensor_model_parallel_size=8,

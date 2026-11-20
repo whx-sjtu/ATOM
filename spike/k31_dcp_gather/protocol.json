@@ -24,6 +24,12 @@
     "atom/distributed/dcp_utils.py": "b55e425a98b794a667e2f11c14fa4e27fe12c8a2babfce5c53658eee8f6e8537",
     "atom/model_ops/indexer/indexer_forward.py": "ba55e2ad99ee1813e2d8303a65da5613c83b3ed4180b7222fe8c6cd0098deff5",
     "/app/k31-agent-team-private/task-6/aiter-572232d/aiter/dist/parallel_state.py": "973fb78b5b3cb34983e85441f8a8f89e3dcaa62d2952085d6570cdbfeb6760f2",
-    "/opt/venv/lib/python3.12/site-packages/torch/__init__.py": "51c90fe34a7cf869517d1bab4cd114498790e169ec668f1a154c35ec64117a5e"
+    "/opt/venv/lib/python3.12/site-packages/torch/__init__.py": "51c90fe34a7cf869517d1bab4cd114498790e169ec668f1a154c35ec64117a5e",
+    "/share_nfs/whx/work/k31_perf_opt/.opt-team/agent-team/evidence/task-7/hardware-metadata-01/reader.log": "9f2d77effee980ffecba2cd83f2b7dc21ba3dcc47cfb0c3da10162e9c105c755"
+  },
+  "hardware": {
+    "name": "AMD Radeon Graphics",
+    "gcnArchName": "gfx950:sramecc+:xnack-",
+    "total_memory": 309220868096
   }
 }
