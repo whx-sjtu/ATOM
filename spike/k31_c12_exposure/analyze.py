@@ -244,6 +244,8 @@ def build_cases(out):
         identity = capture_hf_dataset(PRIVATE / "hf-datasets", export)
         write(directory / "dataset-identity.json", identity)
         bundle = directory / "bundle"
+        client_path = directory / "client-result.json"
+        client = read(client_path) if client_path.exists() else {}
         if not bundle.exists():
             build_bundle(
                 config,
@@ -255,7 +257,7 @@ def build_cases(out):
                     "client": directory / "logs/aiperf.log",
                     "server": out / "server.log",
                 },
-                exit_code=0 if ledger["usable_completed_requests"] else 1,
+                exit_code=client.get("exit_code", 1),
                 client_launch=directory / "launch.json",
             )
         result = subprocess.run(
@@ -295,15 +297,35 @@ def summarize(out):
         path = out / label / "bundle/summary.json"
         if path.exists():
             data = read(path)
-            result["unprofiled"][label] = {
+            item = {
                 "request_metrics": data.get("request_metrics"),
                 "accounting": data.get("accounting"),
                 "window": data.get("window"),
                 "capabilities": data.get("capabilities"),
-                "validity": data.get("validity"),
-                "verification": read(out / label / "verification.json"),
-                "ledger": read(out / label / "ledger.json"),
             }
+            for field, filename in (
+                ("validation", path.with_name("validation.json")),
+                ("verification", out / label / "verification.json"),
+                ("ledger", out / label / "ledger.json"),
+                ("client_result", out / label / "client-result.json"),
+            ):
+                item[field] = read(filename) if filename.exists() else {}
+            item["censored"] = (out / label / "censored.json").exists() or item[
+                "client_result"
+            ].get("censored", True)
+            item["range_eligible"] = bool(
+                item["ledger"].get("usable_completed_requests")
+                and item["client_result"].get("exit_code") == 0
+                and item["client_result"].get("phase_observed") is True
+                and not item["censored"]
+                and item["verification"].get("exit_code") == 0
+                and item["validation"].get("complete") is True
+                and item["validation"].get("exit_code") == 0
+                and not data["accounting"]["counts"].get("invalid")
+                and data["accounting"]["counts"].get("profiled_success")
+                == item["ledger"].get("profile_success_records")
+            )
+            result["unprofiled"][label] = item
         else:
             result["unprofiled"][label] = {"missing": "canonical bundle"}
     for path in sorted((out / "diagnostic").glob("window*.json")):
@@ -316,12 +338,15 @@ def summarize(out):
     )
     result["reproduction_range"] = {}
     for name, path in (
-        ("input_throughput", ("throughput", "per_gpu", "input_tput_tps")),
-        ("full_response_interactivity", ("latency", "full_response_intvty", "mean")),
+        ("total_throughput_per_gpu_tps", ("throughput", "per_gpu", "total_tput_tps")),
+        (
+            "full_response_interactivity_p90_tps",
+            ("latency", "full_response_intvty", "p90"),
+        ),
     ):
         values = []
         for item in result["unprofiled"].values():
-            if item.get("ledger", {}).get("usable_completed_requests"):
+            if item.get("range_eligible"):
                 value = item.get("request_metrics", {})
                 for key in path:
                     value = value.get(key) if isinstance(value, dict) else None

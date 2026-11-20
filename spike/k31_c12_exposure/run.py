@@ -171,13 +171,16 @@ def run_client(C, frozen, out, label, fd, track, check_deadline):
     watchdog.start()
     windows = []
     try:
-        _monitor_client(process, directory, label, out, windows, check_deadline)
+        result = _monitor_client(
+            process, directory, label, out, windows, check_deadline
+        )
     finally:
         watchdog.cancel()
         watchdog.join()
+    result["censored"] = expired.is_set()
+    save(directory / "client-result.json", result)
     if expired.is_set():
         raise TimeoutError(f"{label} censored by external client bound")
-    result = json.loads((directory / "client-result.json").read_text())
     if (
         process.returncode
         or not result["phase_observed"]
@@ -228,15 +231,12 @@ def _monitor_client(process, directory, label, out, windows, check_deadline):
                     )
                 index += 1
         time.sleep(0.1)
-    save(
-        directory / "client-result.json",
-        {
-            "exit_code": process.returncode,
-            "phase_observed": phase is not None,
-            "windows": windows,
-            "instrumented": label == "diagnostic",
-        },
-    )
+    return {
+        "exit_code": process.returncode,
+        "phase_observed": phase is not None,
+        "windows": windows,
+        "instrumented": label == "diagnostic",
+    }
 
 
 def capture_metadata(frozen, out):
@@ -359,7 +359,19 @@ def execute(frozen, plan_sha):
     def track(process=None):
         if process is not None:
             processes.append(process)
+            try:
+                if process.poll() is None:
+                    seen[process.pid] = psutil.Process(process.pid).create_time()
+            except psutil.NoSuchProcess:
+                pass
         for parent in processes:
+            try:
+                if parent.poll() is not None or psutil.Process(
+                    parent.pid
+                ).create_time() != seen.get(parent.pid):
+                    continue
+            except psutil.NoSuchProcess:
+                continue
             candidates = {parent.pid, *C.descendants(parent.pid)}
             for item in psutil.process_iter(["pid", "create_time"]):
                 try:
@@ -369,7 +381,7 @@ def execute(frozen, plan_sha):
                     pass
             for pid in candidates:
                 try:
-                    seen.setdefault(pid, psutil.Process(pid).create_time())
+                    seen[pid] = psutil.Process(pid).create_time()
                 except psutil.NoSuchProcess:
                     pass
         live = []
@@ -537,7 +549,7 @@ def execute(frozen, plan_sha):
             if released:
                 os.close(fd)
                 break
-            print("CLEANUP_FAILED_HOLDING_LOCK", flush=True)
+            logger.error("CLEANUP_FAILED_HOLDING_LOCK")
             time.sleep(5)
     print(
         json.dumps(
