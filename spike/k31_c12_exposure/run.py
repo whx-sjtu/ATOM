@@ -240,7 +240,21 @@ def capture_metadata(frozen, out):
 
     import atom
     from atom.benchmarks.results.metadata import capture_config
+    from atom.model_engine.arg_utils import EngineArgs
+    from atom.utils.backends import VLLM_CACHE_ROOT
 
+    parser = EngineArgs.add_cli_args(argparse.ArgumentParser())
+    args, extra = parser.parse_known_args(frozen["server"][3:])
+    if extra != ["--host", "127.0.0.1", "--server-port", str(P["port"])]:
+        raise RuntimeError(f"unexpected serving CLI arguments: {extra}")
+    kwargs = EngineArgs.from_cli_args(args)._get_engine_kwargs()
+    if (
+        kwargs["mark_trace"]
+        or str(Path(VLLM_CACHE_ROOT) / "torch_compile_cache")
+        != frozen["atom_compile_cache"]
+    ):
+        raise RuntimeError("profiler or ATOM compile-cache binding changed")
+    save(out / "engine-kwargs.json", json.loads(json.dumps(kwargs, default=str)))
     env = frozen["environment"]
     config = capture_config(
         P["model"],
