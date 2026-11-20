@@ -5,9 +5,9 @@ import asyncio
 import hashlib
 import json
 import os
-from pathlib import Path
 import statistics
 import time
+from pathlib import Path
 
 import httpx
 
@@ -28,6 +28,37 @@ def save(path, value):
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, indent=2) + "\n")
     temporary.replace(path)
+
+
+def validate_inputs(data, model=None):
+    definition = json.loads((HERE / "fixtures.json").read_text())
+    if (
+        data.get("definition_sha256") != sha256(HERE / "fixtures.json")
+        or data.get("source_sha256") != definition["source_sha256"]
+    ):
+        raise ValueError("input definition/source identity differs")
+    requests = data.get("requests", [])
+    if len(requests) != len(definition["requests"]):
+        raise ValueError("frozen request set differs")
+    if model is not None and Path(data["model"]).resolve() != Path(model).resolve():
+        raise ValueError("input tokenizer source differs")
+    for index, (item, expected) in enumerate(zip(requests, definition["requests"])):
+        ids = item.get("token_ids", [])
+        if item.get("fixture") != index or any(
+            item.get(key) != value for key, value in expected.items()
+        ):
+            raise ValueError("frozen request metadata differs")
+        if (
+            len(ids) != expected["length"]
+            or any(type(x) is not int or x < 0 for x in ids)
+            or token_hash(ids) != expected["sha256"]
+        ):
+            raise ValueError("frozen prompt tokens differ")
+
+
+def validate_repeats(repeats):
+    if type(repeats) is not int or repeats < 2:
+        raise ValueError("at least two measured repeats are required")
 
 
 def prepare_inputs(model, source, output):
@@ -89,6 +120,11 @@ async def complete(client, body, identity, ledger):
         usage = result.get("usage", {})
         count = usage.get("completion_tokens")
         record.update(response_id=result.get("id"), usage=usage, output_tokens=count)
+        prompt_count = usage.get("prompt_tokens")
+        if type(prompt_count) is not int or prompt_count != len(
+            body["prompt_token_ids"]
+        ):
+            raise ValueError("response prompt token count differs from the request")
         if type(count) is not int or count <= 0:
             raise ValueError("missing or invalid response completion_tokens")
         if len(result.get("choices", [])) != 1:
@@ -108,7 +144,7 @@ async def complete(client, body, identity, ledger):
     except asyncio.CancelledError:
         record.update(cancelled=True, error="cancelled")
         raise
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001 - preserve request failure evidence
         record["error"] = f"{type(error).__name__}: {error}"
     finally:
         record["end_ns"] = time.perf_counter_ns()
@@ -150,6 +186,8 @@ async def observe(client):
 
 
 async def measure(url, model, inputs, k, repeats, output, client=None):
+    validate_inputs(inputs)
+    validate_repeats(repeats)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
     owned = client is None
@@ -164,19 +202,21 @@ async def measure(url, model, inputs, k, repeats, output, client=None):
             before = await observe(client)
             semaphore = asyncio.Semaphore(concurrency)
 
-            async def one(item):
-                async with semaphore:
+            async def one(
+                item, sem=semaphore, phase=stage, c=concurrency, r=repeat, cap=limit
+            ):
+                async with sem:
                     identity = {
                         "k": k,
-                        "stage": stage,
-                        "client_concurrency": concurrency,
-                        "repeat": repeat,
+                        "stage": phase,
+                        "client_concurrency": c,
+                        "repeat": r,
                         "fixture": item["fixture"],
                         "prompt_sha256": item["sha256"],
                     }
                     return await complete(
                         client,
-                        payload(model, item["token_ids"], limit, stage == "prime"),
+                        payload(model, item["token_ids"], cap, phase == "prime"),
                         identity,
                         ledger,
                     )

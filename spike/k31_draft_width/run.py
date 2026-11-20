@@ -5,18 +5,23 @@ import asyncio
 import fcntl
 import json
 import os
-from pathlib import Path
 import signal
 import socket
 import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 import httpx
-import psutil
 
-from spike.k31_draft_width.client import measure, save, sha256
+from spike.k31_draft_width.client import (
+    measure,
+    save,
+    sha256,
+    validate_inputs,
+    validate_repeats,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 UNSET = (
@@ -24,6 +29,8 @@ UNSET = (
     "ATOM_DSV41_BENCHMARK_SYNTHETIC",
     "AITER_AOT_IMPORT",
     "AITER_REBUILD",
+    "ATOM_MONO_COMPILE_INDEX",
+    "FLYDSL_RUNTIME_RUN_ONLY",
 )
 
 
@@ -80,8 +87,9 @@ def command(args, k):
 def environment(args, k, selection):
     cache = args.cache / f"k{k}"
     env = dict(os.environ)
-    for key in UNSET:
-        env.pop(key, None)
+    for key in list(env):
+        if key in UNSET or key.startswith(("ATOM_", "AITER_", "FLYDSL_")):
+            env.pop(key)
     env.update(
         PYTHONPATH=f"{ROOT}:{selection['aiter_root']}",
         PYTHONDONTWRITEBYTECODE="1",
@@ -93,16 +101,29 @@ def environment(args, k, selection):
         ATOM_GDN_SSM_DTYPE="fp32",
         ATOM_MLA_ABSORB_BF16="1",
         ATOM_REPLAYSSM_CACHE_LEN="16",
+        ATOM_MONO_POLL_SLEEP_UNITS="16",
+        AITER_MAX_JOBS="16",
+        MAX_JOBS="16",
+        OMP_NUM_THREADS="1",
+        OPENBLAS_NUM_THREADS="1",
+        MKL_NUM_THREADS="1",
         ATOM_ENABLE_RELAXED_MTP="0",
         ATOM_SPEC_LOSSLESS_SAMPLING="0",
         HSA_ENABLE_IPC_MODE_LEGACY="1",
         MOONCAKE_DISABLE_HIP_DMABUF="1",
         HIP_VISIBLE_DEVICES="0,1,2,3,4,5,6,7",
+        ROCR_VISIBLE_DEVICES="0,1,2,3,4,5,6,7",
         GPU_ARCHS="gfx950",
         ARCH="gfx950",
         AITER_JIT_DIR=selection["native_jit_dir"],
         AITER_CACHE_DIR=selection["native_cache_dir"],
-        ATOM_MONO_COMPILE_INDEX=str(cache / "mono_index"),
+        AITER_ASM_DIR=str(Path(selection["aiter_root"]) / "hsa"),
+        HF_HOME=str(cache / "hf"),
+        HF_MODULES_CACHE=str(cache / "hf_modules"),
+        TIKTOKEN_CACHE_DIR=str(cache / "tiktoken"),
+        XDG_CACHE_HOME=str(cache / "xdg"),
+        HF_HUB_OFFLINE="1",
+        TRANSFORMERS_OFFLINE="1",
         FLYDSL_RUNTIME_CACHE_DIR=str(cache / "flydsl"),
         TRITON_CACHE_DIR=str(cache / "triton"),
         TORCHINDUCTOR_CACHE_DIR=str(cache / "torchinductor"),
@@ -129,28 +150,52 @@ def birth(pid):
         return None
 
 
+def process_table():
+    result = {}
+    for directory in Path("/proc").iterdir():
+        if not directory.name.isdigit():
+            continue
+        try:
+            fields = (directory / "stat").read_text().rsplit(")", 1)[1].split()
+            if fields[0] != "Z":
+                result[int(directory.name)] = (
+                    fields[19],
+                    int(fields[1]),
+                    int(fields[2]),
+                )
+        except (OSError, IndexError, ValueError):
+            continue
+    return result
+
+
 def remember(proc, known):
-    candidates = {proc.pid}
-    if birth(proc.pid) == known.get(proc.pid):
-        try:
-            candidates.update(
-                p.pid for p in psutil.Process(proc.pid).children(recursive=True)
-            )
-        except psutil.NoSuchProcess:
-            pass
-    for item in psutil.process_iter(["pid"]):
-        try:
-            if os.getpgid(item.pid) == proc.pid:
-                candidates.add(item.pid)
-        except (ProcessLookupError, PermissionError):
-            pass
+    table = process_table()
+    anchors = {
+        pid
+        for pid, ticks in known.items()
+        if ticks is not None and table.get(pid, (None,))[0] == ticks
+    }
+    candidates = set(anchors)
+    # A numeric PGID can be reused once the original group dies. Only an
+    # original pid/birth still in that group proves its present ownership.
+    if any(table[pid][2] == proc.pid for pid in anchors):
+        candidates.update(
+            pid for pid, (_, _, pgid) in table.items() if pgid == proc.pid
+        )
+    while True:
+        children = {
+            pid for pid, (_, parent, _) in table.items() if parent in candidates
+        } - candidates
+        if not children:
+            break
+        candidates.update(children)
     for pid in candidates:
-        ticks = birth(pid)
-        if ticks is not None:
-            known.setdefault(pid, ticks)
-    return [
-        pid for pid, ticks in known.items() if ticks is not None and birth(pid) == ticks
-    ]
+        known[pid] = table[pid][0]
+    return sorted(
+        pid
+        for pid, ticks in known.items()
+        if ticks is not None and table.get(pid, (None,))[0] == ticks
+    )
 
 
 def cleanup(proc, known, output):
@@ -181,7 +226,7 @@ def cleanup(proc, known, output):
                 "remaining": live,
                 "vram_bytes": memory,
             }
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 - telemetry failures retain ownership
             released, result = False, {"released": False, "error": str(error)}
         try:
             save(output / "cleanup.json", result)
@@ -214,6 +259,9 @@ async def wait_ready(proc, url, timeout):
 
 
 def verify(args):
+    validate_repeats(args.repeats)
+    if args.startup_timeout <= 0 or args.run_timeout <= args.startup_timeout:
+        raise ValueError("run deadline must exceed the positive startup deadline")
     head = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
     ).strip()
@@ -222,21 +270,140 @@ def verify(args):
     ).strip()
     if head != args.head or dirty:
         raise RuntimeError("source is not the reviewed clean commit")
+    if (
+        sha256(args.inputs) != args.inputs_sha
+        or sha256(args.cache_receipt) != args.cache_sha
+    ):
+        raise RuntimeError("reviewed input/cache receipt changed")
+    changed = subprocess.check_output(
+        ["git", "diff", "--name-only", args.base, "HEAD"], cwd=ROOT, text=True
+    ).splitlines()
+    if any(not name.startswith("spike/k31_draft_width/") for name in changed):
+        raise RuntimeError("spike includes production-source changes")
+    pins = json.loads(args.model_pins.read_text())
+    if sha256(args.model_pins) != args.model_pins_sha:
+        raise RuntimeError("model identity receipt changed")
+    for role, location in (("target", args.model), ("draft", args.draft)):
+        record = pins[role]
+        if (
+            Path(location).resolve() != Path(record["path"]).resolve()
+            or sha256(Path(location) / "config.json") != record["config_sha256"]
+        ):
+            raise RuntimeError(f"{role} model path/config differs from its receipt")
+    if (
+        sha256(Path(args.model) / "model.safetensors.index.json")
+        != pins["target"]["index_sha256"]
+    ):
+        raise RuntimeError("target model index differs from its receipt")
     data = json.loads(args.inputs.read_text())
+    validate_inputs(data, args.model)
     if Path(data["model"]).resolve() != Path(args.model).resolve():
         raise ValueError("prepared inputs used another tokenizer source")
+    cache = verify_cache(args)
+    return data, cache
+
+
+def verify_cache(args):
     cache = json.loads(args.cache_receipt.read_text())
+    expected_settings = {
+        "max_model_len": 131072,
+        "block_size": 64,
+        "replay_cap": 16,
+        "tp": 8,
+        "dcp": 8,
+        "poll_sleep_units": 16,
+        "debug": False,
+        "timeline": False,
+        "arms": {
+            f"k{k}": {
+                "qlen": k + 1,
+                "rows": [(k + 1) * c for c in (1, 2, 3, 4)],
+                "state_len": k + 3,
+                "replay_window": k + 1,
+            }
+            for k in (3, 4)
+        },
+    }
     if (
-        not cache.get("ready")
+        cache.get("ready") is not True
         or cache["atom_source"] != args.base
-        or cache["settings"]
-        != {"max_model_len": 131072, "block_size": 64, "replay_cap": 16}
+        or any(
+            cache["settings"].get(key) != value
+            for key, value in expected_settings.items()
+        )
     ):
         raise RuntimeError("current-source cache preparation is not complete")
-    for path, expected in cache["artifacts"].items():
-        if sha256(path) != expected:
+    identity, selection = cache["identity"], cache["aiter_selection"]
+    if (
+        identity["aiter_selection"] != selection
+        or identity["settings"] != cache["settings"]
+    ):
+        raise RuntimeError("cache identity differs from selected settings")
+    sources = identity["production_sha256"]
+    if not sources:
+        raise RuntimeError("cache receipt has no source binding")
+    for path, expected in sources.items():
+        resolved = (ROOT / path).resolve()
+        if not resolved.is_relative_to(ROOT / "atom") or sha256(resolved) != expected:
+            raise RuntimeError(f"cache production source changed: {path}")
+    model_config = identity["model_config"]
+    if (
+        Path(model_config["path"]).resolve()
+        != (Path(args.model) / "config.json").resolve()
+        or sha256(model_config["path"]) != model_config["sha256"]
+    ):
+        raise RuntimeError("cache model identity changed")
+    artifacts = cache["artifacts"]
+    for k in (3, 4):
+        arm = (args.cache / f"k{k}" / "flydsl").resolve()
+        if not any(Path(path).resolve().is_relative_to(arm) for path in artifacts):
+            raise RuntimeError("selected cache has no prepared arm")
+    for path, expected in artifacts.items():
+        if (
+            not Path(path).resolve().is_relative_to(args.cache.resolve())
+            or sha256(path) != expected
+        ):
             raise RuntimeError(f"cache artifact changed: {path}")
-    return data, cache
+    native_ref = identity["native_receipt"]
+    if sha256(native_ref["path"]) != native_ref["sha256"]:
+        raise RuntimeError("native receipt changed")
+    native = json.loads(Path(native_ref["path"]).read_text())
+    if (
+        native.get("native_cpu_ready") is not True
+        or native["identity"]["selection"] != selection
+    ):
+        raise RuntimeError("native selection is not prepared")
+    source = native["identity"]["source"]
+    if Path(source["source_root"]).resolve() != Path(selection["aiter_root"]).resolve():
+        raise RuntimeError("native source root differs")
+    for root, revision in (
+        (source["source_root"], source["aiter_commit"]),
+        (source["ck_root"], source["ck_commit"]),
+    ):
+        head = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root, text=True
+        ).strip()
+        dirty = subprocess.check_output(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=root,
+            text=True,
+        ).strip()
+        if head != revision or dirty:
+            raise RuntimeError("native source revision changed")
+    bound = {
+        **native["artifacts"],
+        **native["compiled_inputs"],
+        **{
+            str(Path(source["source_root"]) / path): value
+            for path, value in source["source_files_sha256"].items()
+        },
+    }
+    if not native["artifacts"] or not native["compiled_inputs"]:
+        raise RuntimeError("native receipt has no artifact/source binding")
+    for path, expected in bound.items():
+        if sha256(path) != expected:
+            raise RuntimeError(f"native artifact/source changed: {path}")
+    return cache
 
 
 def run(args):
@@ -257,15 +424,20 @@ def run(args):
         if args.pause.exists() or any(n >= 2 * 2**30 for n in vram().values()):
             raise RuntimeError("GPU admission refused; no retry")
         for k in (4, 3):
+            if args.pause.exists():
+                raise RuntimeError("GPU pause requested; no next arm")
             output = args.output / f"k{k}"
             output.mkdir()
             env, cmd = environment(args, k, selection), command(args, k)
             for key in (
                 "TMPDIR",
-                "ATOM_MONO_COMPILE_INDEX",
                 "FLYDSL_RUNTIME_CACHE_DIR",
                 "TRITON_CACHE_DIR",
                 "TORCHINDUCTOR_CACHE_DIR",
+                "HF_HOME",
+                "HF_MODULES_CACHE",
+                "TIKTOKEN_CACHE_DIR",
+                "XDG_CACHE_HOME",
             ):
                 Path(env[key]).mkdir(parents=True, exist_ok=True)
             with socket.socket() as port:
@@ -291,6 +463,10 @@ def run(args):
                 output / "contract.json",
                 {
                     "head": args.head,
+                    "base": args.base,
+                    "model_pins_sha256": sha256(args.model_pins),
+                    "cache_identity": cache["identity_fingerprint"],
+                    "removed_environment_prefixes": ["ATOM_", "AITER_", "FLYDSL_"],
                     "argv": cmd,
                     "environment": recorded,
                     "unset": list(UNSET),
@@ -314,11 +490,11 @@ def run(args):
             known = {proc.pid: birth(proc.pid)}
             stop = threading.Event()
 
-            def watch():
+            def watch(server=proc, ledger=known, stopped=stop):
                 deadline = time.monotonic() + args.run_timeout
-                while not stop.wait(0.5):
-                    remember(proc, known)
-                    if proc.poll() is not None or time.monotonic() >= deadline:
+                while not stopped.wait(0.5):
+                    remember(server, ledger)
+                    if server.poll() is not None or time.monotonic() >= deadline:
                         os.kill(os.getpid(), signal.SIGTERM)
                         return
 
@@ -367,9 +543,17 @@ def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("model", "draft", "head", "base"):
+    for name in (
+        "model",
+        "draft",
+        "head",
+        "base",
+        "inputs-sha",
+        "cache-sha",
+        "model-pins-sha",
+    ):
         parser.add_argument("--" + name, required=True)
-    for name in ("inputs", "cache", "cache-receipt", "output"):
+    for name in ("inputs", "cache", "cache-receipt", "model-pins", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--python", default="/opt/venv/bin/python")
     parser.add_argument("--port", type=int, default=8654)
