@@ -88,7 +88,7 @@ def argv(program, flags):
 
 
 def environment(attempt):
-    namespace = PRIVATE / "namespaces" / attempt
+    namespace = PRIVATE / P["namespace_dir"] / attempt
     env = dict(P["environment"])
     for key, suffix in {
         "HOME": "home",
@@ -218,6 +218,18 @@ def check_cache_toolchain(cache):
         raise ValueError("cache compiler environment changed")
 
 
+def jit_helper(path, expected):
+    import importlib.util
+
+    path = Path(path)
+    if sha(path) != expected:
+        raise ValueError("native publication helper source changed")
+    spec = importlib.util.spec_from_file_location("task10_" + path.stem, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def prepare(attempt):
     import importlib.metadata
     import re
@@ -225,7 +237,7 @@ def prepare(attempt):
 
     if not re.fullmatch(r"(author|independent)-[0-9]{3}", attempt):
         raise ValueError("invalid attempt name")
-    namespace = PRIVATE / "namespaces" / attempt
+    namespace = PRIVATE / P["namespace_dir"] / attempt
     namespace.mkdir(parents=True, exist_ok=False)
     files, provenance = {}, {}
     for name, expected in {
@@ -266,65 +278,156 @@ def prepare(attempt):
             files[str(source)] = sha(source)
     for destination, record in provenance.items():
         files[destination] = record["sha256"]
-    extra = P["fmha_opus_preparation"]
-    if sha(extra["path"]) != extra["sha256"]:
-        raise ValueError("FMHA preparation receipt changed")
-    ready = json.loads(Path(extra["path"]).read_text())
-    detail_ref = ready["native_receipt"]
-    if sha(detail_ref["path"]) != detail_ref["sha256"]:
-        raise ValueError("FMHA native receipt changed")
-    detail = json.loads(Path(detail_ref["path"]).read_text())
-    if (
-        detail["source_pins"]
-        != {"atom": P["atom_base"], "aiter": P["aiter_sha"], "ck": P["ck_sha"]}
-        or not ready["cpu_ready"]
-        or detail["operator_executed"]
+    native_publications = {}
+    for module, extra, validation_key, closure_key in (
+        (
+            "module_fmha_fwd_bf16_opus",
+            P["fmha_opus_preparation"],
+            "include_order_validation",
+            "expected",
+        ),
+        (
+            "module_deepgemm_opus",
+            P["deepgemm_opus_preparation"],
+            "ninja_graph_validation",
+            "recorded_sha256",
+        ),
     ):
-        raise ValueError("FMHA source/build qualification mismatch")
-    for reference in (
-        extra,
-        detail_ref,
-        detail["input_closure"],
-        ready["include_order_validation"],
-        ready["initial_strict_validation"],
-        ready["build_log"],
-        ready["load_validation_log"],
-        ready["load_validation_exit"],
-    ):
-        if sha(reference["path"]) != reference["sha256"]:
-            raise ValueError("FMHA provenance input changed")
-        files[reference["path"]] = reference["sha256"]
-    build_source = Path(extra["path"]).parents[1] / "source/aiter"
-    closure = json.loads(Path(detail["input_closure"]["path"]).read_text())
-    for filename, record in closure.items():
-        source = Path(filename)
-        target = (
-            namespace / "aiter" / source.relative_to(build_source)
-            if source.is_relative_to(build_source)
-            else source
-        )
+        if sha(extra["path"]) != extra["sha256"]:
+            raise ValueError("native preparation receipt changed")
+        ready = json.loads(Path(extra["path"]).read_text())
+        detail_ref = ready["native_receipt"]
+        if sha(detail_ref["path"]) != detail_ref["sha256"]:
+            raise ValueError("native detail receipt changed")
+        detail = json.loads(Path(detail_ref["path"]).read_text())
         if (
-            record["sha256"] != record["expected"]
-            or sha(source) != record["sha256"]
-            or sha(target) != record["sha256"]
+            detail["source_pins"]
+            != {"atom": P["atom_base"], "aiter": P["aiter_sha"], "ck": P["ck_sha"]}
+            or not ready["cpu_ready"]
+            or detail["operator_executed"]
         ):
-            raise ValueError(f"FMHA source/header closure changed: {filename}")
-        files[str(target)] = record["sha256"]
-    for filename, record in detail["compiler_runtime_binaries"].items():
-        if sha(filename) != record["sha256"]:
-            raise ValueError("FMHA compiler/runtime changed")
-        files[filename] = record["sha256"]
-    artifact = ready["artifact"]
-    if sha(artifact["path"]) != artifact["sha256"]:
-        raise ValueError("FMHA native artifact changed")
-    destination = namespace / "cache/aiter/jit/module_fmha_fwd_bf16_opus.so"
-    shutil.copyfile(artifact["path"], destination)
-    files[str(destination)] = artifact["sha256"]
-    provenance[str(destination)] = {
-        "source": artifact["path"],
-        "sha256": artifact["sha256"],
-        "qualification": extra,
-    }
+            raise ValueError("native source/build qualification mismatch")
+        references = [
+            extra,
+            detail_ref,
+            detail["input_closure"],
+            ready[validation_key],
+            ready["initial_strict_validation"],
+            ready["build_log"],
+            ready["load_validation_log"],
+            ready["load_validation_exit"],
+        ]
+        if module == "module_deepgemm_opus":
+            if (
+                ready["compile_unit_count"] != 950
+                or ready["kernel_key_count"] != 769
+                or detail["variant_pruning"]
+                or detail["incomplete_objects_reused"]
+            ):
+                raise ValueError(
+                    "DeepGEMM preparation is not the complete native family"
+                )
+            references += [
+                *ready["required_supporting_artifacts"],
+                ready["publication_api_source"],
+                detail["complete_units"],
+                detail["ninja"],
+                detail["ninja_completion_log"],
+            ]
+        for reference in references:
+            if sha(reference["path"]) != reference["sha256"]:
+                raise ValueError("native provenance input changed")
+            files[reference["path"]] = reference["sha256"]
+        build_source = Path(extra["path"]).parents[1] / "source/aiter"
+        closure = json.loads(Path(detail["input_closure"]["path"]).read_text())
+        for filename, record in closure.items():
+            source = Path(filename)
+            target = (
+                namespace / "aiter" / source.relative_to(build_source)
+                if source.is_relative_to(build_source)
+                else source
+            )
+            if (
+                record["sha256"] != record[closure_key]
+                or sha(source) != record["sha256"]
+                or sha(target) != record["sha256"]
+            ):
+                raise ValueError(f"native source/header closure changed: {filename}")
+            files[str(target)] = record["sha256"]
+        for filename, record in detail["compiler_runtime_binaries"].items():
+            if sha(filename) != record["sha256"]:
+                raise ValueError("native compiler/runtime changed")
+            files[filename] = record["sha256"]
+        artifact = ready["artifact"]
+        if (
+            Path(artifact["path"]).name != module + ".so"
+            or sha(artifact["path"]) != artifact["sha256"]
+        ):
+            raise ValueError("native artifact changed")
+        destination = namespace / "cache/aiter/jit" / (module + ".so")
+        shutil.copyfile(artifact["path"], destination)
+        files[str(destination)] = artifact["sha256"]
+        provenance[str(destination)] = {
+            "source": artifact["path"],
+            "sha256": artifact["sha256"],
+            "qualification": extra,
+        }
+        if module == "module_deepgemm_opus":
+            helpers = namespace / "aiter/aiter/jit/utils"
+            api_ref = {
+                "path": str(helpers / "jit_cache.py"),
+                "sha256": ready["publication_api_source"]["sha256"],
+            }
+            api = jit_helper(api_ref["path"], api_ref["sha256"])
+            baton_api = jit_helper(
+                helpers / "file_baton.py", files[str(helpers / "file_baton.py")]
+            )
+            source_kids = detail["compiled_kids"]
+            snapshot = api.snapshot_compiled_kids(source_kids["path"])
+            required = json.loads(snapshot[0])
+            if len(required) != 769 or "a16w16/gfx950/256/93" not in required:
+                raise ValueError("required DeepGEMM compiled keys missing")
+            if api.compiled_kids_are_current(
+                source_kids["path"], str(destination), required
+            ):
+                raise ValueError(
+                    "new native binary unexpectedly shares a foreign publication receipt"
+                )
+            sidecar = destination.parent / "build/compiled_kids_opus.json"
+            sidecar.parent.mkdir(parents=True, exist_ok=True)
+            baton = baton_api.FileBaton(str(sidecar.parent / ("lock_" + module)))
+            if not baton.try_acquire():
+                raise ValueError("private native metadata publication is busy")
+            try:
+                api.publish_compiled_kids(
+                    snapshot,
+                    str(sidecar),
+                    str(destination),
+                    api._artifact_identity(destination),
+                )
+            finally:
+                baton.release()
+            if not api.compiled_kids_are_current(
+                str(sidecar), str(destination), required
+            ):
+                raise ValueError("installed native compiled-kids publication is stale")
+            files[str(sidecar)] = sha(sidecar)
+            local_receipt = Path(str(sidecar) + ".receipt")
+            files[str(local_receipt)] = sha(local_receipt)
+            provenance[str(sidecar)] = {
+                "source": source_kids["path"],
+                "sha256": source_kids["sha256"],
+                "qualification": extra,
+            }
+            native_publications[module] = {
+                "artifact": str(destination),
+                "sidecar": str(sidecar),
+                "receipt": {"path": str(local_receipt), "sha256": sha(local_receipt)},
+                "api": api_ref,
+                "required_key_count": len(required),
+                "foreign_receipt_rejected": True,
+                "installed_metadata_current": True,
+            }
     env = environment(attempt)
     for key, value in env.items():
         if key != "PYTHONPATH" and value.startswith(str(namespace)):
@@ -402,6 +505,7 @@ def prepare(attempt):
         "data": {"path": str(data), "sha256": sha(data)},
         "startup_qualification": {"path": str(startup), "sha256": sha(startup)},
         "cache_provenance": provenance,
+        "native_publications": native_publications,
         "aiter_ref": P["aiter_sha"],
         "ck_ref": P["ck_sha"],
         "recorded_model_identity": json.loads(Path(P["model_pins"]).read_text()),
@@ -484,6 +588,18 @@ def make_plan(attempt):
     for filename, expected in preparation["files"].items():
         if sha(filename) != expected:
             raise ValueError(f"preparation artifact changed: {filename}")
+    publications = preparation["native_publications"]
+    if set(publications) != {"module_deepgemm_opus"}:
+        raise ValueError("native metadata publication is missing")
+    for publication in publications.values():
+        api = jit_helper(publication["api"]["path"], publication["api"]["sha256"])
+        required = json.loads(Path(publication["sidecar"]).read_text())
+        if not api.compiled_kids_are_current(
+            publication["sidecar"], publication["artifact"], required
+        ):
+            raise ValueError(
+                "native publication no longer matches its installed binary"
+            )
     startup = preparation["startup_qualification"]
     if sha(startup["path"]) != startup["sha256"]:
         raise ValueError("CPU startup qualification changed")
@@ -913,7 +1029,7 @@ def resolved_policy(command):
 
 
 def cache_inventory(attempt):
-    root = PRIVATE / "namespaces" / attempt
+    root = PRIVATE / P["namespace_dir"] / attempt
     return {
         str(p): sha(p)
         for directory in (
@@ -984,7 +1100,7 @@ def inherited_cache_role(proc, plan, row, server_births, cache_evidence):
         for parent in proc.parents()
     ):
         return None
-    private = PRIVATE / "namespaces" / plan["attempt"]
+    private = PRIVATE / P["namespace_dir"] / plan["attempt"]
     root = Path(plan["environment"]["HOME"]) / ".cache/atom/torch_compile_cache"
     keys = {
         "TRITON_CACHE_DIR": "triton_cache",
@@ -1012,7 +1128,7 @@ def inherited_cache_role(proc, plan, row, server_births, cache_evidence):
 def process_receipt(owned, plan, receipt_path=None):
     rows = []
     cache_evidence = {}
-    private = PRIVATE / "namespaces" / plan["attempt"]
+    private = PRIVATE / P["namespace_dir"] / plan["attempt"]
     for name, expected in P["process_environment"]["sources"].items():
         if sha(ROOT / name) != expected:
             raise ValueError(f"process environment source changed: {name}")
@@ -1429,7 +1545,9 @@ def execute_bound(path, start, started_unix):
         if client.returncode != 0:
             raise RuntimeError("scored client failed; partial evidence retained")
         state["evidence"] = bind_results(out, expected)
-        state["processes_after_scoring"] = process_receipt(owned, plan)
+        state["processes_after_scoring"] = process_receipt(
+            owned, plan, out / "after-scoring-processes.json"
+        )
         state["execution_elapsed_s"] = time.monotonic() - start
         if time.monotonic() >= whole:
             raise TimeoutError("whole execution deadline")

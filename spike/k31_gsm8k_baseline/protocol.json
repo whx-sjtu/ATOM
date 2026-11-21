@@ -209,5 +209,10 @@
       "/usr/lib/python3.12/multiprocessing/popen_spawn_posix.py": "97b5d25aa479516894489877e6a7921252ee35f51e118c2f1f91f32919e7caa8",
       "/usr/lib/python3.12/multiprocessing/util.py": "6752c4515ec69f82e9df64e017da490c3754e51d818c270ea1ad2d64e09268be"
     }
+  },
+  "namespace_dir": "namespaces/deepgemm-opus-qualified",
+  "deepgemm_opus_preparation": {
+    "path": "/app/k31-agent-team-private/task-10/native-deepgemm-opus-preparation/evidence/final-receipt.json",
+    "sha256": "fe9edfe65658877ea24d3c6b7a2156602ff9d76275c6dba62b27ed22daaa4acc"
   }
 }

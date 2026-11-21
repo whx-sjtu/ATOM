@@ -96,3 +96,10 @@ roles, cache keys, ranks, mixed pairs and paths escaping the private namespace a
 rejected. The witness saves PID, birth, role and declared environment values before
 refusing a mismatch. Author-003 did not retain its rejected PID/key; a CPU
 reproduction of this checker defect does not retrospectively identify that child.
+
+The prospective DeepGEMM OPUS preparation uses a new declared namespace directory;
+older namespaces and their packets remain preserved. Only the fully source-bound
+module and compiled-kids metadata are reused. The pinned official publication API
+creates a receipt for the new binary identity and verifies the metadata is current;
+the old binary's inode receipt is not reused. Both startup and after-scoring process
+checks write distinct durable diagnostic receipts before refusing a child.

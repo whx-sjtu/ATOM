@@ -926,3 +926,64 @@ def test_private_cache_key_follows_separate_source_roots(process_family):
         )
         keys.append(key)
     assert keys[0] != keys[1]
+
+
+def test_after_scoring_refusal_persists_actual_child_details(process_family):
+    import ast
+
+    owned, plan, root = process_family("policy")
+    samples = root / "scored-samples.jsonl"
+    samples.write_text('{"answer":"retained CPU fixture"}\n')
+    sample_hash = verify.sha(samples)
+    state = {
+        "phase": "scoring",
+        "outcome": "EXECUTION_INVALID",
+        "evidence": {"samples_sha256": sample_hash},
+    }
+    source = run.HERE / "run.py"
+    function = next(
+        n
+        for n in ast.parse(source.read_text()).body
+        if isinstance(n, ast.FunctionDef) and n.name == "execute_bound"
+    )
+    execution = next(n for n in function.body if isinstance(n, ast.Try))
+    first = next(
+        i
+        for i, n in enumerate(execution.body)
+        if isinstance(n, ast.Assign)
+        and any(
+            isinstance(target, ast.Subscript)
+            and isinstance(target.slice, ast.Constant)
+            and target.slice.value == "processes_after_scoring"
+            for target in n.targets
+        )
+    )
+    # Run the unchanged production post-scoring tail and refusal handler against
+    # real Owned CPU children; earlier model/hardware stages are outside this case.
+    tail = ast.Try(
+        body=execution.body[first:],
+        handlers=execution.handlers,
+        orelse=[],
+        finalbody=[],
+    )
+    module = ast.fix_missing_locations(ast.Module(body=[tail], type_ignores=[]))
+    scope = dict(
+        vars(run),
+        owned=owned,
+        plan=plan,
+        out=root,
+        state=state,
+        start=time.monotonic(),
+        whole=time.monotonic() + 10,
+    )
+    exec(  # noqa: S102 - actual production failure path
+        compile(module, str(source), "exec"), scope
+    )
+    assert state["outcome"] == "EXECUTION_INVALID" and state["phase"] == "scoring"
+    assert "processes_after_scoring" not in state
+    rows = json.loads((root / "after-scoring-processes.json").read_text())
+    refused = next(row for row in rows if "refusal" in row)
+    assert refused["pid"] in {p.pid for p in owned.live()}
+    assert "ATOM_ENABLE_RELAXED_MTP" in refused["mismatch_keys"]
+    assert refused["environment"]["ATOM_ENABLE_RELAXED_MTP"] == "1"
+    assert verify.sha(samples) == sample_hash == state["evidence"]["samples_sha256"]
