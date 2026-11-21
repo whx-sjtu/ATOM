@@ -28,12 +28,23 @@ def compare(got, expected):
         if finite
         else None
     )
+    row_relative = (
+        float(
+            (
+                (got.float() - expected.float()).abs().flatten(1).amax(1)
+                / expected.float().abs().flatten(1).amax(1).clamp_min(1e-30)
+            ).max()
+        )
+        if finite
+        else None
+    )
     equality = float(
         (got.view(torch.int16) == expected.view(torch.int16)).float().mean()
     )
     return {
         "finite": finite,
         "relative_max": relative,
+        "row_relative_max_diagnostic": row_relative,
         "bf16_equal": equality,
         "passed": finite and relative <= 2**-7 and equality >= 0.999,
     }
@@ -416,7 +427,7 @@ def worker(rank, plan):
                 )
             else:
                 record["verdict"] = "correctness_failed"
-            record["sent_bytes_per_rank"] = 7 * rows * 12 * 260
+            record["logical_off_rank_v_lse_payload_bytes"] = 7 * rows * 12 * 260
             record["rotating_input_bytes"] = sum(
                 sum(
                     v.numel() * v.element_size()

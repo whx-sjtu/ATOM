@@ -140,9 +140,10 @@ def prepare(args):
         "workload_s": 240 if smoke else 600,
         "cleanup_term_s": 10,
         "cleanup_kill_s": 30,
-        "release_s": 60,
+        "release_policy": "retain lock until verified; failed observations quarantine",
         "rendezvous": "file://" + str(cache / "tmp/gloo-init"),
         "scope": "deterministic interface fixture; no model, serving, quality or C12 claim",
+        "gpu_lock": "/app/agent-team-scratch/g24-gpu.lock",
         "selected_bdfs": list(SELECTED_BDFS),
         "hip_runtime": next(
             p for p in files if Path(p).name.startswith("libamdhip64.so")
@@ -269,23 +270,30 @@ def selected_released(alive, seen, snapshot, used):
     )
 
 
+def worker_guard(plan, path):
+    assert os.environ.get("K31_TASK14_GPU_GRANT") == plan["head"]
+    assert os.environ.get("K31_TASK14_PLAN_SHA") == sha(path)
+    assert not os.environ.get("KFD_GUARD_LOG") and not os.environ.get("LD_PRELOAD")
+    assert os.nice(0) == 0 and set(os.sched_getaffinity(0)).issubset(range(112))
+    fd = int(os.environ["K31_TASK14_GPU_LOCK_FD"])
+    assert Path(os.readlink(f"/proc/self/fd/{fd}")).resolve() == Path(plan["gpu_lock"])
+    blocked = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+    assert not blocked.intersection((signal.SIGTERM, signal.SIGINT))
+
+
 def launch(args, plan):
     assert os.environ.get("K31_TASK14_GPU_GRANT") == plan["head"]
     assert os.environ.get("K31_TASK14_PLAN_SHA") == sha(args.plan)
     assert not os.environ.get("KFD_GUARD_LOG") and not os.environ.get("LD_PRELOAD")
     assert os.nice(0) == 0 and set(os.sched_getaffinity(0)).issubset(range(112))
     assert plan["selected_bdfs"] == list(SELECTED_BDFS)
+    assert plan["gpu_lock"] == "/app/agent-team-scratch/g24-gpu.lock"
     out = Path(plan["out"])
     assert not out.exists()
     harness, owned_class = resource_components()
-    fd = harness.GpuLock().acquire()
-    owned, proc, stopped = owned_class(harness), None, []
-    result = {
-        "head": plan["head"],
-        "process_exit": None,
-        "complete": False,
-        "phase": "admission",
-    }
+    fd = harness.GpuLock(plan["gpu_lock"]).acquire()
+    owned, children, stopped = owned_class(harness), [], []
+    result = {"head": plan["head"], "complete": False, "phase": "admission"}
     previous = {
         sig: signal.signal(sig, lambda sig, frame: stopped.append(sig))
         for sig in (signal.SIGTERM, signal.SIGINT)
@@ -299,36 +307,51 @@ def launch(args, plan):
             raise InterruptedError("cancelled before spawn")
         start = time.monotonic()
         result.update(phase="operator", start_monotonic=start)
-        # Parent handlers record cancellation; children retain unblocked TERM/INT.
-        proc = harness.spawn(
-            [
-                str(RUNTIME / "bin/python"),
-                str(Path(__file__).resolve()),
-                "workers",
-                "--plan",
-                str(args.plan.resolve()),
-            ],
-            env=plan["environment"],
-            cwd=ROOT,
-            log_path=out / "workers.log",
-            lock_fd=fd,
-            cpus="0-111",
+        environment = dict(
+            plan["environment"],
+            K31_TASK14_GPU_GRANT=plan["head"],
+            K31_TASK14_PLAN_SHA=sha(args.plan),
+            K31_TASK14_GPU_LOCK_FD=str(fd),
         )
-        owned.add(proc)
+        # Pass the lease to every rank directly; multiprocessing.spawn drops arbitrary FDs.
+        for rank in range(8):
+            child = harness.spawn(
+                [
+                    str(RUNTIME / "bin/python"),
+                    str(Path(__file__).resolve()),
+                    "worker",
+                    "--plan",
+                    str(args.plan.resolve()),
+                    "--rank",
+                    str(rank),
+                ],
+                env=environment,
+                cwd=ROOT,
+                log_path=out / f"rank-{rank}.log",
+                lock_fd=fd,
+                cpus="0-111",
+            )
+            children.append(child)
+            owned.add(child)
+            if stopped:
+                break
         while (
-            proc.poll() is None
+            any(p.poll() is None for p in children)
             and not stopped
+            and all(p.poll() in (None, 0) for p in children)
             and time.monotonic() < start + plan["workload_s"]
         ):
             owned.live()
             time.sleep(0.05)
         result.update(
-            process_exit=proc.poll(),
+            exit_codes=[p.poll() for p in children],
             stop_signals=stopped,
-            timed_out=proc.poll() is None and not stopped,
+            timed_out=any(p.poll() is None for p in children)
+            and not stopped
+            and time.monotonic() >= start + plan["workload_s"],
             elapsed_s=time.monotonic() - start,
         )
-        if proc.poll() == 0 and not stopped:
+        if len(children) == 8 and all(p.poll() == 0 for p in children) and not stopped:
             ranks = [json.loads((out / f"rank-{r}.json").read_text()) for r in range(8)]
             assert {r["bdf"] for r in ranks} == set(SELECTED_BDFS)
             assert all(
@@ -349,7 +372,7 @@ def launch(args, plan):
             released = False
             try:
                 alive = [p.pid for p in owned.live()]
-                snapshot = harness.gpu_snapshot() if proc is not None else None
+                snapshot = harness.gpu_snapshot() if children else None
                 used = (
                     {
                         bdf: int(
@@ -359,12 +382,13 @@ def launch(args, plan):
                         )
                         for bdf in SELECTED_BDFS
                     }
-                    if proc is not None
+                    if children
                     else {}
                 )
-                released = proc is None or selected_released(
+                released = not children or selected_released(
                     alive, owned.seen, snapshot, used
                 )
+                result["final_exit_codes"] = [p.poll() for p in children]
                 result["cleanup"] = {
                     "owned_births": owned.seen,
                     "alive": alive,
@@ -389,7 +413,7 @@ def launch(args, plan):
             time.sleep(5)
         for sig, handler in previous.items():
             signal.signal(sig, handler)
-    result["resources_recorded"] = resources(plan) if proc is not None else False
+    result["resources_recorded"] = resources(plan) if children else False
     write(out / "launch-result.json", result)
     assert result["complete"] and result["resources_recorded"], result
     print(json.dumps(result, indent=2))
@@ -398,9 +422,10 @@ def launch(args, plan):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "mode", choices=("prepare", "check", "verify", "launch", "workers")
+        "mode", choices=("prepare", "check", "verify", "launch", "worker")
     )
     parser.add_argument("--plan", type=Path)
+    parser.add_argument("--rank", type=int, choices=range(8))
     parser.add_argument("--out", type=Path)
     parser.add_argument("--stage", choices=("smoke", "measure"), default="smoke")
     args = parser.parse_args()
@@ -423,10 +448,11 @@ def main():
         elif args.mode == "launch":
             launch(args, plan)
         else:
-            import torch.multiprocessing as mp
+            worker_guard(plan, args.plan)
+            assert args.rank is not None
             from adapter import worker
 
-            mp.spawn(worker, args=(plan,), nprocs=8, join=True)
+            worker(args.rank, plan)
 
 
 if __name__ == "__main__":
