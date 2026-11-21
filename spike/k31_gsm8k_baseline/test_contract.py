@@ -1043,15 +1043,37 @@ def test_real_ipc_generators_roundtrip_and_byte_boundary(tmp_path, case):
             created.rmdir()
 
 
-def test_freeze_rejects_changed_ipc_tmpdir(monkeypatch):
+def test_freeze_rejects_changed_ipc_tmpdir():
     attempt = os.environ.get("K31_TASK10_CPU_ATTEMPT", "author-005")
-    original = run.environment
-
-    def changed(name):
-        env = original(name)
-        env["TMPDIR"] += "/unqualified-planned-path"
-        return env
-
-    monkeypatch.setattr(run, "environment", changed)
-    with pytest.raises(ValueError, match="IPC qualification"):
-        run.make_plan(attempt)
+    code = r"""
+import os, run
+original = run.environment
+def changed(name):
+    env = original(name)
+    env['TMPDIR'] += '/unqualified-planned-path'
+    return env
+run.environment = changed
+try:
+    run.make_plan(os.environ['K31_TASK10_CPU_ATTEMPT'])
+except ValueError as error:
+    assert 'IPC qualification' in str(error), str(error)
+else:
+    raise AssertionError('changed IPC TMPDIR was accepted')
+print('IPC_PLAN_REFUSED')
+"""
+    env = dict(run.environment(attempt), K31_TASK10_CPU_ATTEMPT=attempt)
+    env.update(
+        {k: os.environ[k] for k in ("LD_PRELOAD", "KFD_GUARD_LOG") if k in os.environ}
+    )
+    env["PYTHONPATH"] = f"{run.HERE}:{env['PYTHONPATH']}"
+    result = subprocess.run(
+        [run.P["python"], "-B", "-c", code],
+        cwd=run.ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "IPC_PLAN_REFUSED" in result.stdout
