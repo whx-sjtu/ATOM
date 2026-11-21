@@ -489,6 +489,70 @@ def test_actual_native_submission_poll_and_report(frozen, native, mode, caplog):
     assert S.plain(rec.data["operations"]) == rec.data["operations"]
 
 
+def test_native_poll_emissions_belong_to_each_generation(frozen, native):
+    from atom.kv_transfer.offload.metadata import NativeStateTransfer, SaveSpec
+
+    def run_case():
+        worker = native.worker.NativeStateLMCacheMPConnector.__new__(
+            native.worker.NativeStateLMCacheMPConnector
+        )
+        worker._lock = threading.RLock()
+        worker._native_saves, worker._native_loads = {}, {}
+        worker._completed_save_operations, worker._completed_load_operations = (
+            set(),
+            set(),
+        )
+        worker._completed_save_operation_order = deque()
+        worker._is_kv_writer, worker._max_pending_saves = False, 4
+        worker._adapter, worker.chunk_size, worker._transfer_deadline_s = None, 4, 30.0
+        for generation in (17, 18):
+            req = native.worker.MPReqMeta(
+                req_id=130,
+                token_ids=list(range(16)),
+                block_ids=[0, 1, 2, 3],
+                save_spec=SaveSpec(skip_leading_tokens=0, can_save=True),
+                save_operation=native.types.SaveOperationId(130, generation),
+                native_state=NativeStateTransfer((1,), 16, 123),
+                is_last_prefill=True,
+            )
+            worker._submit_native(req, None, loading=False)
+        output = worker.get_finished()
+        assert worker._native_saves == {}
+        return {
+            "terminal": sorted(
+                (
+                    c.channel,
+                    c.operation_id.req_id,
+                    c.operation_id.generation,
+                    c.succeeded,
+                )
+                for c in output.connector_completions
+                if c.channel == S.CHANNEL
+            ),
+            "all": sorted(
+                (c.channel, repr(c.operation_id), c.succeeded)
+                for c in output.connector_completions
+            ),
+        }
+
+    S.RUNTIME = None
+    baseline = run_case()
+    for module in (native.transfer, native.worker):
+        S.patch(module)
+    rec = recorder(frozen)
+    rec.data["current"] = {"ordinal": 3}
+    assert run_case() == baseline
+    assert baseline["terminal"] == [(S.CHANNEL, 130, g, True) for g in (17, 18)]
+    for generation in (17, 18):
+        stages = rec.data["operations"][str(generation)]["stages"]
+        assert stages["worker_terminal"]["count"] == 1
+        assert stages["worker_terminal"]["value"]["aggregation_ordinal"] == 3
+        assert stages["poll_return"]["value"]["emitted"] == [
+            [S.CHANNEL, 130, generation, True]
+        ]
+    assert S.plain(rec.data["operations"]) == rec.data["operations"]
+
+
 def test_native_quorum_duplicate_generations_and_settlement(frozen, native):
     from atom.kv_transfer.offload.mp import native_state_scheduler as N
 
@@ -552,9 +616,13 @@ def test_no_tensor_access_and_source_binding(frozen, native):
 
 
 @pytest.mark.parametrize(
-    "outcome", ["normal", "client_error", "deadline", "native_failure"]
+    "outcome",
+    ["normal", "client_error", "deadline", "native_failure", "admission_failure"],
 )
-def test_existing_controller_lifecycle(frozen, tmp_path, monkeypatch, outcome):
+@pytest.mark.parametrize("stop_write_fails", [False, True])
+def test_existing_controller_lifecycle(
+    frozen, tmp_path, monkeypatch, outcome, stop_write_fails
+):
     import os
     import signal
 
@@ -663,9 +731,24 @@ def test_existing_controller_lifecycle(frozen, tmp_path, monkeypatch, outcome):
         release_checks.append(timeout)
         return True, {"cards": {str(r): {} for r in range(8)}}
 
+    def admission():
+        if outcome == "admission_failure":
+            raise RuntimeError("original admission failure")
+        return {}
+
+    control_calls = []
+    original_control = run.save_control
+
+    def control(clock, out, plan):
+        control_calls.append(clock.reason is not None)
+        if clock.reason is not None and stop_write_fails:
+            raise OSError("fixture stop-control write failed")
+        original_control(clock, out, plan)
+
+    monkeypatch.setattr(run, "save_control", control)
     lifecycle = NS(
         GpuLock=lambda path: NS(acquire=lambda: fd),
-        assert_gpus_idle=dict,
+        assert_gpus_idle=admission,
         assert_ports_free=lambda ports: events.append(("ports", ports)),
         descendants=lambda pid: [],
         spawn=spawn,
@@ -719,10 +802,10 @@ def test_existing_controller_lifecycle(frozen, tmp_path, monkeypatch, outcome):
         S,
         "summarize",
         lambda *args: {
-            "join_available": False,
-            "complete_chains": False,
+            "join_available": outcome == "normal",
+            "complete_chains": outcome == "normal",
             "generations": {},
-            "incomplete": ["fixture"],
+            "incomplete": [],
         },
     )
     try:
@@ -732,16 +815,39 @@ def test_existing_controller_lifecycle(frozen, tmp_path, monkeypatch, outcome):
             with pytest.raises(SystemExit):
                 run.execute(subject, "fixture")
         state = json.loads((Path(subject["output"]) / "status.json").read_text())
-        assert state["gpu_released"] and state["alive"] == []
-        assert release_checks == [10]
-        assert [e[1] for e in events if e[0] == "spawn"] == [
-            "metadata",
-            "cache",
-            "server",
-            "client",
-        ]
-        assert ("metadata_wait", 60) in events
-        assert alarms[0] == 18 and 9 in alarms and alarms[-1] == 0
+        assert control_calls == [False, True]
+        assert ("save_observer_control_error" in state) is stop_write_fails
+        if stop_write_fails:
+            assert (
+                "fixture stop-control write failed"
+                in state["save_observer_control_error"]
+            )
+        summary = state["save_observer_summary"]
+        assert summary["join_available"] is (
+            outcome == "normal" and not stop_write_fails
+        )
+        assert summary["complete_chains"] is (
+            outcome == "normal" and not stop_write_fails
+        )
+        assert (
+            "stop-control publication failed" in summary["incomplete"]
+        ) is stop_write_fails
+        if outcome == "admission_failure":
+            assert state["no_owned_gpu_work_started"] and not state["admitted"]
+            assert release_checks == [] and not children
+            assert state["errors"] == ["RuntimeError('original admission failure')"]
+        else:
+            assert state["gpu_released"] and state["alive"] == []
+            assert release_checks == [10]
+            assert [e[1] for e in events if e[0] == "spawn"] == [
+                "metadata",
+                "cache",
+                "server",
+                "client",
+            ]
+            assert ("metadata_wait", 60) in events
+            assert 9 in alarms
+        assert alarms[0] == 18 and alarms[-1] == 0
         receipt = state["save_observer_client"]
         assert receipt["instrumented"] and receipt["performance_accepted"] is False
         assert receipt["censored"] is (outcome in ("deadline", "native_failure"))
@@ -752,6 +858,7 @@ def test_existing_controller_lifecycle(frozen, tmp_path, monkeypatch, outcome):
                 "client_error": "client-failure",
                 "deadline": "deadline",
                 "native_failure": "native-failure",
+                "admission_failure": "observer-failure",
             }[outcome]
         )
         assert state["state"] == ("COMPLETED" if outcome == "normal" else "FAILED")
@@ -791,8 +898,8 @@ def test_terminal_receipt_failure_and_expired_evidence(tmp_path, monkeypatch):
     assert state["save_observer_client"]["censored"] is True
 
 
-@pytest.mark.parametrize("mismatch", ["range", "ordinal"])
-def test_reducer_rejects_semantic_or_ordinal_repair(frozen, monkeypatch, mismatch):
+@pytest.mark.parametrize("mismatch", ["range", "ordinal", "stop_control"])
+def test_reducer_rejects_unavailable_join(frozen, monkeypatch, mismatch):
     fields = {
         "req_id": 130,
         "start": 0,
@@ -831,11 +938,18 @@ def test_reducer_rejects_semantic_or_ordinal_repair(frozen, monkeypatch, mismatc
             },
         }
     monkeypatch.setattr(S, "reports", lambda *args: values)
-    assert S.summarize("fixture", frozen)["complete_chains"]
+    out = Path(frozen["output"])
+    assert S.summarize(out, frozen)["complete_chains"]
     stages = values["rank-0"]["operations"]["1"]["stages"]
     if mismatch == "range":
         stages["submit_enter"]["value"]["end"] = 17
-    else:
+    elif mismatch == "ordinal":
         stages["worker_terminal"]["value"]["aggregation_ordinal"] = 3
-    result = S.summarize("fixture", frozen)
+    else:
+        (out / "status.json").write_text(
+            json.dumps({"save_observer_control_error": "fixture OSError"})
+        )
+    result = S.summarize(out, frozen)
     assert not result["join_available"] and not result["complete_chains"]
+    if mismatch == "stop_control":
+        assert "stop-control publication failed" in result["incomplete"]

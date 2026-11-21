@@ -822,7 +822,10 @@ def execute(frozen, plan_sha):
         def on_stop():
             arm_evidence_deadline(clock)
             if save_clock is not None:
-                save_control(save_clock, out, frozen)
+                try:
+                    save_control(save_clock, out, frozen)
+                except OSError as error:
+                    state["save_observer_control_error"] = repr(error)
 
         clock.on_stop = on_stop
         clock.on_clock_change = lambda: signal.setitimer(
@@ -974,12 +977,12 @@ def execute(frozen, plan_sha):
                 else "FAILED"
             )
     except BaseException as error:
+        state["state"] = "FAILED"
+        state["errors"].append(repr(error))
         if clock:
             clock.latch("observer-failure", time.monotonic(), type(error).__name__)
         else:
             logger.exception("Bounded workload failed")
-        state["state"] = "FAILED"
-        state["errors"].append(repr(error))
     finally:
         try:
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -1002,6 +1005,12 @@ def execute(frozen, plan_sha):
 
                     while time.monotonic() < save_clock.grace_end():
                         summary = summarize(out, frozen)
+                        if state.get("save_observer_control_error"):
+                            summary["join_available"] = False
+                            summary["complete_chains"] = False
+                            summary["incomplete"].append(
+                                "stop-control publication failed"
+                            )
                         state["save_observer_summary"] = {
                             "join_available": summary["join_available"],
                             "complete_chains": summary["complete_chains"],

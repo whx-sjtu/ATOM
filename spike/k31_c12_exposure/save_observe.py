@@ -702,6 +702,7 @@ def poll_factory(original):
         value = runtime()
         selected = value is not None and safe(value.select, key)
         if selected:
+            before = safe(selected_output, output) or []
             sample(
                 "poll_enter",
                 key,
@@ -720,7 +721,12 @@ def poll_factory(original):
                 sample("poll_return", key, {"exception": type(error).__name__})
                 raise
             if selected:
-                keys = safe(selected_output, output) or []
+                keys = [
+                    row
+                    for row in (safe(selected_output, output) or [])
+                    if row not in before
+                    and (str(row[1]), row[2]) == (str(key[0]), key[1])
+                ]
                 sample("poll_return", key, {"emitted": keys, "exception": None})
                 for channel, req, gen, succeeded in keys:
                     ordinal = (value.data["current"] or {}).get("ordinal")
@@ -1247,6 +1253,17 @@ def startup_ready(values):
 def summarize(out, plan):
     values = reports(out, plan)
     reasons, generations = [], []
+    try:
+        status = json.loads((Path(out) / "status.json").read_text())
+    except FileNotFoundError:
+        status = {}
+    except (OSError, ValueError):
+        reasons.append("controller status unavailable")
+        status = {}
+    if type(status) is not dict:
+        reasons.append("controller status invalid")
+    elif status.get("save_observer_control_error"):
+        reasons.append("stop-control publication failed")
     for name, value in values.items():
         if not value.get("ready") or value.get("unavailable") or value.get("dropped"):
             reasons.append(name + ": unavailable/dropped")

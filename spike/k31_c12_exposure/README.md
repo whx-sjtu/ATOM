@@ -141,7 +141,8 @@ submission, future queries/results, existing aggregation and settlement calls ke
 their original arguments, results, exceptions and order. In particular, the
 installed result(timeout=0) path keeps its existing event synchronization; the
 observer adds none. The raw/event query scope excludes adapter housekeeping for
-other outstanding futures.
+other outstanding futures. Per-poll emission rows identify newly added
+completions for that poll's operation.
 
 Source-bound constructor receipts identify EngineCore/manager and eight workers
 before traffic. Diagnostic ordinals count existing broadcasts/executions under
@@ -156,6 +157,9 @@ uses existing aggregation/startup/failure boundaries. Worker records are capped 
 256/128KiB each; the manager at 512/256KiB, for 1.25MiB of retained role payload.
 In-place writes keep no duplicate temporary payload; interrupted or failed writes
 are unavailable. Overflow is explicit and never adds a workload stop or retry.
+A failed stop-control write preserves the original terminal state/error and is
+recorded separately in status.json. Both the status summary and offline reducer
+mark the join unavailable because the shortened worker cutoff was not proved.
 Recorder-owned cost counters exclude native calls, overlap and omit their own
 publication tail; cumulative I/O bytes are separate from the retained payload cap.
 
