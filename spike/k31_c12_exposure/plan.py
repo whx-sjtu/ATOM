@@ -254,6 +254,10 @@ def make_plan(out, mode="exposure"):
             for p in (
                 ROOT / "atom/model_engine/async_proc.py",
                 ROOT / "atom/model_engine/model_runner.py",
+                ROOT / "atom/model_engine/scheduler.py",
+                ROOT / "atom/model_engine/sequence.py",
+                ROOT / "atom/utils/h2d.py",
+                ROOT / "atom/utils/forward_context.py",
                 ROOT / "atom/model_ops/attentions/aiter_mla.py",
                 ROOT / "atom/model_ops/attention_mla.py",
                 ROOT / "atom/model_ops/indexer/indexer_forward.py",

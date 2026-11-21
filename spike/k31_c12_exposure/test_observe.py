@@ -167,8 +167,6 @@ def test_pool_recording_and_generations():
 def fake_runtime(tmp_path):
     import threading
 
-    import numpy as np
-
     runtime = object.__new__(O.Observer)
     runtime.path, runtime.config = tmp_path, P["observer"]
     runtime.first_request, runtime.forward_number = None, 0
@@ -176,18 +174,14 @@ def fake_runtime(tmp_path):
     runtime.torch = NS(
         cuda=NS(current_stream=lambda: NS(device_index=0, stream_id=7, cuda_stream=0))
     )
-    batch = NS(
-        req_ids=[17],
-        external_request_ids=None,
-        num_scheduled_tokens=np.array([8192]),
-        num_cached_tokens=np.array([385024]),
-        context_lens=np.array([393216]),
-        is_dummy_run=False,
-        total_seqs_num=1,
-        total_seqs_num_prefill=1,
-        total_seqs_num_decode=0,
-    )
-    return runtime, batch, NS(h2d_owner=NS(epoch=2), block_size=64)
+    from atom.utils.h2d import PublicationOwner
+
+    owner = PublicationOwner("cpu")
+    owner.begin()
+    owner.finish()
+    runtime.torch.cuda.is_current_stream_capturing = lambda: False
+    batch = native_batch([native_sequence(393216, cached=385024, ident=17)], [8192])
+    return runtime, batch, NS(h2d_owner=owner, block_size=64)
 
 
 def test_whole_batch_selection_and_owned_host_copies(tmp_path):
@@ -214,7 +208,7 @@ def test_whole_batch_selection_and_owned_host_copies(tmp_path):
     assert runtime.maps[0]["block_tables"].flags.owndata
     assert not runtime.maps[0]["block_tables"].flags.writeable
     batch.context_lens[:] = 401408
-    batch.num_cached_tokens[:] = 393216
+    batch.num_cached_tokens[:] = [393216]
     batch.req_ids = [18]
     runtime.prepare(runner, batch)
     assert O.TLS.target is None
@@ -541,6 +535,306 @@ def test_normalized_environment_still_checks_native_source_hash(tmp_path):
     runtime.state = {"worker_environment": native_asm_environment(expected)}
     with pytest.raises(ValueError, match="native seam source hash changed"):
         runtime.seal(None)
+
+
+def native_batch(seqs, counts, **kwargs):
+    from atom.model_engine.scheduler import ScheduledBatch
+    from atom.model_engine.sequence import SequenceType
+
+    prefill = [seq.type == SequenceType.PREFILL for seq in seqs]
+    return ScheduledBatch(
+        seqs={seq.id: seq for seq in seqs},
+        num_scheduled_tokens=counts,
+        total_tokens_num=sum(counts),
+        total_tokens_num_prefill=sum(n for n, yes in zip(counts, prefill) if yes),
+        total_tokens_num_decode=sum(n for n, yes in zip(counts, prefill) if not yes),
+        total_seqs_num=len(seqs),
+        total_seqs_num_prefill=sum(prefill),
+        total_seqs_num_decode=len(seqs) - sum(prefill),
+        **kwargs,
+    )
+
+
+def native_sequence(length, cached=0, *, request_id=None, decode=False, ident=None):
+    from array import array
+
+    from atom.model_engine.sequence import Sequence, SequenceType
+
+    seq = Sequence(
+        array("i", [0]) * length, block_size=64, id=ident, request_id=request_id
+    )
+    seq.type = SequenceType.DECODE if decode else SequenceType.PREFILL
+    seq.num_cached_tokens = cached
+    return seq
+
+
+def native_startup_batches(monkeypatch):
+    from atom.config import SpeculativeConfig
+
+    sys.path.insert(0, str(ROOT / "tests"))
+    from aiter_stub import atom_under_stubs
+
+    with atom_under_stubs() as load:
+        module = load("atom.model_engine.model_runner")
+        runner = object.__new__(module.ModelRunner)
+        # Draft config loading is a model boundary; keep the native dataclass and predicate.
+        with monkeypatch.context() as model_boundary:
+            model_boundary.setattr(
+                SpeculativeConfig, "__post_init__", lambda self: None
+            )
+            spec = SpeculativeConfig(method="dspark", num_speculative_tokens=3)
+        runner.config = NS(
+            max_model_len=P["max_model_len"],
+            max_num_seqs=P["max_num_seqs"],
+            max_num_batched_tokens=P["max_num_batched_tokens"],
+            enable_dp_attention=False,
+            prefill_context_parallel_size=1,
+            speculative_config=spec,
+        )
+        runner.block_size, runner.label = 64, "native CPU contract"
+        runner.tokenID_processor = NS(clean=lambda: None, is_pd_producer=False)
+        batches = []
+        runner.forward = batches.append  # Controlled model-forward boundary only.
+        monkeypatch.setattr(module, "get_dp_group", lambda: NS(world_size=1))
+        monkeypatch.setattr(module.torch.cuda, "empty_cache", lambda: None)
+        monkeypatch.setattr(module.torch.cuda, "reset_peak_memory_stats", lambda: None)
+        runner.warmup_model()
+        runner.dummy_execution()
+    return batches
+
+
+def native_field_types(batch, owner):
+    fields = (
+        "req_ids",
+        "external_request_ids",
+        "num_scheduled_tokens",
+        "num_cached_tokens",
+        "context_lens",
+        "is_dummy_run",
+        "total_seqs_num",
+        "total_seqs_num_prefill",
+        "total_seqs_num_decode",
+    )
+    result = {}
+    for name in fields:
+        value = getattr(batch, name)
+        item = {"container": f"{type(value).__module__}.{type(value).__name__}"}
+        if isinstance(value, (list, tuple)) or hasattr(value, "dtype"):
+            item["elements"] = sorted(
+                {f"{type(v).__module__}.{type(v).__name__}" for v in value}
+            )
+            item["length"] = len(value)
+        if hasattr(value, "dtype"):
+            item.update(dtype=str(value.dtype), shape=list(value.shape))
+        result[name] = item
+    result["publication_epoch"] = {
+        "container": f"{type(owner.epoch).__module__}.{type(owner.epoch).__name__}",
+        "value": owner.epoch,
+    }
+    return result
+
+
+def test_native_prepare_contract(tmp_path, monkeypatch):
+    import torch
+
+    from atom.utils.h2d import PublicationOwner
+
+    warmup, idle = native_startup_batches(monkeypatch)
+    assert warmup.is_dummy_run and warmup.total_seqs_num == 2
+    assert warmup.num_cached_tokens == [0, 0]
+    assert warmup.num_scheduled_tokens.tolist() == [4096, 4096]
+    assert not idle.is_dummy_run and idle.req_ids == []
+    prefill = native_batch([native_sequence(32, request_id="prefill")], [32])
+    decode = native_batch([native_sequence(33, cached=32, decode=True)], [1])
+    target_seq = native_sequence(401408, cached=385024, ident=314, request_id="target")
+    first = native_batch([target_seq], [8192])
+    mixed = native_batch(
+        [native_sequence(33, cached=32, decode=True), target_seq], [1, 8192]
+    )
+    target_seq.num_cached_tokens = 393216
+    second = native_batch([target_seq], [8192], num_cached_tokens=[393216])
+    runtime, _batch, _runner = fake_runtime(tmp_path)
+    owner = PublicationOwner("cpu")
+    runner = NS(h2d_owner=owner, block_size=64)
+    capture = [False]
+    runtime.torch.cuda.is_current_stream_capturing = lambda: capture[0]
+    cases = [
+        ("warmup", warmup, False),
+        ("idle", idle, False),
+        ("prefill", prefill, False),
+        ("decode", decode, False),
+        ("mixed", mixed, False),
+        ("capture_guard", first, True),
+        ("target_first", first, False),
+        ("target_second", second, False),
+    ]
+    evidence, errors = [], []
+    for name, batch, capture[0] in cases:
+        owner.begin()
+        row = {"case": name, "types": native_field_types(batch, owner)}
+        O.TLS.semantic = O.TLS.target = {"stale": True}
+        try:
+            runtime.prepare(runner, batch)
+            if batch.is_dummy_run or capture[0]:
+                assert O.TLS.semantic is None and O.TLS.target is None
+            else:
+                semantic = O.TLS.semantic
+                assert semantic["publication_epoch"] == owner.epoch
+                assert semantic["request_ids"] == batch.req_ids
+                assert semantic["external_request_ids"] == batch.external_request_ids
+                assert semantic["new"] == batch.num_scheduled_tokens.tolist()
+                assert semantic["cached"] == batch.num_cached_tokens
+                assert semantic["context"] == batch.context_lens.tolist()
+                assert bool(O.TLS.target) == name.startswith("target_")
+                saved = copy.deepcopy(semantic)
+                # Native constructors may alias scheduled arrays/cached overrides.
+                if name != "mixed":
+                    batch.req_ids.append(999)
+                    batch.external_request_ids.append("changed")
+                    if batch.num_cached_tokens:
+                        batch.num_cached_tokens[0] += 1
+                        batch.num_scheduled_tokens[0] += 1
+                        batch.context_lens[0] += 1
+                    assert semantic == saved
+
+                def cpu_record(value):
+                    if isinstance(value, dict):
+                        return all(cpu_record(v) for v in value.values())
+                    if isinstance(value, list):
+                        return all(cpu_record(v) for v in value)
+                    return value is None or type(value) in (str, int, bool)
+
+                assert cpu_record(semantic)
+                row["semantic"] = saved
+        except Exception as error:  # noqa: BLE001
+            row["error"] = f"{type(error).__name__}: {error}"
+            errors.append([name, row["error"]])
+        finally:
+            owner.finish()
+        evidence.append(row)
+    print(json.dumps({"native_batch_contract": evidence}, sort_keys=True))
+    assert not errors, errors
+    assert [s["context"][0] for s in runtime.state["bracket"]] == [393216, 401408]
+    assert [s["request_ids"] for s in runtime.state["bracket"]] == [[314], [314]]
+    assert not torch.cuda.is_initialized() and not torch.distributed.is_initialized()
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "num_scheduled_tokens",
+        "num_cached_tokens",
+        "context_lens",
+        "total_seqs_num",
+        "req_ids",
+        "is_dummy_run",
+    ],
+)
+def test_prepare_rejects_tensor_containers_without_readback(
+    tmp_path, monkeypatch, field
+):
+    import torch
+
+    runtime, batch, runner = fake_runtime(tmp_path)
+    tensor = torch.empty(1, device="meta", dtype=torch.int32)
+    setattr(batch, field, tensor)
+
+    def readback(*args, **kwargs):
+        pytest.fail("observer attempted tensor readback")
+
+    for method in ("tolist", "item", "cpu", "numpy"):
+        monkeypatch.setattr(torch.Tensor, method, readback)
+    O.TLS.semantic = O.TLS.target = {"stale": True}
+    with pytest.raises(TypeError):
+        runtime.prepare(runner, batch)
+    assert O.TLS.semantic is None and O.TLS.target is None
+
+
+def test_cached_override_and_scheduled_array_are_owned_snapshot(tmp_path):
+    import numpy as np
+
+    runtime, _batch, runner = fake_runtime(tmp_path)
+    seq = native_sequence(393216, cached=385024, ident=93, request_id="native-override")
+    scheduled = np.array([8192], dtype=np.int32)
+    cached = [385024]
+    batch = native_batch([seq], scheduled, num_cached_tokens=cached)
+    assert batch.num_scheduled_tokens is scheduled and batch.num_cached_tokens is cached
+    runtime.prepare(runner, batch)
+    record = copy.deepcopy(O.TLS.semantic)
+    scheduled[0], cached[0] = 1, 0
+    batch.req_ids[0], batch.external_request_ids[0], batch.context_lens[0] = 94, None, 1
+    assert O.TLS.semantic == record
+    assert record["cached"] == [385024] and record["new"] == [8192]
+
+
+def test_native_capture_context_bypasses_batch_preparation(tmp_path):
+    import numpy as np
+    import torch
+
+    from atom.config import CompilationConfig, ParallelConfig
+    from atom.utils.forward_context import (
+        Context,
+        get_forward_context,
+        reset_forward_context,
+    )
+    from atom.utils.h2d import PublicationOwner
+
+    sys.path.insert(0, str(ROOT / "tests"))
+    from aiter_stub import atom_under_stubs
+
+    runtime, _batch, _runner = fake_runtime(tmp_path)
+    runtime.state["markers"] = []
+    runtime.torch.cuda.is_current_stream_capturing = lambda: True
+    with atom_under_stubs() as load:
+        module = load("atom.model_engine.model_runner")
+        runner = object.__new__(module.ModelRunner)
+        runner.config = NS(
+            parallel_config=ParallelConfig(), compilation_config=CompilationConfig()
+        )
+        runner.h2d_owner = PublicationOwner("cpu")
+        runner.running_tokens_per_dp_rank = np.array([4], dtype=np.int32)
+        info = NS(np=np.zeros(3, dtype=np.int32), gpu=torch.zeros(3, dtype=torch.int32))
+        info.copy_to_gpu = lambda: info.gpu.copy_(torch.from_numpy(info.np))
+        runner.forward_vars = {
+            "batch_info": info,
+            "input_ids": NS(gpu=torch.zeros(4, dtype=torch.int32)),
+        }
+        ctx = Context(
+            torch.arange(4),
+            is_prefill=True,
+            is_dummy_run=True,
+            scheduled_bs=2,
+            scheduled_tokens=4,
+            running_bs=2,
+            running_tokens=4,
+        )
+        called = []
+
+        def model_boundary(ids, positions):
+            assert (
+                get_forward_context().context is ctx
+                and get_forward_context().in_hipgraph
+            )
+            assert get_forward_context().tr_graph == "record"
+            assert runtime.begin_call(None, None, None, None, None) is None
+            called.append((ids.shape, positions.shape))
+
+        runner.model = model_boundary
+        runner.prepare_model = lambda *a: pytest.fail(
+            "native capture called prepare_model"
+        )
+        O.TLS.semantic = O.TLS.target = {"stale": True}
+        try:
+            built = runner._build_capture(lambda: (None, ctx))
+            runner._run_capture_prefill(*built, "record")
+            assert called == [(torch.Size([4]), torch.Size([4]))]
+            assert runner.h2d_owner.epoch == 1
+            assert runtime.state["markers"] == [] and runtime.state["bracket"] == []
+            assert runtime.forward_number == 0
+        finally:
+            reset_forward_context()
+            O.TLS.semantic = O.TLS.target = None
+    assert not torch.cuda.is_initialized() and not torch.distributed.is_initialized()
 
 
 # The probe below is opt-in and runs as a separate guarded process, never during

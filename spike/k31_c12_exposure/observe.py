@@ -11,6 +11,7 @@ import signal
 import sys
 import threading
 import time
+from numbers import Integral
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -40,6 +41,24 @@ def atomic(path, value):
     else:
         tmp.write_text(json.dumps(value, allow_nan=False) + "\n")
     tmp.replace(path)
+
+
+def host_int(value, name):
+    if not isinstance(value, Integral) or isinstance(value, bool):
+        raise TypeError(f"{name} must be a host integer")
+    return int(value)
+
+
+def host_counts(values, name):
+    import numpy as np
+
+    if isinstance(values, np.ndarray):
+        if values.ndim != 1 or values.dtype.kind not in "iu":
+            raise TypeError(f"{name} must be a one-dimensional host integer array")
+        return values.tolist()
+    if isinstance(values, list):
+        return [host_int(value, name) for value in values]
+    raise TypeError(f"{name} must be a native host list or ndarray")
 
 
 def descriptor(tensor):
@@ -497,18 +516,28 @@ class Observer:
 
     def prepare(self, runner, batch):
         self.forward_number += 1
+        TLS.semantic = TLS.target = None
+        if type(batch.is_dummy_run) is not bool:
+            raise TypeError("is_dummy_run must be a native bool")
+        if batch.is_dummy_run or self.torch.cuda.is_current_stream_capturing():
+            return
+        external_ids = getattr(batch, "external_request_ids", None)
+        if not isinstance(batch.req_ids, list) or (
+            external_ids is not None and not isinstance(external_ids, list)
+        ):
+            raise TypeError("request identities must be native host lists")
         semantic = {
             "forward": self.forward_number,
             "request_ids": list(batch.req_ids),
-            "external_request_ids": getattr(batch, "external_request_ids", None),
-            "new": batch.num_scheduled_tokens.tolist(),
-            "cached": batch.num_cached_tokens.tolist(),
-            "context": batch.context_lens.tolist(),
-            "dummy": bool(batch.is_dummy_run),
-            "total": int(batch.total_seqs_num),
-            "prefill": int(batch.total_seqs_num_prefill),
-            "decode": int(batch.total_seqs_num_decode),
-            "publication_epoch": int(runner.h2d_owner.epoch),
+            "external_request_ids": external_ids,
+            "new": host_counts(batch.num_scheduled_tokens, "num_scheduled_tokens"),
+            "cached": host_counts(batch.num_cached_tokens, "num_cached_tokens"),
+            "context": host_counts(batch.context_lens, "context_lens"),
+            "dummy": batch.is_dummy_run,
+            "total": host_int(batch.total_seqs_num, "total_seqs_num"),
+            "prefill": host_int(batch.total_seqs_num_prefill, "total_seqs_num_prefill"),
+            "decode": host_int(batch.total_seqs_num_decode, "total_seqs_num_decode"),
+            "publication_epoch": host_int(runner.h2d_owner.epoch, "publication_epoch"),
             "allocation_generation": "unavailable",
             "input_fingerprint": "unavailable",
         }

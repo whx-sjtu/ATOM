@@ -61,6 +61,14 @@ Six current-stream events per call distinguish entry, the two gathers and their
 intervening index-select, and final scatter. CPU-owned immutable host maps and
 scalar tensor/view/stream descriptors do not prove consumed GPU values or lifetime.
 Raw allocation/request generation and cross-run input correspondence stay unavailable.
+Preparation respects native `ScheduledBatch` containers: new/context counts are
+host NumPy arrays, cached counts and IDs are host lists. Integer snapshots reject
+tensors before conversion. Flagged dummy/capture calls clear semantic state before
+copying fields; the native empty idle batch remains a non-target snapshot.
+CPU checks call native warmup/idle factories, Sequence/ScheduledBatch and
+PublicationOwner, including mixed batches and both target lengths. Native capture
+uses Context directly and bypasses prepare_model; its model/upload boundaries are
+controlled in the CPU check, without executing a GPU graph.
 
 Startup is bounded by900s; workload always ends bymin(readiness+420,launch+1320).
 After a candidate starts, each rank's earliest incomplete frontier also has a30s
