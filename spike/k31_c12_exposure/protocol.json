@@ -52,5 +52,70 @@
   "max_profile_upper_bound_s": 10,
   "state_policy": "Fresh service and private LMCache namespace once; retain state across u1/u2/diagnostic. Identical client seed/warmup policy is not KV/SSM state equivalence.",
   "scope": "Bounded exposure only; not official submission. No candidate, GSM8K or 3600-second client run.",
-  "ck_sha": "f93c029e09f67c983696eecac8e0e0350f3dbb54"
+  "ck_sha": "f93c029e09f67c983696eecac8e0e0350f3dbb54",
+  "observer": {
+    "mode": "warmup_observer",
+    "ranks": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "layers": [
+      3,
+      7,
+      11,
+      15,
+      19,
+      23,
+      27,
+      31,
+      35,
+      39,
+      43,
+      47,
+      51,
+      55,
+      59,
+      63,
+      67,
+      71,
+      75,
+      79,
+      83,
+      87,
+      91,
+      92
+    ],
+    "contexts": [
+      393216,
+      401408
+    ],
+    "new_tokens": 8192,
+    "local_padded": [
+      49152,
+      50176
+    ],
+    "block_size": 64,
+    "interleave": 1,
+    "markers_per_call": 6,
+    "pool_size": 288,
+    "pool_ceiling": 384,
+    "startup_s": 900,
+    "prefix_s": 420,
+    "workload_s": 1320,
+    "no_progress_s": 30,
+    "evidence_s": 15,
+    "evidence_absolute_s": 1335,
+    "heartbeat_s": 5,
+    "trace_buffer_size": 65536,
+    "export_bytes": 67108864,
+    "draft_eligible_helpers": 0,
+    "draft_basis": "K3DSparkMLAAttention uses MLAModules(indexer=None,is_sparse=False); write_context_kv_latent; unexpected indexer/helper calls fail qualification",
+    "source_audit_sha256": "6139f3d873e37cf5bd1c427926cfb5cfd3375dff9b7036217e6d8d3c03a6989c"
+  }
 }

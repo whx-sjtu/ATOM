@@ -132,11 +132,11 @@ def profile_window(url, out, server_log, trace_root):
     return evidence
 
 
-def run_client(C, frozen, out, label, fd, track, check_deadline):
+def run_client(C, frozen, out, label, fd, track, check_deadline, observer=None):
     directory = out / label
     directory.mkdir()
     argv = frozen["client"] + ["--output-artifact-dir", str(directory)]
-    env = frozen["environment"]
+    env = frozen["environments"]["client"]
     save(directory / "launch.json", {"argv": argv, "environment": env})
     process = C.spawn(
         argv,
@@ -147,6 +147,42 @@ def run_client(C, frozen, out, label, fd, track, check_deadline):
         cpus="0-111",
     )
     track(process)
+    if observer:
+        observer.client_pid = process.pid
+        phase = False
+        while process.poll() is None and observer.reason is None:
+            for path in (directory / "logs/aiperf.log", directory / "console.log"):
+                phase = phase or (
+                    path.exists()
+                    and bool(PHASE.search(path.read_text(errors="replace")))
+                )
+            observer.check(observer_snapshots(out, frozen), time.monotonic(), phase)
+            if observer.reason is None:
+                check_deadline()
+                time.sleep(0.1)
+        if observer.reason is None:
+            observer.latch(
+                "observer-failure",
+                time.monotonic(),
+                "client exited before full bracket",
+            )
+        # Stop new submissions before any filesystem/export work. The final ledger may be partial.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        save(
+            directory / "client-result.json",
+            {
+                "exit_code": process.poll(),
+                "stop": observer.reason,
+                "phase_observed": phase,
+                "phase_overlap_possible": phase,
+                "performance_accepted": False,
+                "cancellation_ledger": "partial; preserve raw client artifacts and server request logs",
+            },
+        )
+        return
     deadline = time.monotonic() + P["client_timeout_s"]
     expired = threading.Event()
 
@@ -260,7 +296,7 @@ def capture_metadata(frozen, out):
     ):
         raise RuntimeError("profiler or ATOM compile-cache binding changed")
     save(out / "engine-kwargs.json", json.loads(json.dumps(kwargs, default=str)))
-    env = frozen["environment"]
+    env = frozen["environments"]["server"]
     config = capture_config(
         P["model"],
         frozen["server"],
@@ -320,10 +356,31 @@ def metrics(out, label, state):
             state["errors"].append(f"metrics {suffix}: {error!r}")
 
 
+def observer_snapshots(out, frozen):
+    snapshots = {}
+    for rank in frozen["protocol"]["observer"]["ranks"]:
+        path = out / "observer" / f"rank-{rank}" / "state.json"
+        if not path.exists():
+            continue
+        value = json.loads(path.read_text())
+        if value.get("ready") and (
+            value.get("head") != frozen["head"]
+            or value.get("config_sha256") != frozen["observer_config_sha256"]
+            or value.get("sources") != frozen["sources"]
+            or value.get("rank") != rank
+        ):
+            value["failure"] = "worker receipt identity differs from frozen plan"
+        snapshots[rank] = value
+    pids = [v["pid"] for v in snapshots.values()]
+    if len(pids) != len(set(pids)):
+        raise RuntimeError("multiple rank receipts from one worker")
+    return snapshots
+
+
 def execute(frozen, plan_sha):
     import psutil
 
-    expected = make_plan(Path(frozen["output"]))
+    expected = make_plan(Path(frozen["output"]), frozen.get("mode", "exposure"))
     if frozen != expected or git("status", "--porcelain"):
         raise RuntimeError("source or frozen plan changed")
     if (
@@ -354,7 +411,14 @@ def execute(frozen, plan_sha):
         "admitted": False,
     }
     save(out / "plan.json", frozen)
-    deadline = time.monotonic() + P["workload_timeout_s"]
+    launched = time.monotonic()
+    observer = None
+    if frozen["mode"] == "warmup_observer":
+        from observe import StopState
+
+        observer = StopState(frozen["protocol"]["observer"], launched)
+    limit = observer.config["workload_s"] if observer else P["workload_timeout_s"]
+    deadline = launched + limit
 
     def track(process=None):
         if process is not None:
@@ -401,10 +465,21 @@ def execute(frozen, plan_sha):
         track()
         if any(p.poll() is not None for p in services):
             raise RuntimeError("a persistent server exited")
+        if observer:
+            observer.check(observer_snapshots(out, frozen), time.monotonic())
+            if observer.reason:
+                raise RuntimeError(f"observer stopped: {observer.reason}")
         if time.monotonic() >= deadline:
             raise TimeoutError("whole workload bound exceeded")
 
     def interrupt(signum, frame):
+        if observer:
+            observer.latch(
+                "deadline" if signum == signal.SIGALRM else "observer-failure",
+                time.monotonic(),
+                f"signal {signum}",
+            )
+            raise KeyboardInterrupt(f"signal {signum}")
         for proc in processes:
             if proc.poll() is None:
                 try:
@@ -417,7 +492,7 @@ def execute(frozen, plan_sha):
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGINT, interrupt)
     signal.signal(signal.SIGALRM, interrupt)
-    signal.setitimer(signal.ITIMER_REAL, P["workload_timeout_s"])
+    signal.setitimer(signal.ITIMER_REAL, limit)
     try:
         state["before"] = C.assert_gpus_idle()
         state["admitted"] = True
@@ -430,7 +505,7 @@ def execute(frozen, plan_sha):
             ]
         )
         metadata_env = dict(
-            frozen["environment"], K31_TASK6_METADATA_LEASE=frozen["head"]
+            frozen["environments"]["metadata"], K31_TASK6_METADATA_LEASE=frozen["head"]
         )
         metadata = C.spawn(
             [
@@ -448,7 +523,7 @@ def execute(frozen, plan_sha):
         track(metadata)
         if metadata.wait(timeout=60):
             raise RuntimeError("metadata capture failed; see metadata.log")
-        env = frozen["environment"]
+        env = frozen["environments"]["cache"]
         cache = C.spawn(
             frozen["cache"],
             env=env,
@@ -459,7 +534,11 @@ def execute(frozen, plan_sha):
         )
         track(cache)
         services.append(cache)
-        ready_deadline = time.monotonic() + P["readiness_timeout_s"]
+        ready_deadline = (
+            launched + observer.config["startup_s"]
+            if observer
+            else time.monotonic() + P["readiness_timeout_s"]
+        )
         while True:
             check_deadline()
             try:
@@ -475,7 +554,7 @@ def execute(frozen, plan_sha):
             time.sleep(0.2)
         server = C.spawn(
             frozen["server"],
-            env=env,
+            env=frozen["environments"]["server"],
             cwd=ROOT,
             log_path=out / "server.log",
             lock_fd=fd,
@@ -490,18 +569,26 @@ def execute(frozen, plan_sha):
             try:
                 models = json.loads(request(f"http://127.0.0.1:{P['port']}/v1/models"))
                 if any(m["id"] == P["served_name"] for m in models["data"]):
-                    break
+                    snapshots = observer_snapshots(out, frozen) if observer else {}
+                    if not observer or (
+                        len(snapshots) == 8
+                        and all(v.get("ready") for v in snapshots.values())
+                    ):
+                        break
             except (OSError, ValueError):
                 pass
             if time.monotonic() >= ready_deadline:
                 raise TimeoutError("server readiness bound exceeded")
             time.sleep(1)
         state["ready_at"] = time.time()
+        if observer:
+            observer.ready = time.monotonic()
+            state["observer_ready_mono"] = observer.ready
         save(out / "status.json", state)
-        for label in ("u1", "u2", "diagnostic"):
+        for label in frozen["invocations"]:
             metrics(out, f"before-{label}", state)
             try:
-                run_client(C, frozen, out, label, fd, track, check_deadline)
+                run_client(C, frozen, out, label, fd, track, check_deadline, observer)
             finally:
                 metrics(out, f"after-{label}", state)
         state["state"] = "COMPLETED"
@@ -510,6 +597,36 @@ def execute(frozen, plan_sha):
         state["state"] = "FAILED"
         state["errors"].append(repr(error))
     finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        if observer:
+            client_pid = getattr(observer, "client_pid", None)
+            if client_pid is not None:
+                try:
+                    os.killpg(client_pid, signal.SIGKILL)
+                except OSError as error:
+                    if not isinstance(error, ProcessLookupError):
+                        state["errors"].append(f"client stop: {error!r}")
+            observer.latch("observer-failure", time.monotonic(), state["errors"])
+            state["observer_stop"] = observer.reason
+            state["mode"] = "warmup_observer"
+            state["performance_accepted"] = False
+            # The parent never waits on a worker event, GIL, exporter, or file acknowledgement.
+            try:
+                save(out / "observer/trigger.json", observer.reason)
+                snapshots = observer_snapshots(out, frozen)
+                alive = {p.pid for p in track()}
+                for snap in snapshots.values():
+                    if snap.get("stack_registered") and snap["pid"] in alive:
+                        os.kill(snap["pid"], signal.SIGUSR2)
+                while time.monotonic() < observer.grace_end():
+                    time.sleep(
+                        max(0, min(0.1, observer.grace_end() - time.monotonic()))
+                    )
+            except Exception as error:  # noqa: BLE001
+                state["errors"].append(f"evidence grace: {error!r}")
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)

@@ -223,7 +223,9 @@ def environment():
     return env
 
 
-def make_plan(out):
+def make_plan(out, mode="exposure"):
+    if mode not in ("exposure", "warmup_observer"):
+        raise ValueError(mode)
     server, cache, client = commands(out)
     external = [
         WS / "harness/common.py",
@@ -231,7 +233,36 @@ def make_plan(out):
         PRIVATE / "runtime-imports.json",
         PRIVATE / "dataset-ready.json",
     ]
+    env = environment()
+    roles = {role: dict(env) for role in ("server", "cache", "client", "metadata")}
+    config = P["observer"] if mode == "warmup_observer" else None
+    if config:
+        roles["server"].update(
+            {
+                "PYTHONPATH": f"{HERE / 'worker_bootstrap'}:{env['PYTHONPATH']}",
+                "K31_OBSERVER_PLAN": str(out / "plan.json"),
+                "TORCH_NCCL_TRACE_BUFFER_SIZE": str(config["trace_buffer_size"]),
+                "TORCH_FR_BUFFER_SIZE": str(config["trace_buffer_size"]),
+                "TORCH_NCCL_ENABLE_TIMING": "0",
+            }
+        )
     return {
+        "mode": mode,
+        "native_sources": {
+            str(p): sha(p)
+            for p in (
+                ROOT / "atom/model_engine/async_proc.py",
+                ROOT / "atom/model_engine/model_runner.py",
+                ROOT / "atom/model_ops/attentions/aiter_mla.py",
+                ROOT / "atom/model_ops/attention_mla.py",
+                ROOT / "atom/model_ops/indexer/indexer_forward.py",
+                Path(P["aiter_root"]) / "aiter/dist/parallel_state.py",
+            )
+        },
+        "observer_config_sha256": hashlib.sha256(
+            json.dumps(config, sort_keys=True).encode()
+        ).hexdigest(),
+        "environments": roles,
         "head": git("rev-parse", "HEAD"),
         "base": P["base"],
         "output": str(out),
@@ -239,10 +270,14 @@ def make_plan(out):
         "server": server,
         "cache": cache,
         "client": client,
-        "environment": environment(),
-        "sources": {str(p): sha(p) for p in HERE.iterdir() if p.is_file()},
+        "environment": env,
+        "sources": {
+            str(p): sha(p)
+            for p in sorted(HERE.rglob("*"))
+            if p.is_file() and "__pycache__" not in p.parts
+        },
         "atom_compile_cache": str(PRIVATE / "home/.cache/atom/torch_compile_cache"),
-        "invocations": ["u1", "u2", "diagnostic"],
+        "invocations": ["warmup_observer"] if config else ["u1", "u2", "diagnostic"],
         "official_submission_eligible": False,
         "gpu_authorized_by_plan": False,
         "readiness": {str(p): sha(p) if p.exists() else None for p in external},
@@ -253,8 +288,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--plan-out", type=Path)
+    parser.add_argument(
+        "--mode", choices=("exposure", "warmup_observer"), default="exposure"
+    )
     args = parser.parse_args()
-    plan = make_plan(args.out.resolve())
+    plan = make_plan(args.out.resolve(), args.mode)
     if args.plan_out:
         args.plan_out.parent.mkdir(parents=True, exist_ok=True)
         args.plan_out.write_text(json.dumps(plan, indent=2) + "\n")

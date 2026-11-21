@@ -362,11 +362,109 @@ def summarize(out):
     return result
 
 
+def summarize_observer(out):
+    import numpy as np
+
+    result = {
+        "mode": "warmup_observer",
+        "performance_accepted": False,
+        "cross_run_input_correspondence": "unproven",
+        "ranks": {},
+        "limitation": "Host-map bounds do not witness device page values, producer readiness, or allocation lifetime.",
+    }
+    for rank in range(8):
+        directory = out / "observer" / f"rank-{rank}"
+        item = (
+            read(directory / "state.json")
+            if (directory / "state.json").exists()
+            else {"failure": "missing worker"}
+        )
+        checks = []
+        for path in sorted(directory.glob("host-map-*.json")):
+            witness = read(path)
+            arrays = {
+                k: np.asarray(v, dtype=np.int64) for k, v in witness["arrays"].items()
+            }
+            table, lengths, lpad, cu, gcu = (
+                arrays[k] for k in ("block_tables", "g_lens", "lpad", "cu_pad", "g_cu")
+            )
+            try:
+                seq = np.repeat(np.arange(len(lengths)), lpad)
+                local = np.arange(int(cu[-1])) - np.repeat(cu[:-1], lpad)
+                pages = table[seq, local // 64]
+                read_slots = pages * 64 + local % 64
+                page_counts = (lengths + 63) // 64
+                first = np.concatenate(([0], page_counts.cumsum()))
+                stage = np.repeat(first[:-1] * 64 - gcu[:-1], lengths) + np.arange(
+                    int(gcu[-1])
+                )
+                position = np.arange(int(gcu[-1])) - np.repeat(gcu[:-1], lengths)
+                gather = (
+                    (position % 8) * int(cu[-1])
+                    + np.repeat(cu[:-1], lengths)
+                    + position // 8
+                )
+                capacities = [
+                    {
+                        "cache": op["semantic"]["cache"],
+                        "page_capacity": min(
+                            op["cache"]["shape"][0], op["scale"]["shape"][0]
+                        ),
+                    }
+                    for op in item.get("operands", [])
+                    if op["semantic"]["context"] == int(lengths[0])
+                ]
+                valid = bool(
+                    capacities
+                    and read_slots.min() >= 0
+                    and all(pages.max() < c["page_capacity"] for c in capacities)
+                    and stage.min() >= 0
+                    and stage.max() < int(first[-1]) * 64
+                    and gather.min() >= 0
+                    and gather.max() < int(cu[-1]) * 8
+                )
+                checks.append(
+                    {
+                        "source": str(path),
+                        "host_bounds_valid": valid,
+                        "view_capacities": capacities,
+                        "read_range": [int(read_slots.min()), int(read_slots.max())],
+                        "stage_range": [int(stage.min()), int(stage.max())],
+                        "gather_range": [int(gather.min()), int(gather.max())],
+                    }
+                )
+            except (ValueError, IndexError) as error:
+                checks.append(
+                    {
+                        "source": str(path),
+                        "host_bounds_valid": False,
+                        "error": str(error),
+                    }
+                )
+        item["host_map_checks"] = checks
+        result["ranks"][rank] = item
+    status = out / "status.json"
+    result["stop"] = read(status).get("observer_stop") if status.exists() else None
+    result["conclusion"] = (
+        "Complete bracket remains inconclusive about the old failure."
+        if all(v.get("complete") for v in result["ranks"].values())
+        else "Incomplete target coverage; unavailable observations stay unavailable."
+    )
+    write(out / "observer-report.json", result)
+    return result
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("out", type=Path)
     parser.add_argument("--build-bundles", action="store_true")
     args = parser.parse_args()
-    if args.build_bundles:
-        build_cases(args.out)
-    print(json.dumps(summarize(args.out)))
+    if read(args.out / "plan.json").get("mode") == "warmup_observer":
+        if args.build_bundles:
+            raise ValueError("observer mode produces no exposure/performance bundle")
+        result = summarize_observer(args.out)
+    else:
+        if args.build_bundles:
+            build_cases(args.out)
+        result = summarize(args.out)
+    print(json.dumps(result))

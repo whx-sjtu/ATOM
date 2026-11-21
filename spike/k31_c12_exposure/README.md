@@ -37,3 +37,49 @@ scopes, overlapping families and rank sums do not establish GPU wall cost;
 missing native MLA tail or embedded K2 communication boundaries remain unknown.
 The report derives its reproduction range only from usable unprofiled samples.
 None of these observations establishes official C12 performance or B300 headroom.
+
+## Warmup observer (separate mode)
+
+Freeze with `plan.py --mode warmup_observer --out <fresh-run> --plan-out <plan>`.
+`run.py --run-plan <plan>` uses the existing owned supervisor and still requires
+an exact reviewed head/plan grant. The plan binds all nested observer sources,
+the native seams, configuration, and server/cache/client/metadata environments.
+Only the server receives `worker_bootstrap` and recorder settings. Native spawned
+workers activate after device/group setup; nonworkers install passive import hooks.
+
+The pre-load exporter/accessor probe and initial event records precede weight
+loading. Two existing post-load all-gathers calibrate the selected-PG sequence
+association from unique new FlightRecorder entries. The runtime layer/cache
+catalog, initial event completion and selected-group history are sealed before
+`_maybe_warmup`. No synthetic collective or event synchronization is inserted.
+
+One AgentX invocation selects the first whole-batch singleton request at393216
+keys and its401408-key successor (8192 new tokens each). The24 layers are3,7,...91,92.
+Six current-stream events per call distinguish entry, the two gathers and their
+intervening index-select, and final scatter. CPU-owned immutable host maps and
+scalar tensor/view/stream descriptors do not prove consumed GPU values or lifetime.
+Raw allocation/request generation and cross-run input correspondence stay unavailable.
+
+Startup is bounded by900s; workload always ends bymin(readiness+420,launch+1320).
+After a candidate starts, each rank's earliest incomplete frontier also has a30s
+limit. The first completion/failure/phase/deadline stop is latched. The client
+process group is killed before export grace; profiling overlap may already exist.
+Evidence ends bymin(trigger+15,launch+1335), then normal TERM/KILL/release runs.
+The parent does not wait on a worker's GIL, event query or exporter. A worker may
+still have queued GPU work during grace. There is no retry or second arm.
+
+Analyze with `analyze.py <run>`; observer mode rejects performance bundle creation.
+The report preserves first unfinished communication and host-map bounds, using
+per-layer tensor-view page capacity rather than shared-storage size. Complete
+coverage remains inconclusive about the old failure; it never supplies an exposure
+reproduction range or official result.
+
+CPU checks (inside the declared container, under `no_gpu.sh` and the CPU lock):
+`python -m pytest -q --confcutdir=spike/k31_c12_exposure spike/k31_c12_exposure/test_observe.py`.
+For the native8-worker wiring probe, freeze a fresh observer plan and run
+`test_observe.py` with `K31_CPU_ROUTE=1`, `K31_OBSERVER_PLAN=<plan>`, and the shim
+at the front of PYTHONPATH. It uses real AsyncIOProcManager/spawn/AsyncIOProc and
+the native ModelRunner constructor/setup call. Explicit fixtures replace external
+kernels, device/PG/Event/exporter, model construction and IO queues; all8 distinct
+workers must publish source-bound hook receipts while CUDA/distributed remain
+uninitialized. This is wiring qualification only, never GPU readiness.
