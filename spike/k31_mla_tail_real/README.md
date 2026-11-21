@@ -43,7 +43,10 @@ per-arm min/max intervals are frozen before independent reproduction; its
 five-sample medians must lie inside without widening. Failure never auto-retries.
 
 The model capture and replay are separate prospective root leases, bounded at
-900 and180 seconds. Pinned Owned PID/birth tracking, unblocked child stop signals,
+900 and180 seconds, including result validation in an owned CPU child under the
+same absolute deadline. Late completion is failure. Work elapsed time includes
+validation; cleanup time is reported separately. Pinned Owned PID/birth tracking,
+unblocked child stop signals,
 all-eight-BDF counters and an actually empty global KFD sample govern cleanup.
 Direct sysfs polling does not restart SMI; unknown release retains the lock.
 

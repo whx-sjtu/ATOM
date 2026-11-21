@@ -77,6 +77,21 @@ def save(path, value):
     Path(path).write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
 
 
+def validation_command(path):
+    return [
+        "flock",
+        "-x",
+        str(WS / "locks/cpu-compile.lock"),
+        str(WS / "harness/no_gpu.sh"),
+        "/opt/venv/bin/python",
+        "-B",
+        str(Path(__file__).resolve()),
+        "--validate-results",
+        "--plan",
+        str(path.resolve()),
+    ]
+
+
 def check_plan(plan, path, worker=False):
     helpers()
     assert plan["head"] == LEGACY.git("rev-parse", "HEAD") and not LEGACY.git(
@@ -86,6 +101,7 @@ def check_plan(plan, path, worker=False):
     assert plan["max_job_seconds"] == (900 if plan["mode"] == "capture" else 180)
     assert Path(plan["output"]).resolve().is_relative_to(PRIVATE / "runs")
     assert plan["selected_bdfs"] == list(LEGACY.SELECTED_BDFS)
+    assert plan["validation_command"] == validation_command(path)
     assert plan["protocol"] == {
         "pairs": 5,
         "aa_pairs": 5,
@@ -168,6 +184,8 @@ def make_plan(mode, output, path, snapshot=None):
             *Path(__file__).parent.glob("*"),
             RECIPE,
             WS / "harness/common.py",
+            WS / "harness/no_gpu.sh",
+            WS / "harness/nogpu/kfd_guard.c",
         ]
         if p.is_file()
     }
@@ -228,6 +246,7 @@ def make_plan(mode, output, path, snapshot=None):
             "--plan",
             str(path.resolve()),
         ],
+        "validation_command": validation_command(path),
         "gpu_authorized_by_plan": False,
     }
     if mode == "replay":
@@ -573,6 +592,7 @@ def supervise(plan, path):
         sig: signal.signal(sig, lambda sig, frame: stopped.append(sig))
         for sig in (signal.SIGTERM, signal.SIGINT)
     }
+    start, validation = None, None
     try:
         result["admission"] = common.assert_gpus_idle()
         common.assert_ports_free(plan["ports"])
@@ -583,7 +603,11 @@ def supervise(plan, path):
             K31_TASK19_GPU_LOCK_FD=str(fd),
         )
         start = time.monotonic()
-        for rank in range(1 if plan["mode"] == "capture" else 8):
+        deadline = start + plan["max_job_seconds"]
+        expected_workers = 1 if plan["mode"] == "capture" else 8
+        for rank in range(expected_workers):
+            if stopped or time.monotonic() >= deadline:
+                break
             script = (
                 Path(__file__).with_name("capture.py")
                 if plan["mode"] == "capture"
@@ -610,29 +634,52 @@ def supervise(plan, path):
             owned.add(child)
             if stopped:
                 break
-        while (
-            any(p.poll() is None for p in children)
-            and not stopped
-            and all(p.poll() in (None, 0) for p in children)
-            and time.monotonic() < start + plan["max_job_seconds"]
-        ):
-            owned.live()
-            time.sleep(0.05)
-        result.update(
-            exit_codes=[p.poll() for p in children],
-            stop_signals=stopped,
-            complete=len(children) == (1 if plan["mode"] == "capture" else 8)
-            and all(p.poll() == 0 for p in children)
-            and not stopped,
-            elapsed_s=time.monotonic() - start,
-        )
-        if result["complete"]:
-            validate_results(plan)
-            result["validated_results"] = True
+        for phase in ("work", "validation"):
+            if phase == "validation":
+                if stopped or time.monotonic() >= deadline:
+                    raise TimeoutError("work deadline reached before validation")
+                validation = common.spawn(
+                    plan["validation_command"],
+                    env={**env, "KFD_GUARD_LOG": str(output / "validation-kfd.log")},
+                    cwd=ROOT,
+                    log_path=output / "validation.log",
+                    lock_fd=fd,
+                    cpus="112-127",
+                )
+                owned.add(validation)
+            active = children if phase == "work" else [validation]
+            while (
+                any(p.poll() is None for p in active)
+                and not stopped
+                and all(p.poll() in (None, 0) for p in active)
+                and time.monotonic() < deadline
+            ):
+                owned.live()
+                time.sleep(0.05)
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"{phase} exceeded the absolute work deadline")
+            if (
+                stopped
+                or len(children) != expected_workers
+                or any(p.poll() != 0 for p in active)
+            ):
+                raise RuntimeError(f"{phase} cancelled or exited unsuccessfully")
+        result["validated_results"] = True
+        result["complete"] = True
     except BaseException as error:  # noqa: BLE001 - cleanup remains owned
         result["error"] = repr(error)
         result["complete"] = False
     finally:
+        result.update(
+            exit_codes=[p.poll() for p in children],
+            validation_exit_code=None if validation is None else validation.poll(),
+            stop_signals=stopped,
+            elapsed_s=None if start is None else time.monotonic() - start,
+        )
+        if start is not None and result["elapsed_s"] >= plan["max_job_seconds"]:
+            result["complete"] = False
+            result.setdefault("error", "absolute work deadline exceeded")
+        cleanup_started = time.monotonic()
         try:
             owned.stop()
         except Exception as error:  # noqa: BLE001 - retain ownership on cleanup failure
@@ -649,6 +696,7 @@ def supervise(plan, path):
                     "selected_used_bytes": used,
                     "released": released,
                 }
+                result["cleanup_elapsed_s"] = time.monotonic() - cleanup_started
                 common.save_json(output / "controller.json", result)
             except Exception as error:  # noqa: BLE001
                 print(
@@ -689,6 +737,141 @@ def ownership_fixture(directory):
     )
     child.start()
     child.join()
+
+
+def deadline_checks():
+    """Real CPU children expose late terminal observations and slow validation."""
+    from tempfile import TemporaryDirectory
+    from types import SimpleNamespace as NS
+    from unittest.mock import patch
+
+    helpers()
+    actual, Owned = LEGACY.resource_components()
+    records = []
+    inherited_env = dict(os.environ)
+    original_sleep = time.sleep
+    for case, limit, worker_seconds, validation_seconds in (
+        ("late_child", 0.06, 0.08, 0),
+        ("late_validation", 0.15, 0.01, 0.30),
+        ("within_deadline", 1, 0.01, 0.01),
+    ):
+        with TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            descriptors = []
+
+            class CpuLock:
+                def acquire(self, directory=directory, descriptors=descriptors):
+                    descriptor = os.open(
+                        directory / "cpu.lock", os.O_CREAT | os.O_RDWR, 0o600
+                    )
+                    descriptors.append(descriptor)
+                    return descriptor
+
+            def spawn(
+                command,
+                directory=directory,
+                validation_seconds=validation_seconds,
+                worker_seconds=worker_seconds,
+                **kwargs,
+            ):
+                seconds = (
+                    validation_seconds
+                    if "--validate-results" in command
+                    else worker_seconds
+                )
+                return actual.spawn(
+                    ["/bin/sleep", str(seconds)],
+                    env=inherited_env,
+                    cwd=ROOT,
+                    log_path=directory / "child.log",
+                    lock_fd=kwargs["lock_fd"],
+                    cpus="112-127",
+                )
+
+            common = NS(
+                GpuLock=CpuLock,
+                spawn=spawn,
+                descendants=actual.descendants,
+                assert_gpus_idle=lambda: {"cpu_stub": True},
+                assert_ports_free=lambda ports: None,
+                save_json=save,
+            )
+            plan = {
+                "head": "cpu-deadline",
+                "mode": "capture",
+                "output": str(directory / "out"),
+                "ports": [],
+                "environment": {},
+                "max_job_seconds": limit,
+                "validation_command": ["--validate-results"],
+            }
+            path = directory / "plan.json"
+            save(path, plan)
+            env = {
+                k: v
+                for k, v in inherited_env.items()
+                if k not in ("LD_PRELOAD", "KFD_GUARD_LOG")
+            }
+            env.update(K31_TASK19_GPU_GRANT=plan["head"], K31_TASK19_PLAN_SHA=sha(path))
+
+            def validate(_plan, seconds=validation_seconds):
+                original_sleep(seconds)
+                return True
+
+            def scheduling_delay(seconds, case=case):
+                original_sleep(
+                    0.20 if case == "late_child" and seconds == 0.05 else seconds
+                )
+
+            started = time.monotonic()
+            with (
+                patch.dict(os.environ, env, clear=True),
+                patch("os.nice", lambda n: 0),
+                patch("os.sched_getaffinity", lambda pid: {0}),
+                patch.dict(
+                    globals(), check_plan=lambda *args: None, validate_results=validate
+                ),
+                patch.object(time, "sleep", scheduling_delay),
+                patch.object(
+                    LEGACY, "resource_components", lambda common=common: (common, Owned)
+                ),
+                patch.object(
+                    LEGACY,
+                    "release_snapshot",
+                    lambda: ({"kfd_pids": []}, {b: 0 for b in LEGACY.SELECTED_BDFS}),
+                ),
+            ):
+                try:
+                    supervise(plan, path)
+                except AssertionError:
+                    pass
+            result = json.loads((directory / "out/controller.json").read_text())
+            assert result["cleanup"]["released"] and not result["cleanup"]["alive"]
+            try:
+                os.fstat(descriptors[0])
+            except OSError:
+                pass
+            else:
+                raise AssertionError("deadline control leaked its ownership lock")
+            records.append(
+                {
+                    "case": case,
+                    "declared_bound_s": limit,
+                    "complete": result["complete"],
+                    "reported_elapsed_s": result["elapsed_s"],
+                    "wall_s": time.monotonic() - started,
+                    "owned_release": result["cleanup"]["released"],
+                }
+            )
+    assert all(
+        not r["complete"] and r["reported_elapsed_s"] >= r["declared_bound_s"]
+        for r in records[:2]
+    ), records
+    assert (
+        records[2]["complete"]
+        and records[2]["reported_elapsed_s"] < records[2]["declared_bound_s"]
+    ), records
+    return records
 
 
 def cpu_checks():
@@ -873,6 +1056,7 @@ def cpu_checks():
         )
         result["unknown_or_occupied_release_refused"] = True
     assert not torch.cuda.is_initialized()
+    result["absolute_deadline"] = deadline_checks()
     return result
 
 
@@ -885,6 +1069,7 @@ if __name__ == "__main__":
     parser.add_argument("--out", type=Path)
     parser.add_argument("--snapshot", type=Path)
     parser.add_argument("--worker", action="store_true")
+    parser.add_argument("--validate-results", action="store_true")
     parser.add_argument("--rank", type=int, choices=range(8))
     args = parser.parse_args()
     if args.selfcheck:
@@ -896,7 +1081,15 @@ if __name__ == "__main__":
     else:
         assert args.plan is not None
         plan = json.loads(args.plan.read_text())
-        if args.worker:
+        if args.validate_results:
+            assert (
+                not args.worker
+                and os.environ.get("KFD_GUARD_LOG")
+                and os.environ.get("LD_PRELOAD")
+            )
+            check_plan(plan, args.plan)
+            validate_results(plan)
+        elif args.worker:
             check_plan(plan, args.plan, worker=True)
             assert args.rank is not None
             assert Path(
