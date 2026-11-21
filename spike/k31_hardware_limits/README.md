@@ -3,8 +3,13 @@
 This spike records empirical rates on one named gfx950 device. It does not
 alter inference or establish an exhaustive hardware ceiling. The copied
 `kernel-perf/probe_roofline.py` is an external, SHA256-pinned input; its Triton
-kernels, event timer, cache sweep and estimator are reused. The adapter does
-not consume its unverified gfx950 throughput constant.
+copy kernel, event timer, cache sweep and estimator are reused. The tracked
+read variant explicitly accumulates FP32 before its FP32 store, matching the
+FP32 oracle. The original FP16 reduction failed that comparison and remains
+failed evidence. FP16 input generation, BLOCK8192/int64 addressing, grid,
+working sets, byte counting, timing and tolerances are unchanged. This new
+kernel variant needs its own measured results/resources. The adapter does
+not consume the probe's unverified gfx950 throughput constant.
 
 ## Inputs and command
 

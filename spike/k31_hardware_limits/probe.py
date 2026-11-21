@@ -142,6 +142,20 @@ def library_compute(base, torch, bdf, seconds):
     )
 
 
+def read_kernel(triton):
+    global tl
+    import triton.language as tl
+
+    @triton.jit
+    def read_fp32(P, n, out, BLOCK: tl.constexpr):
+        pid = tl.program_id(0).to(tl.int64)
+        offsets = pid * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
+        values = tl.load(P + offsets, mask=offsets < n, other=0.0).to(tl.float32)
+        tl.store(out + pid, tl.sum(values))
+
+    return read_fp32
+
+
 def memory_case(base, torch, nbytes, copy):
     n = nbytes // 2
     a = torch.randn(n, dtype=torch.float16, device="cuda")
@@ -651,6 +665,8 @@ def main():
             spec = importlib.util.spec_from_file_location("roofline_base", args.probe)
             base = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(base)
+            base._read = read_kernel(triton)
+            result["read_accumulator_dtype"] = "float32"
             for name in what:
                 if name == "compute":
                     row = library_compute(base, torch, bdf, args.clock_seconds)
