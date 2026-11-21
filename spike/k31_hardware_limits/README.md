@@ -79,8 +79,11 @@ around its perftest include warmup/profiling and do not establish a sustained
 A4W4 hardware roof. Input descriptors include shapes, strides, dtypes and
 logical bytes; temporary allocations and library workspace remain outside
 that descriptor sum. One argument set means no rotating-buffer HBM claim.
-Keep each implementation's returned timing and configured kernel identity;
-do not silently select the fastest observed implementation after the run.
+The primary BF16 cross-check is torch.mm plus AITER's `torch us`; the primary
+A4W4 cell is `tuned`, fixed by the pinned gfx950/CU256/2048x8192x8192 config to
+`_ZN5aiter45f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256_psE` with splitK=0.
+Retain all other implementation timings as controls. Keep the configured
+kernel identity and do not select a different winner after the run.
 
 Memory outputs are fully checked against Torch and for finiteness before
 timing. AITER's reference and catastrophic checks are unchanged. Its

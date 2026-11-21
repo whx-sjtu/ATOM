@@ -213,6 +213,7 @@ def cache_knee(base, torch, bdf):
             row["mib"] = mib
             rows.append(row)
             emit(row)
+            torch.cuda.empty_cache()
     eligible = {i for i, r in enumerate(rows) if r["mean_us"] >= base.MIN_US_FOR_KNEE}
     knee = base.cache_estimate(
         [r["mib"] for r in rows], [r["payload_tb_s"] for r in rows], eligible
@@ -433,20 +434,16 @@ def execute_plan(path):
         state["before"] = resources.assert_gpus_idle()
         start = time.monotonic()
         state.update(phase="measurement", start_monotonic_s=start)
-        # Block interruption until PID/birth ownership is registered.
-        mask = signal.pthread_sigmask(signal.SIG_BLOCK, set(previous))
-        try:
-            child = resources.spawn(
-                plan["command"],
-                env=plan["environment"],
-                cwd=root,
-                log_path=output / "measurement.log",
-                lock_fd=fd,
-                cpus="0-111",
-            )
-            owned.add(child)
-        finally:
-            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+        # Parent handlers only record cancellation; children retain normal TERM handling.
+        child = resources.spawn(
+            plan["command"],
+            env=plan["environment"],
+            cwd=root,
+            log_path=output / "measurement.log",
+            lock_fd=fd,
+            cpus="0-111",
+        )
+        owned.add(child)
         while child.poll() is None and not stopped and time.monotonic() < start + 55:
             owned.live()
             time.sleep(0.05)
