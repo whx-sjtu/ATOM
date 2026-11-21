@@ -160,10 +160,13 @@ class StopState:
         self.ready = None
         self.reason = None
         self.frontiers = {}
+        self.on_stop = None
 
     def latch(self, reason, now, detail=None):
         if self.reason is None:
             self.reason = {"reason": reason, "mono": now, "detail": detail}
+            if self.on_stop:
+                self.on_stop()
         return self.reason
 
     def deadline(self):

@@ -26,6 +26,27 @@ EXPORT = re.compile(r"Rank (\d+): trace exported to (\S+\.json\.gz)")
 RANKS = {str(rank) for rank in range(8)}
 
 
+class EvidenceDeadline(BaseException):
+    """Bypass request retry handlers and end evidence collection immediately."""
+
+
+def arm_evidence_deadline(observer):
+    def expired(signum, frame):
+        raise EvidenceDeadline()
+
+    signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(
+        signal.ITIMER_REAL, max(0.001, observer.grace_end() - time.monotonic())
+    )
+    # Arm before any stop/receipt I/O. The callback runs once, at the first latch.
+    client_pid = getattr(observer, "client_pid", None)
+    if client_pid is not None:
+        try:
+            os.killpg(client_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
 def save(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
@@ -166,11 +187,7 @@ def run_client(C, frozen, out, label, fd, track, check_deadline, observer=None):
                 time.monotonic(),
                 "client exited before full bracket",
             )
-        # Stop new submissions before any filesystem/export work. The final ledger may be partial.
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        # The first-stop callback has already stopped submissions and armed grace.
         save(
             directory / "client-result.json",
             {
@@ -489,6 +506,8 @@ def execute(frozen, plan_sha):
         # Cancellation must bypass request handlers that retry OSError.
         raise KeyboardInterrupt(f"signal {signum}")
 
+    if observer:
+        observer.on_stop = lambda: arm_evidence_deadline(observer)
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGINT, interrupt)
     signal.signal(signal.SIGALRM, interrupt)
@@ -598,89 +617,93 @@ def execute(frozen, plan_sha):
             try:
                 run_client(C, frozen, out, label, fd, track, check_deadline, observer)
             finally:
-                metrics(out, f"after-{label}", state)
+                if not observer or observer.reason is None:
+                    metrics(out, f"after-{label}", state)
         state["state"] = "COMPLETED"
     except BaseException as error:
-        logger.exception("Bounded workload failed")
+        if observer:
+            observer.latch("observer-failure", time.monotonic(), type(error).__name__)
+        else:
+            logger.exception("Bounded workload failed")
         state["state"] = "FAILED"
         state["errors"].append(repr(error))
     finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, signal.SIG_IGN)
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-        if observer:
-            client_pid = getattr(observer, "client_pid", None)
-            if client_pid is not None:
+        try:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            if observer:
                 try:
-                    os.killpg(client_pid, signal.SIGKILL)
-                except OSError as error:
-                    if not isinstance(error, ProcessLookupError):
-                        state["errors"].append(f"client stop: {error!r}")
-            observer.latch("observer-failure", time.monotonic(), state["errors"])
-            state["observer_stop"] = observer.reason
-            state["mode"] = "warmup_observer"
-            state["performance_accepted"] = False
-            # The parent never waits on a worker event, GIL, exporter, or file acknowledgement.
-            try:
-                save(out / "observer/trigger.json", observer.reason)
-                snapshots = observer_snapshots(out, frozen)
-                alive = {p.pid for p in track()}
-                for snap in snapshots.values():
-                    if snap.get("stack_registered") and snap["pid"] in alive:
-                        os.kill(snap["pid"], signal.SIGUSR2)
-                while time.monotonic() < observer.grace_end():
-                    time.sleep(
-                        max(0, min(0.1, observer.grace_end() - time.monotonic()))
+                    observer.latch(
+                        "observer-failure", time.monotonic(), state["errors"]
                     )
-            except Exception as error:  # noqa: BLE001
-                state["errors"].append(f"evidence grace: {error!r}")
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, signal.SIG_IGN)
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-        track()
-        for sig, seconds in ((signal.SIGTERM, 15), (signal.SIGKILL, 15)):
-            for proc in track():
+                    state["observer_stop"] = observer.reason
+                    state["mode"] = "warmup_observer"
+                    state["performance_accepted"] = False
+                    # Keep the first-stop alarm armed across every evidence read/write.
+                    if time.monotonic() < observer.grace_end():
+                        save(out / "observer/trigger.json", observer.reason)
+                        snapshots = observer_snapshots(out, frozen)
+                        alive = {p.pid for p in track()}
+                        for snap in snapshots.values():
+                            if snap.get("stack_registered") and snap["pid"] in alive:
+                                os.kill(snap["pid"], signal.SIGUSR2)
+                        while time.monotonic() < observer.grace_end():
+                            time.sleep(
+                                max(
+                                    0, min(0.1, observer.grace_end() - time.monotonic())
+                                )
+                            )
+                except EvidenceDeadline:
+                    state["evidence_deadline_reached"] = True
+                except Exception as error:  # noqa: BLE001
+                    state["errors"].append(f"evidence grace: {error!r}")
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, signal.SIG_IGN)
+            track()
+            for sig, seconds in ((signal.SIGTERM, 15), (signal.SIGKILL, 15)):
+                for proc in track():
+                    try:
+                        proc.send_signal(sig)
+                    except psutil.NoSuchProcess:
+                        pass
+                until = time.monotonic() + seconds
+                while track() and time.monotonic() < until:
+                    time.sleep(0.5)
+            while True:
+                if not state.get("admitted"):
+                    state["no_owned_gpu_work_started"] = True
+                    state["finished"] = time.time()
+                    save(out / "status.json", state)
+                    os.close(fd)
+                    break
+                state["alive"] = [p.pid for p in track()]
                 try:
-                    proc.send_signal(sig)
-                except psutil.NoSuchProcess:
-                    pass
-            until = time.monotonic() + seconds
-            while track() and time.monotonic() < until:
-                time.sleep(0.5)
-        while True:
-            if not state.get("admitted"):
-                state["no_owned_gpu_work_started"] = True
+                    released, state["after"] = C.wait_gpus_released(timeout=10)
+                    released = (
+                        released
+                        and len(state["after"]["cards"]) == 8
+                        and not state["alive"]
+                    )
+                except Exception as error:
+                    logger.exception("Release check failed; retaining ownership lock")
+                    released = False
+                    state["cleanup_error"] = repr(error)
+                state["gpu_released"] = released
                 state["finished"] = time.time()
-                save(out / "status.json", state)
-                os.close(fd)
-                break
-            state["alive"] = [p.pid for p in track()]
-            try:
-                released, state["after"] = C.wait_gpus_released(timeout=10)
-                released = (
-                    released
-                    and len(state["after"]["cards"]) == 8
-                    and not state["alive"]
-                )
-            except Exception as error:
-                logger.exception("Release check failed; retaining ownership lock")
-                released = False
-                state["cleanup_error"] = repr(error)
-            state["gpu_released"] = released
-            state["finished"] = time.time()
-            try:
-                save(out / "status.json", state)
-            except OSError as error:
-                logger.exception("Cleanup receipt write failed; release still required")
-                state["state"] = "FAILED"
-                state["cleanup_write_error"] = repr(error)
-            if released:
-                os.close(fd)
-                break
-            logger.error("CLEANUP_FAILED_HOLDING_LOCK")
-            time.sleep(5)
+                try:
+                    save(out / "status.json", state)
+                except OSError as error:
+                    logger.exception(
+                        "Cleanup receipt write failed; release still required"
+                    )
+                    state["state"] = "FAILED"
+                    state["cleanup_write_error"] = repr(error)
+                if released:
+                    os.close(fd)
+                    break
+                logger.error("CLEANUP_FAILED_HOLDING_LOCK")
+                time.sleep(5)
     print(
         json.dumps(
             {

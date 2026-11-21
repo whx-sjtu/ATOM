@@ -356,6 +356,37 @@ def test_gather_wrapper_preserves_native_exception_and_entry_receipt(monkeypatch
     assert "after" not in runtime.receipts[0]
 
 
+def test_first_stop_interrupts_blocked_evidence_io_and_latches_once():
+    import signal
+
+    import run
+
+    config = dict(P["observer"], evidence_s=0.03)
+    stop = O.StopState(config, time.monotonic())
+    calls = []
+    previous = signal.getsignal(signal.SIGALRM)
+
+    def arm():
+        calls.append("armed")
+        run.arm_evidence_deadline(stop)
+
+    stop.on_stop = arm
+    try:
+        stop.latch("no-progress", time.monotonic())
+        stop.latch("observer-failure", time.monotonic())
+        with pytest.raises(run.EvidenceDeadline):
+            try:
+                time.sleep(1)  # Controlled blocking evidence IO.
+            except (OSError, ValueError):
+                pytest.fail("a retry handler swallowed the evidence deadline")
+        assert calls == ["armed"]
+        assert stop.reason["reason"] == "no-progress"
+        assert time.monotonic() - stop.reason["mono"] < 0.5
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
 # The probe below is opt-in and runs as a separate guarded process, never during
 # test collection. No install()/patch() calls: sitecustomize performs registration.
 class ModelBoundary(Exception):
