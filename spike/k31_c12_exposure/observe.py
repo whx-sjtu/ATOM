@@ -7,7 +7,6 @@ import importlib.abc
 import importlib.machinery
 import json
 import os
-import re
 import signal
 import sys
 import threading
@@ -461,21 +460,21 @@ class Observer:
         }
         if set(HOOKS) != expected:
             raise ValueError("worker hook registration incomplete")
+        expected_catalog = {}
+        for layer in self.config["layers"]:
+            prefix = self.config["indexer_prefix_template"].format(layer=layer)
+            expected_catalog[prefix] = {"layer": layer, "cache": prefix + ".k_cache"}
         context = runner.config.compilation_config.static_forward_context
         for prefix, item in context.items():
             if type(item).__name__ == "Indexer":
-                match = re.fullmatch(r"model.layers.(\d+).self_attn.indexer", prefix)
                 if (
-                    not match
+                    prefix not in expected_catalog
                     or not item._indexer_fp4
                     or item.k_cache.prefix != prefix + ".k_cache"
                 ):
                     raise ValueError("unexpected target/draft indexer catalog")
-                self.catalog[prefix] = {
-                    "layer": int(match[1]),
-                    "cache": item.k_cache.prefix,
-                }
-        if sorted(x["layer"] for x in self.catalog.values()) != self.config["layers"]:
+                self.catalog[prefix] = expected_catalog[prefix]
+        if self.catalog != expected_catalog:
             raise ValueError("runtime eligible indexer catalog differs")
         if len(self.calibrations) != 2 or self.calibrations[0] != self.calibrations[1]:
             raise ValueError("normal startup sequence calibration unavailable")

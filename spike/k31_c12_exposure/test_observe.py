@@ -280,9 +280,10 @@ def test_full_24_layer_two_forward_pool_and_stream_identity(tmp_path):
     ]
     runtime.initialized = [True] * 288
     runtime.catalog = {
-        f"model.layers.{layer}.self_attn.indexer": {
+        P["observer"]["indexer_prefix_template"].format(layer=layer): {
             "layer": layer,
-            "cache": f"model.layers.{layer}.self_attn.indexer.k_cache",
+            "cache": P["observer"]["indexer_prefix_template"].format(layer=layer)
+            + ".k_cache",
         }
         for layer in P["observer"]["layers"]
     }
@@ -385,6 +386,49 @@ def test_first_stop_interrupts_blocked_evidence_io_and_latches_once():
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)
+
+
+def test_runtime_catalog_uses_native_language_model_prefix(tmp_path, monkeypatch):
+    runtime, _batch, runner = fake_runtime(tmp_path)
+    runtime.plan = {"environments": {"server": {}}, "native_sources": {}}
+    runtime.state = {"worker_environment": {}}
+    runtime.catalog = {}
+    runtime.group = ["2", "tp"]
+    runtime.calibrations = [{"offset": 0, "span": 1, "pg_id": 2}] * 2
+    runtime.initialized = [True] * 288
+    runtime.poll = runtime.publish = lambda: None
+    runtime.dump = lambda destination=None: {"entries": [trace_entry()]}
+    hooks = [
+        "ModelRunner._setup_device_and_distributed",
+        "ModelRunner.forward",
+        "ModelRunner.prepare_model",
+        "ModelRunner._maybe_warmup",
+        "AiterMLAMetadataBuilder._build_dcp_indexer_fp4_prefill_meta",
+        "MLAAttention.process_weights_after_loading",
+        "GroupCoordinator.all_gather",
+        "atom.model_ops.indexer.indexer_forward._index_cache",
+        "atom.model_ops.indexer.indexer_forward._dcp_stage_indexer_fp4_prefill",
+    ]
+    monkeypatch.setattr(O, "HOOKS", hooks)
+    catalog = {}
+    for layer in P["observer"]["layers"]:
+        prefix = P["observer"]["indexer_prefix_template"].format(layer=layer)
+        item = type("Indexer", (), {})()
+        item._indexer_fp4, item.k_cache = True, NS(prefix=prefix + ".k_cache")
+        catalog[prefix] = item
+    runner.config = NS(
+        dcp_config=NS(interleave_size=1),
+        compilation_config=NS(static_forward_context=catalog),
+    )
+    bad = "model.layers.3.self_attn.indexer"
+    catalog[bad] = next(iter(catalog.values()))
+    with pytest.raises(ValueError, match="unexpected target/draft"):
+        runtime.seal(runner)
+    del catalog[bad]
+    runtime.seal(runner)
+    assert runtime.state["ready"]
+    assert len(runtime.catalog) == 24
+    assert "language_model.model.layers.92.self_attn.indexer" in runtime.catalog
 
 
 # The probe below is opt-in and runs as a separate guarded process, never during

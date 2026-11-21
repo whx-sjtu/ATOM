@@ -116,6 +116,7 @@
     "export_bytes": 67108864,
     "draft_eligible_helpers": 0,
     "draft_basis": "K3DSparkMLAAttention uses MLAModules(indexer=None,is_sparse=False); write_context_kv_latent; unexpected indexer/helper calls fail qualification",
-    "source_audit_sha256": "6139f3d873e37cf5bd1c427926cfb5cfd3375dff9b7036217e6d8d3c03a6989c"
+    "source_audit_sha256": "6139f3d873e37cf5bd1c427926cfb5cfd3375dff9b7036217e6d8d3c03a6989c",
+    "indexer_prefix_template": "language_model.model.layers.{layer}.self_attn.indexer"
   }
 }

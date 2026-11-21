@@ -256,6 +256,12 @@ def make_plan(out, mode="exposure"):
                 ROOT / "atom/model_ops/attentions/aiter_mla.py",
                 ROOT / "atom/model_ops/attention_mla.py",
                 ROOT / "atom/model_ops/indexer/indexer_forward.py",
+                ROOT / "atom/config.py",
+                ROOT / "atom/model_engine/model_setup.py",
+                ROOT / "atom/models/kimi_k3/model.py",
+                ROOT / "atom/models/kimi_k3_dspark.py",
+                Path(P["model"]) / "config.json",
+                Path(P["draft"]) / "config.json",
                 Path(P["aiter_root"]) / "aiter/dist/parallel_state.py",
             )
         },
