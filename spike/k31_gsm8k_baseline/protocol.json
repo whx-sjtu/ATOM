@@ -168,5 +168,32 @@
     "gsm8k-test.arrow": "45965b000311d1550e5619b60b5bf31cf76edebfd8b8eddc62a876fbf8c9be95",
     "gsm8k-train.arrow": "6146bca074f4c6c5e07de7e96cc968adab3833dbdafeda21830f27558eea3d9b",
     "dataset_info.json": "9f7fae0b392512aba022201d3c01513ace3c88e3cfb9f25c851bd1fef7618ba1"
+  },
+  "startup_module": {
+    "origin": "/usr/lib/python3.12/sitecustomize.py",
+    "resolved_source": "/etc/python3.12/sitecustomize.py",
+    "source_sha256": "43d81125d92376b1a69d53a71126a041cc9a18d8080e92dea0a2ae23be138b1e",
+    "cached": "/usr/lib/python3.12/__pycache__/sitecustomize.cpython-312.pyc",
+    "bytecode_sha256": "7da39774563230f32c049423b82a37f3ec8035374193e22dd513941279a628a4",
+    "site_packages": "/opt/venv/lib/python3.12/site-packages",
+    "files": {
+      "/etc/python3.12/sitecustomize.py": "43d81125d92376b1a69d53a71126a041cc9a18d8080e92dea0a2ae23be138b1e",
+      "/usr/lib/python3.12/site.py": "619436355cbe91c3b29681ab486ee63f5f2e0a7d6274dfae747bdb94e60bca55",
+      "/usr/lib/python3.12/__pycache__/sitecustomize.cpython-312.pyc": "7da39774563230f32c049423b82a37f3ec8035374193e22dd513941279a628a4",
+      "/opt/venv/pyvenv.cfg": "2bf6ac0243a4f754708520ed6c3928e385aca4d2c8f5b387613a9df4b428186b",
+      "/opt/venv/lib/python3.12/site-packages/_distutils_hack/__init__.py": "df81e6bcba34ee3e3952f776551fb669143b9490fdd6c4caeb32609f97e985b4",
+      "/opt/venv/lib/python3.12/site-packages/__editable__.amd_aiter-0.0.0.pth": "1fc8e756c6d52113db664d15314d84a9bca8b8dccc1dcbae5813fdfe8f9bf03e",
+      "/opt/venv/lib/python3.12/site-packages/__editable__.atom-0.1.11.dev25+g5f3ae2b5b.pth": "29b2beeaf7a7f0e9adfe95a2a2e9d19b8d4975d97e0face162ab2dcfb4e82615",
+      "/opt/venv/lib/python3.12/site-packages/distutils-precedence.pth": "2638ce9e2500e572a5e0de7faed6661eb569d1b696fcba07b0dd223da5f5d224",
+      "/opt/venv/lib/python3.12/site-packages/__editable___amd_aiter_0_0_0_finder.py": "745bb5b3f6da2f6a645ad82d67ae35f1c99fb9a7991ec1aec41dc0da37bce3d9",
+      "/opt/venv/lib/python3.12/site-packages/__editable___atom_0_1_11_dev25_g5f3ae2b5b_finder.py": "792bf60b9d907000c3c41bd7ebeb73e9a58a142fafcd035ef7e65e43dd0922b9"
+    },
+    "meta_path_modules": [
+      "_frozen_importlib",
+      "_frozen_importlib_external",
+      "_distutils_hack",
+      "__editable___amd_aiter_0_0_0_finder",
+      "__editable___atom_0_1_11_dev25_g5f3ae2b5b_finder"
+    ]
   }
 }

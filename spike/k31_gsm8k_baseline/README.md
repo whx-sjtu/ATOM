@@ -62,3 +62,15 @@ still keep the pending gate. From the same clean experimental head, use the CPU 
 operation. Recovery reuses the original answers and release proof; an already
 sealed attempt only retries the directory sync. It launches no model, does not
 rewrite sealed answers and cannot replace a valid low score with a later result.
+
+Startup qualification permits only the pinned, inactive distro `sitecustomize`
+source and bytecode. It records the loaded origin, hashes, import-finder state and
+Apport/user-hook resolution before any rejection. Changed or alternative hooks,
+reachable Apport, user hooks and altered exception/tracing behavior fail closed.
+`--startup-check <receipt>` is a guarded CPU helper with no target-runtime imports
+or device discovery; full runtime/hardware checks remain in leased startup.
+
+Keep the sealed invalid `author-001` record intact. CPU checks for the repaired next
+attempt use `K31_TASK10_CPU_ATTEMPT=author-002`; preparing that namespace does not
+consume a lease or select A0. A new independently qualified head/plan and root grant
+are required before its existing `--run` entry may execute.

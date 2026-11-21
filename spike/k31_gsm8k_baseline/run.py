@@ -228,6 +228,10 @@ def prepare(attempt):
     namespace = PRIVATE / "namespaces" / attempt
     namespace.mkdir(parents=True, exist_ok=False)
     files, provenance = {}, {}
+    for name, expected in P["startup_module"]["files"].items():
+        if sha(name) != expected:
+            raise ValueError(f"startup dependency changed: {name}")
+        files[name] = expected
     for record in P["preparation_inputs"].values():
         if sha(record["path"]) != record["sha256"]:
             raise ValueError("preparation input changed")
@@ -307,6 +311,15 @@ def prepare(attempt):
     )
     data = PRIVATE / "preparation" / f"{attempt}-data.json"
     data.parent.mkdir(parents=True, exist_ok=True)
+    startup = data.with_name(f"{attempt}-startup.json")
+    subprocess.run(
+        [P["python"], str(HERE / "run.py"), "--startup-check", str(startup)],
+        cwd=ROOT,
+        env=cpu_env,
+        check=True,
+        timeout=60,
+    )
+    files[str(startup)] = sha(startup)
     subprocess.run(
         [P["python"], str(HERE / "run.py"), "--data", str(data)],
         cwd=ROOT,
@@ -320,6 +333,7 @@ def prepare(attempt):
     receipt = {
         "files": files,
         "data": {"path": str(data), "sha256": sha(data)},
+        "startup_qualification": {"path": str(startup), "sha256": sha(startup)},
         "cache_provenance": provenance,
         "aiter_ref": P["aiter_sha"],
         "ck_ref": P["ck_sha"],
@@ -394,9 +408,27 @@ def make_plan(attempt):
     check_cache_toolchain(
         json.loads(Path(P["preparation_inputs"]["cache_receipt"]["path"]).read_text())
     )
+    for name, expected in P["startup_module"]["files"].items():
+        if sha(name) != expected:
+            raise ValueError(f"startup dependency changed: {name}")
     for filename, expected in preparation["files"].items():
         if sha(filename) != expected:
             raise ValueError(f"preparation artifact changed: {filename}")
+    startup = preparation["startup_qualification"]
+    if sha(startup["path"]) != startup["sha256"]:
+        raise ValueError("CPU startup qualification changed")
+    witness = json.loads(Path(startup["path"]).read_text())
+    if (
+        not witness["qualified"]
+        or witness["target_imports_present"]
+        or witness["executable"] != P["python"]
+        or not witness["cpu_guard_present"]
+        or witness["nice"] != 19
+        or not set(witness["cpus"]).issubset(range(112, 128))
+        or witness["verifier_sha256"] != sha(HERE / "run.py")
+        or witness["protocol_sha256"] != sha(HERE / "protocol.json")
+    ):
+        raise ValueError("CPU startup qualification is incomplete or stale")
     for name in ("common.py", "gsm8k_compare.py"):
         dependency(name)
     owned_type()
@@ -416,6 +448,7 @@ def make_plan(attempt):
         "files": {str(p): sha(p) for p in sorted(HERE.iterdir()) if p.is_file()},
         "preparation": {"path": str(receipt_path), "sha256": sha(receipt_path)},
         "data": preparation["data"],
+        "startup_qualification": startup,
         "environment": env,
         "commands": commands(attempt),
     }
@@ -821,12 +854,127 @@ def process_receipt(owned, plan):
     return rows
 
 
-def runtime_check(path):
+def startup_check(receipt_path=None):
+    import importlib.util
     import sys
 
-    if "sitecustomize" in sys.modules:
-        raise ValueError("an unqualified Python startup hook is active")
+    policy = P["startup_module"]
+    hook = sys.modules.get("sitecustomize")
+    spec = getattr(hook, "__spec__", None)
+    observed = {
+        "verifier_sha256": sha(HERE / "run.py"),
+        "protocol_sha256": sha(HERE / "protocol.json"),
+        "cpu_guard_present": bool(os.environ.get("KFD_GUARD_LOG")),
+        "nice": os.nice(0),
+        "cpus": sorted(os.sched_getaffinity(0)),
+        "executable": sys.executable,
+        "prefix": sys.prefix,
+        "search_path": sys.path,
+        "loaded": hook is not None,
+        "file": getattr(hook, "__file__", None),
+        "origin": getattr(spec, "origin", None),
+        "cached": getattr(hook, "__cached__", None),
+        "loader": type(getattr(spec, "loader", None)).__name__,
+        "spec_cached": getattr(spec, "cached", None),
+        "apport_loaded": "apport_python_hook" in sys.modules,
+        "usercustomize_loaded": "usercustomize" in sys.modules,
+        "default_excepthook": sys.excepthook is sys.__excepthook__,
+        "trace_active": sys.gettrace() is not None,
+        "profile_active": sys.getprofile() is not None,
+        "target_imports_present": [
+            name for name in ("atom", "aiter", "torch") if name in sys.modules
+        ],
+        "meta_path_modules": [
+            getattr(f, "__module__", type(f).__module__) for f in sys.meta_path
+        ],
+    }
+    errors = []
+    for field, expected in (
+        ("file", policy["origin"]),
+        ("origin", policy["origin"]),
+        ("cached", policy["cached"]),
+        ("loader", "SourceFileLoader"),
+    ):
+        if observed[field] != expected:
+            errors.append(f"unexpected startup {field}")
+    for field, key in (("file", "source_sha256"), ("cached", "bytecode_sha256")):
+        try:
+            observed[field + "_resolved"] = str(Path(observed[field]).resolve())
+            observed[key] = sha(observed[field])
+            if observed[key] != policy[key]:
+                errors.append(f"startup {key} changed")
+        except (OSError, TypeError, RuntimeError) as error:
+            observed[key + "_error"] = repr(error)
+            errors.append(f"startup {field} unreadable")
+    if observed.get("file_resolved") != policy["resolved_source"]:
+        errors.append("unexpected resolved startup source")
+    if (
+        observed.get("cached_resolved") != policy["cached"]
+        or observed["spec_cached"] != policy["cached"]
+    ):
+        errors.append("unexpected resolved startup bytecode")
+    observed["runtime_files"] = {}
+    for name, expected in policy["files"].items():
+        try:
+            observed["runtime_files"][name] = sha(name)
+            if observed["runtime_files"][name] != expected:
+                errors.append(f"startup dependency changed: {name}")
+        except OSError as error:
+            observed["runtime_files"][name] = repr(error)
+            errors.append(f"startup dependency unreadable: {name}")
+    observed["pth_files"] = sorted(
+        str(p) for p in Path(policy["site_packages"]).glob("*.pth")
+    )
+    if observed["pth_files"] != sorted(
+        name for name in policy["files"] if name.endswith(".pth")
+    ):
+        errors.append("startup .pth inventory changed")
+    if set(observed["meta_path_modules"]) - set(policy["meta_path_modules"]):
+        errors.append("unqualified import finder")
+    if observed["apport_loaded"] or observed["usercustomize_loaded"]:
+        errors.append("Apport or user startup hook is active")
+    if (
+        not observed["default_excepthook"]
+        or observed["trace_active"]
+        or observed["profile_active"]
+    ):
+        errors.append("exception/tracing hooks changed")
+    if observed["target_imports_present"]:
+        errors.append("target runtime imported before startup qualification")
+    observed["resolvable"] = {}
+    if not errors:
+        for name in ("apport_python_hook", "usercustomize"):
+            try:
+                candidate = importlib.util.find_spec(name)
+                observed["resolvable"][name] = (
+                    None
+                    if candidate is None
+                    else {
+                        "origin": candidate.origin,
+                        "locations": list(candidate.submodule_search_locations or []),
+                    }
+                )
+                if candidate is not None:
+                    errors.append(
+                        f"unqualified startup dependency is reachable: {name}"
+                    )
+            except (ImportError, ValueError, AttributeError) as error:
+                observed["resolvable"][name] = repr(error)
+                errors.append(f"startup resolution failed: {name}")
+    observed.update(qualified=not errors, errors=errors)
+    # The witness is captured even when an unexpected startup component is refused.
+    print("STARTUP_PROVENANCE=" + json.dumps(observed, sort_keys=True), flush=True)
+    if receipt_path is not None:
+        save(receipt_path, observed)
+    if errors:
+        raise ValueError("unqualified Python startup: " + "; ".join(errors))
+    return observed
+
+
+def runtime_check(path):
+    startup = startup_check()
     plan = load_plan(path, grant=True)
+    save(Path(plan["output"]) / "startup-hook.json", startup)
     import aiter
     import aiter_worker_limits
     import torch
@@ -853,6 +1001,7 @@ def runtime_check(path):
     if len(devices) != 8 or any(d != expected for d in devices):
         raise ValueError("hardware identity changed")
     receipt = {
+        "startup_hook": startup,
         "resolved_policy": resolved_policy(plan["commands"]["server"]),
         "imports": modules,
         "devices": devices,
@@ -1117,6 +1266,7 @@ def main():
     parser.add_argument("--run", type=Path)
     parser.add_argument("--finalize", type=Path)
     parser.add_argument("--runtime-check", type=Path)
+    parser.add_argument("--startup-check", type=Path)
     parser.add_argument("--data", type=Path)
     args = parser.parse_args()
     if args.prepare:
@@ -1130,6 +1280,14 @@ def main():
             raise FileExistsError(path)
         save(path, make_plan(args.freeze))
         print(json.dumps({"plan": str(path), "sha256": sha(path)}))
+    elif args.startup_check:
+        startup_check(args.startup_check)
+        if (
+            not os.environ.get("KFD_GUARD_LOG")
+            or os.nice(0) != 19
+            or not set(os.sched_getaffinity(0)).issubset(range(112, 128))
+        ):
+            raise ValueError("CPU startup qualification requires the CPU guard")
     elif args.runtime_check:
         runtime_check(args.runtime_check)
     elif args.finalize:

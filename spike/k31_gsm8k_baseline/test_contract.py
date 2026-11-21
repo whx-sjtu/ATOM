@@ -535,3 +535,90 @@ def test_registry_failure_is_pending_and_recovers_same_low_attempt(
         signal.setitimer(signal.ITIMER_REAL, 0)
         for sig, handler in handlers.items():
             signal.signal(sig, handler)
+
+
+def test_pinned_startup_helper_accepts_stock_and_records_all_refusals(tmp_path):
+    code = r"""
+import importlib.util, json, sys, types
+from contextlib import ExitStack
+from pathlib import Path
+from unittest.mock import patch
+import run
+out = Path(sys.argv[1])
+policy = run.P['startup_module']
+original = sys.modules['sitecustomize']
+real_sha = run.sha
+accepted = run.startup_check(out/'allowed.json')
+assert accepted['qualified'] and not accepted['target_imports_present']
+assert accepted['source_sha256'] == policy['source_sha256']
+assert accepted['bytecode_sha256'] == policy['bytecode_sha256']
+assert accepted['resolvable'] == {'apport_python_hook':None, 'usercustomize':None}
+legacy = out/'legacy.py'
+legacy.write_bytes(Path(policy['origin']).read_bytes())
+replacement = types.ModuleType('sitecustomize')
+replacement.__file__ = str(legacy)
+replacement.__cached__ = str(legacy.with_suffix('.pyc'))
+replacement.__spec__ = importlib.util.spec_from_file_location('sitecustomize', legacy)
+for name in ('apport_python_hook','usercustomize'):
+    directory = out/name
+    directory.mkdir()
+    (directory/(name+'.py')).write_text("raise AssertionError('negative fixture must never execute')\n")
+class UnknownFinder:
+    def find_spec(self, *args):
+        raise AssertionError('unqualified finder must not run')
+cases = ('source_bytes','bytecode_bytes','wrong_origin','legacy_hook','missing_hook',
+         'user_loaded','apport_loaded','apport_reachable','user_reachable',
+         'exception_hook','trace_hook','profile_hook','dependency_bytes','unknown_finder')
+for case in cases:
+    with ExitStack() as stack:
+        if case in ('source_bytes','bytecode_bytes','dependency_bytes'):
+            target = {'source_bytes':policy['resolved_source'], 'bytecode_bytes':policy['cached'], 'dependency_bytes':'/usr/lib/python3.12/site.py'}[case]
+            stack.enter_context(patch.object(run, 'sha', lambda path: '0'*64 if str(Path(path).resolve()) == target else real_sha(path)))
+        elif case == 'wrong_origin':
+            stack.enter_context(patch.object(original.__spec__, 'origin', str(legacy)))
+        elif case == 'legacy_hook':
+            stack.enter_context(patch.dict(sys.modules, {'sitecustomize':replacement}))
+        elif case == 'missing_hook':
+            stack.enter_context(patch.dict(sys.modules))
+            del sys.modules['sitecustomize']
+        elif case in ('user_loaded','apport_loaded'):
+            name = 'usercustomize' if case == 'user_loaded' else 'apport_python_hook'
+            stack.enter_context(patch.dict(sys.modules, {name:types.ModuleType(name)}))
+        elif case in ('apport_reachable','user_reachable'):
+            name = 'apport_python_hook' if case == 'apport_reachable' else 'usercustomize'
+            stack.enter_context(patch.object(sys, 'path', [str(out/name), *sys.path]))
+        elif case == 'exception_hook':
+            stack.enter_context(patch.object(sys, 'excepthook', lambda *args: None))
+        elif case in ('trace_hook','profile_hook'):
+            stack.enter_context(patch.object(sys, 'gettrace' if case == 'trace_hook' else 'getprofile', lambda: object()))
+        else:
+            stack.enter_context(patch.object(sys, 'meta_path', [UnknownFinder(), *sys.meta_path]))
+        path = out/(case+'.json')
+        try:
+            run.startup_check(path)
+        except ValueError:
+            receipt = json.loads(path.read_text())
+            assert not receipt['qualified'] and receipt['errors'] and 'origin' in receipt
+        else:
+            raise AssertionError('unqualified startup accepted: '+case)
+assert sys.modules['sitecustomize'] is original
+assert not any(name in sys.modules for name in ('apport_python_hook','usercustomize','atom','aiter','torch'))
+print('PINNED_STARTUP_BOUNDARIES_PASS:'+str(len(cases)))
+"""
+    env = dict(run.environment(os.environ.get("K31_TASK10_CPU_ATTEMPT", "author-001")))
+    env.update(
+        {k: os.environ[k] for k in ("LD_PRELOAD", "KFD_GUARD_LOG") if k in os.environ}
+    )
+    env["PYTHONPATH"] = f"{run.HERE}:{env['PYTHONPATH']}"
+    result = subprocess.run(
+        [run.P["python"], "-B", "-c", code, str(tmp_path)],
+        cwd=run.ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    (tmp_path / "startup-boundaries.log").write_text(result.stdout + result.stderr)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PINNED_STARTUP_BOUNDARIES_PASS:14" in result.stdout
