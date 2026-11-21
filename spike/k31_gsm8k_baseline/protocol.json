@@ -195,5 +195,9 @@
       "__editable___amd_aiter_0_0_0_finder",
       "__editable___atom_0_1_11_dev25_g5f3ae2b5b_finder"
     ]
+  },
+  "fmha_opus_preparation": {
+    "path": "/app/k31-agent-team-private/task-10/native-fmha-opus-preparation/evidence/final-receipt.json",
+    "sha256": "b082d32118d1ca72bc77b4dec745bd5885c697f698971e40dab2fe4ee8fbf4e1"
   }
 }

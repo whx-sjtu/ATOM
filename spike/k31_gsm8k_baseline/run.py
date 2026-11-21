@@ -263,6 +263,65 @@ def prepare(attempt):
             files[str(source)] = sha(source)
     for destination, record in provenance.items():
         files[destination] = record["sha256"]
+    extra = P["fmha_opus_preparation"]
+    if sha(extra["path"]) != extra["sha256"]:
+        raise ValueError("FMHA preparation receipt changed")
+    ready = json.loads(Path(extra["path"]).read_text())
+    detail_ref = ready["native_receipt"]
+    if sha(detail_ref["path"]) != detail_ref["sha256"]:
+        raise ValueError("FMHA native receipt changed")
+    detail = json.loads(Path(detail_ref["path"]).read_text())
+    if (
+        detail["source_pins"]
+        != {"atom": P["atom_base"], "aiter": P["aiter_sha"], "ck": P["ck_sha"]}
+        or not ready["cpu_ready"]
+        or detail["operator_executed"]
+    ):
+        raise ValueError("FMHA source/build qualification mismatch")
+    for reference in (
+        extra,
+        detail_ref,
+        detail["input_closure"],
+        ready["include_order_validation"],
+        ready["initial_strict_validation"],
+        ready["build_log"],
+        ready["load_validation_log"],
+        ready["load_validation_exit"],
+    ):
+        if sha(reference["path"]) != reference["sha256"]:
+            raise ValueError("FMHA provenance input changed")
+        files[reference["path"]] = reference["sha256"]
+    build_source = Path(extra["path"]).parents[1] / "source/aiter"
+    closure = json.loads(Path(detail["input_closure"]["path"]).read_text())
+    for filename, record in closure.items():
+        source = Path(filename)
+        target = (
+            namespace / "aiter" / source.relative_to(build_source)
+            if source.is_relative_to(build_source)
+            else source
+        )
+        if (
+            record["sha256"] != record["expected"]
+            or sha(source) != record["sha256"]
+            or sha(target) != record["sha256"]
+        ):
+            raise ValueError(f"FMHA source/header closure changed: {filename}")
+        files[str(target)] = record["sha256"]
+    for filename, record in detail["compiler_runtime_binaries"].items():
+        if sha(filename) != record["sha256"]:
+            raise ValueError("FMHA compiler/runtime changed")
+        files[filename] = record["sha256"]
+    artifact = ready["artifact"]
+    if sha(artifact["path"]) != artifact["sha256"]:
+        raise ValueError("FMHA native artifact changed")
+    destination = namespace / "cache/aiter/jit/module_fmha_fwd_bf16_opus.so"
+    shutil.copyfile(artifact["path"], destination)
+    files[str(destination)] = artifact["sha256"]
+    provenance[str(destination)] = {
+        "source": artifact["path"],
+        "sha256": artifact["sha256"],
+        "qualification": extra,
+    }
     env = environment(attempt)
     for key, value in env.items():
         if key != "PYTHONPATH" and value.startswith(str(namespace)):
@@ -466,11 +525,14 @@ def load_plan(path, grant=False):
     return plan
 
 
-def request(url, body=None):
+def request(url, body=None, *, deadline=None):
+    timeout = 10 if deadline is None else deadline - time.monotonic()
+    if timeout <= 0:
+        raise TimeoutError("HTTP phase deadline exhausted")
     data = None if body is None else json.dumps(body).encode()
     with urlopen(
         Request(url, data=data, headers={"Content-Type": "application/json"}),
-        timeout=10,
+        timeout=timeout,
     ) as response:
         return response.read().decode()
 
@@ -485,6 +547,39 @@ def wait_until(owned, condition, deadline):
         if condition():
             return
         time.sleep(0.25)
+
+
+def smoke_batch(owned, url, deadline):
+    if time.monotonic() >= deadline:
+        raise TimeoutError("smoke deadline exhausted before dispatch")
+    bodies = [
+        {
+            "model": "kimi-k3.1-pro",
+            "prompt": P["smoke"]["prompt"],
+            "max_tokens": 8,
+            "temperature": 0,
+        }
+        for _ in range(8)
+    ]
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+    futures = []
+    try:
+        futures = [
+            pool.submit(request, url + "/v1/completions", body, deadline=deadline)
+            for body in bodies
+        ]
+
+        def completed():
+            for future in futures:
+                if future.done() and future.exception() is not None:
+                    future.result()
+            return all(future.done() for future in futures)
+
+        wait_until(owned, completed, deadline)
+        return [json.loads(future.result()) for future in futures]
+    finally:
+        # HTTP threads must not delay owned cleanup after a deadline or cancellation.
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def launch(owned, resources, command, env, out, name, fd):
@@ -1168,22 +1263,7 @@ def execute_bound(path, start, started_unix):
                 return False
 
         wait_until(owned, ready, startup)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            bodies = [
-                {
-                    "model": "kimi-k3.1-pro",
-                    "prompt": P["smoke"]["prompt"],
-                    "max_tokens": 8,
-                    "temperature": 0,
-                }
-                for _ in range(8)
-            ]
-            replies = list(
-                pool.map(
-                    lambda body: json.loads(request(url + "/v1/completions", body)),
-                    bodies,
-                )
-            )
+        replies = smoke_batch(owned, url, startup)
         if any(
             len(r.get("choices", [])) != 1
             or not isinstance(r["choices"][0].get("text"), str)

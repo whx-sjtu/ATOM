@@ -74,3 +74,15 @@ Keep the sealed invalid `author-001` record intact. CPU checks for the repaired 
 attempt use `K31_TASK10_CPU_ATTEMPT=author-002`; preparing that namespace does not
 consume a lease or select A0. A new independently qualified head/plan and root grant
 are required before its existing `--run` entry may execute.
+
+Health probes keep their short transport timeout. The fixed smoke batch instead
+uses the remaining original startup deadline for HTTP and parent waiting; it has
+no separate fixed ten-second inference limit. Deadline or cancellation returns
+without joining in-flight HTTP workers, allowing the existing Owned cleanup to
+stop the service immediately. Startup900, client1200 and whole2100 stay unchanged.
+
+Fresh preparation adds only the independently reviewable, source-bound CPU-built
+`module_fmha_fwd_bf16_opus.so` to the original verified seeds. Its source/header,
+compiler/runtime and build/load receipts are checked before copying. Incomplete
+build files and the failed run's whole mutable cache are not promoted. CPU build
+and load readiness do not establish request completion or GPU correctness.

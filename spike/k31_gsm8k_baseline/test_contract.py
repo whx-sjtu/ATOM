@@ -622,3 +622,116 @@ print('PINNED_STARTUP_BOUNDARIES_PASS:'+str(len(cases)))
     (tmp_path / "startup-boundaries.log").write_text(result.stdout + result.stderr)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "PINNED_STARTUP_BOUNDARIES_PASS:14" in result.stdout
+
+
+@pytest.fixture
+def smoke_service(tmp_path):
+    common = verify.dependency("common.py")
+    owned = run.owned_type()(common)
+    server = tmp_path / "http_fixture.py"
+    server.write_text(r"""
+import json, sys, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+root = Path(sys.argv[1])
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b'healthy')
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        with (root/'requests.jsonl').open('a') as stream:
+            stream.write(json.dumps(body)+'\n')
+        trickle = (root/'trickle').exists()
+        if not trickle:
+            time.sleep(float((root/'delay').read_text()))
+        reply = json.dumps({'choices':[{'text':'ready'}]}).encode()
+        try:
+            self.send_response(200); self.send_header('Content-Length',str(len(reply)))
+            self.end_headers()
+            if trickle:
+                for byte in reply:
+                    self.wfile.write(bytes([byte])); self.wfile.flush(); time.sleep(0.1)
+            else:
+                self.wfile.write(reply)
+        except (BrokenPipeError,ConnectionResetError):
+            pass
+    def log_message(self,*args):
+        pass
+server = ThreadingHTTPServer(('127.0.0.1',0),Handler)
+(root/'port').write_text(str(server.server_port))
+server.serve_forever()
+""")
+    (tmp_path / "delay").write_text("12")
+    fd = common.GpuLock(path=str(tmp_path / "cpu-resource.lock")).acquire()
+    child = common.spawn(
+        [sys.executable, str(server), str(tmp_path)],
+        env=os.environ.copy(),
+        cwd=tmp_path,
+        log_path=tmp_path / "server.log",
+        lock_fd=fd,
+        cpus="112-127",
+    )
+    owned.add(child)
+    run.wait_until(owned, lambda: (tmp_path / "port").exists(), time.monotonic() + 5)
+    url = "http://127.0.0.1:" + (tmp_path / "port").read_text()
+    try:
+        yield owned, child, fd, url, tmp_path
+    finally:
+        owned.stop()
+        child.wait(timeout=1)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def test_real_smoke_can_finish_after_health_probe_timeout(smoke_service):
+    owned, _child, _fd, url, path = smoke_service
+    assert run.request(url + "/health") == "healthy"
+    started = time.monotonic()
+    replies = run.smoke_batch(owned, url, started + 15)
+    assert len(replies) == 8 and time.monotonic() - started >= 10
+    requests = [
+        json.loads(line) for line in (path / "requests.jsonl").read_text().splitlines()
+    ]
+    assert len(requests) == 8
+    assert all(
+        row
+        == {
+            "model": "kimi-k3.1-pro",
+            "prompt": run.P["smoke"]["prompt"],
+            "max_tokens": 8,
+            "temperature": 0,
+        }
+        for row in requests
+    )
+
+
+@pytest.mark.parametrize("failure", ["deadline", "cancel"])
+def test_smoke_does_not_wait_for_workers_before_owned_cleanup(
+    smoke_service, monkeypatch, failure
+):
+    owned, child, _fd, url, path = smoke_service
+    (path / "delay").write_text("5")
+    if failure == "deadline":
+        (path / "trickle").touch()
+    if failure == "cancel":
+
+        def cancel(*args):
+            while not (path / "requests.jsonl").exists():
+                time.sleep(0.01)
+            raise KeyboardInterrupt("cancelled smoke")
+
+        monkeypatch.setattr(run, "wait_until", cancel)
+    started = time.monotonic()
+    expected = KeyboardInterrupt if failure == "cancel" else TimeoutError
+    try:
+        with pytest.raises(expected):
+            run.smoke_batch(
+                owned, url, started + (0.3 if failure == "deadline" else 10)
+            )
+        assert time.monotonic() - started < 1
+    finally:
+        owned.stop()
+    assert child.wait(timeout=1) != 0 and not owned.live()
+    assert time.monotonic() - started < 2
