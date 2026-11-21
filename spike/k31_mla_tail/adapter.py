@@ -311,6 +311,12 @@ def worker(rank, plan):
     from amd_kernels.common.hip_runtime import load_hip_runtime
 
     hip = load_hip_runtime()
+    loaded_hip = {
+        str(Path(line.split()[-1]).resolve())
+        for line in Path("/proc/self/maps").read_text().splitlines()
+        if "/libamdhip64.so" in line
+    }
+    assert loaded_hip == {plan["hip_runtime"]}, loaded_hip
     hip.hipDeviceGetPCIBusId.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
     bdf_buffer = ctypes.create_string_buffer(32)
     assert hip.hipDeviceGetPCIBusId(bdf_buffer, 32, rank) == 0

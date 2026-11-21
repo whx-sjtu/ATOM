@@ -65,7 +65,14 @@ def runtime_files():
         files.extend(found)
     files.extend((site / "flydsl").rglob("*.so"))
     files.extend((site / "flydsl").rglob("*.py"))
-    files.append(site / "torch/lib/libamdhip64.so")
+    hip = site / "torch/lib/libamdhip64.so"
+    files.append(
+        (hip if hip.exists() else Path("/opt/rocm/lib/libamdhip64.so")).resolve(
+            strict=True
+        )
+    )
+    files.extend((site / "torch/lib").glob("libtorch_hip.so"))
+    files.extend((site / "torch/lib").glob("libc10_hip.so"))
     return {str(p): sha(p) for p in sorted(set(files))}
 
 
@@ -137,6 +144,9 @@ def prepare(args):
         "rendezvous": "file://" + str(cache / "tmp/gloo-init"),
         "scope": "deterministic interface fixture; no model, serving, quality or C12 claim",
         "selected_bdfs": list(SELECTED_BDFS),
+        "hip_runtime": next(
+            p for p in files if Path(p).name.startswith("libamdhip64.so")
+        ),
         "lease_required": True,
         "gpu_authorized_by_plan": False,
         "command": [
