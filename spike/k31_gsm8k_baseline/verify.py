@@ -201,6 +201,12 @@ def first_valid(registry, expected):
     for number, entry in enumerate(registry, 1):
         if entry["attempt"] != f"author-{number:03d}":
             raise ValueError("author attempt history is not contiguous")
+        if (
+            Path(entry["status"]).parent / "pending-verification.json"
+        ).exists() or not entry.get("status_sha256"):
+            raise ValueError(
+                "earlier attempt is pending verification; recover it before another run"
+            )
         if sha(entry["status"]) != entry["status_sha256"]:
             raise ValueError("attempt status was not sealed")
         status = json.loads(Path(entry["status"]).read_text())

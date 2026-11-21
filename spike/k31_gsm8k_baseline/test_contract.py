@@ -4,9 +4,11 @@ import copy
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -220,6 +222,7 @@ def test_cleanup_keeps_lock_until_durable_release(monkeypatch, tmp_path, fault):
     monkeypatch.setattr(run, "cache_inventory", lambda attempt: {})
     state = {"attempt": "independent-001", "outcome": "COMPLETE"}
     closed, checks = [], []
+    clock = {"now": 0.0}
     real_save = run.save
 
     def save(path, value):
@@ -230,6 +233,7 @@ def test_cleanup_keeps_lock_until_durable_release(monkeypatch, tmp_path, fault):
     def release(**kwargs):
         assert not closed
         checks.append(1)
+        clock["now"] = 65.0
         assert kwargs["timeout"] > 0
         cards = (
             {}
@@ -248,8 +252,7 @@ def test_cleanup_keeps_lock_until_durable_release(monkeypatch, tmp_path, fault):
     )
     monkeypatch.setattr(run.signal, "signal", lambda *args: None)
     monkeypatch.setattr(run.signal, "setitimer", lambda *args: None)
-    ticks = iter([0.0, 65.0])
-    monkeypatch.setattr(run.time, "monotonic", lambda: next(ticks, 65.0))
+    monkeypatch.setattr(run.time, "monotonic", lambda: clock["now"])
 
     def sleep(seconds):
         assert len(checks) < 3
@@ -324,3 +327,174 @@ def test_owned_pid_birth_cancel_and_early_exit(tmp_path, monkeypatch):
     finally:
         owned.seen[child.pid] = born
         owned.stop()
+
+
+def test_blocked_preflight_is_interrupted(monkeypatch):
+    completed = []
+    monkeypatch.setitem(run.P["bounds"], "startup", 0.03)
+
+    def blocked(*args, **kwargs):
+        assert signal.getitimer(signal.ITIMER_REAL)[0] > 0
+        time.sleep(1)
+        completed.append(True)
+
+    monkeypatch.setattr(run, "load_plan", blocked)
+    with pytest.raises(KeyboardInterrupt):
+        run.execute("never-read-cpu-fixture")
+    assert not completed and signal.getitimer(signal.ITIMER_REAL)[0] == 0
+
+
+@pytest.mark.parametrize("blocked", ["query", "receipt"])
+def test_release_io_timeout_preserves_lock_until_retry(tmp_path, monkeypatch, blocked):
+    handlers = {sig: signal.getsignal(sig) for sig in run.STOP}
+    fd = os.open(tmp_path / "release-lock", os.O_CREAT | os.O_RDWR, 0o600)
+    query_calls, receipt_calls, inventoried = [], [], []
+    real_sleep, real_save = time.sleep, run.save
+    monkeypatch.setitem(run.P["bounds"], "release", 0.03)
+    monkeypatch.setattr(run.time, "sleep", lambda seconds: None)
+
+    def release(**kwargs):
+        os.fstat(fd)
+        query_calls.append(1)
+        if blocked == "query" and len(query_calls) == 1:
+            real_sleep(1)
+        return True, {
+            "cards": {str(i): {"used_gib": 0} for i in range(8)},
+            "kfd_pids": [],
+        }
+
+    def save(path, state):
+        if path.name == "release.json":
+            receipt_calls.append(1)
+            if blocked == "receipt" and len(receipt_calls) == 1:
+                real_sleep(1)
+        real_save(path, state)
+
+    def inventory(attempt):
+        with pytest.raises(OSError):
+            os.fstat(fd)
+        assert json.loads((tmp_path / "release.json").read_text())["cleanup"][
+            "released"
+        ]
+        inventoried.append(True)
+        return {}
+
+    monkeypatch.setattr(run, "save", save)
+    monkeypatch.setattr(run, "cache_inventory", inventory)
+    state = {"attempt": "independent-001", "outcome": "COMPLETE"}
+    try:
+        run.finish(
+            SimpleNamespace(stop=lambda: None, live=list, seen={}),
+            SimpleNamespace(wait_gpus_released=release),
+            fd,
+            tmp_path,
+            state,
+        )
+        assert len(query_calls) == 2 and inventoried == [True]
+        assert state["outcome"] == "EXECUTION_INVALID"
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def test_registry_failure_is_pending_and_recovers_same_low_attempt(
+    evidence, tmp_path, monkeypatch
+):
+    expected, _, _, seal = evidence
+    original = seal()
+    monkeypatch.setattr(run, "PRIVATE", tmp_path)
+    monkeypatch.setattr(run, "cache_inventory", lambda attempt: {})
+    monkeypatch.setattr(
+        run, "git", lambda *args: "fixture-head" if args[0] == "rev-parse" else ""
+    )
+    out = tmp_path / "runs/author-001"
+    quality = out / "quality"
+    quality.mkdir(parents=True)
+    (quality / "results_fixture.json").write_bytes(
+        Path(original["result"]["path"]).read_bytes()
+    )
+    (quality / "samples_gsm8k_fixture.jsonl").write_bytes(
+        Path(original["samples"]["path"]).read_bytes()
+    )
+    run.save(tmp_path / "data.json", expected)
+    plan = {
+        "attempt": "author-001",
+        "output": str(out),
+        "head": "fixture-head",
+        "protocol": run.P,
+        "data": {
+            "path": str(tmp_path / "data.json"),
+            "sha256": verify.sha(tmp_path / "data.json"),
+        },
+    }
+    run.save(out / "plan.json", plan)
+    run.save(out / "cache-before.json", {})
+    state = {
+        "attempt": "author-001",
+        "head": "fixture-head",
+        "plan_sha256": verify.sha(out / "plan.json"),
+        "outcome": "COMPLETE",
+        "registered": True,
+        "client_rc": 0,
+        "evidence": verify.bind_results(out, expected),
+        "cache_before_file": {
+            "path": str(out / "cache-before.json"),
+            "sha256": verify.sha(out / "cache-before.json"),
+        },
+        "cleanup": {"released": True},
+    }
+    run.save(
+        out / "release.json",
+        {
+            "head": state["head"],
+            "plan_sha256": state["plan_sha256"],
+            "cleanup": state["cleanup"],
+            "execution": state.copy(),
+        },
+    )
+    registry = [
+        {
+            "attempt": "author-001",
+            "status": str(out / "controller.json"),
+            "plan_sha256": state["plan_sha256"],
+        }
+    ]
+    run.save(tmp_path / "attempts.json", registry)
+    real_seal = run.seal_registry
+
+    def fail_seal(*args):
+        assert json.loads((out / "release.json").read_text())["cleanup"]["released"]
+        raise OSError("injected post-release registry failure")
+
+    monkeypatch.setattr(run, "seal_registry", fail_seal)
+    handlers = {sig: signal.getsignal(sig) for sig in run.STOP}
+    try:
+        with pytest.raises(OSError):
+            run.finalize_evidence(out, state, time.monotonic() + 10)
+        assert state["outcome"] == "PENDING_VERIFICATION"
+        with pytest.raises(ValueError, match="pending verification"):
+            verify.first_valid(registry, expected)
+        monkeypatch.setattr(run, "seal_registry", real_seal)
+        result = run.recover_evidence(out)
+        assert result == {
+            "attempt": "author-001",
+            "outcome": "COMPLETE",
+            "gpu_work": False,
+        }
+        chosen = verify.first_valid(
+            json.loads((tmp_path / "attempts.json").read_text()), expected
+        )
+        assert (
+            chosen["attempt"] == "author-001"
+            and chosen["score"]["quality_floor"] == "FAIL"
+        )
+        assert chosen["score"]["correct"]["flexible-extract"] == 0
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)

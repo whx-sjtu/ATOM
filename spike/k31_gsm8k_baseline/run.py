@@ -482,45 +482,27 @@ def seal_registry(state, out):
 
 def finish(owned, resources, fd, out, state):
     previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, STOP)
-    signal.setitimer(signal.ITIMER_REAL, 0)
+    cancel_alarm()
     for sig in STOP:
         signal.signal(sig, signal.SIG_IGN)
+    arm_deadline(time.monotonic() + P["bounds"]["term"] + P["bounds"]["kill"])
     signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
     try:
         owned.stop()
-    except Exception as error:
+    except BaseException as error:
         logger.exception("Owned termination failed; retaining release responsibility")
         state.update(outcome="EXECUTION_INVALID", stop_error=repr(error))
+    finally:
+        cancel_alarm()
     release_end = time.monotonic() + P["bounds"]["release"]
-    try:
-        state["cache_after"] = cache_inventory(state["attempt"])
-        state["new_artifacts"] = {
-            path: {
-                "sha256": value,
-                "head": state.get("head"),
-                "aiter": P["aiter_sha"],
-                "plan_sha256": state.get("plan_sha256"),
-            }
-            for path, value in state["cache_after"].items()
-            if state.get("cache_before", {}).get(path) != value
-        }
-        state["artifacts"] = {
-            str(p): sha(p)
-            for p in out.rglob("*")
-            if p.is_file() and p.name != "controller.json" and p.suffix != ".tmp"
-        }
-    except Exception as error:
-        logger.exception("Artifact inventory failed; continuing owned cleanup")
-        state.update(outcome="EXECUTION_INVALID", inventory_error=repr(error))
     while True:
+        durable = False
+        now = time.monotonic()
+        arm_deadline(release_end if now < release_end else now + 5)
         try:
             alive = [proc.pid for proc in owned.live()]
             released, snapshot = resources.wait_gpus_released(
-                timeout=(
-                    min(5, release_end - time.monotonic())
-                    if time.monotonic() < release_end
-                    else 5
-                )
+                timeout=min(5, release_end - now) if now < release_end else 5
             )
             released = bool(
                 released
@@ -536,15 +518,45 @@ def finish(owned, resources, fd, out, state):
                 "owned_births": owned.seen,
                 "utc_unix": time.time(),
             }
-            save(out / "controller.json", state)
-            if released:
-                seal_registry(state, out)
-                os.close(fd)
-                return
-        except Exception as error:
+            save(
+                out / "release.json",
+                {
+                    "head": state.get("head"),
+                    "plan_sha256": state.get("plan_sha256"),
+                    "cleanup": state["cleanup"],
+                    "execution": {
+                        key: state[key]
+                        for key in (
+                            "attempt",
+                            "head",
+                            "plan_sha256",
+                            "outcome",
+                            "client_rc",
+                            "execution_elapsed_s",
+                            "error",
+                            "stop_error",
+                            "cleanup_error",
+                            "registered",
+                            "cache_before_file",
+                            "evidence",
+                            "launch_monotonic",
+                            "launch_unix",
+                            "phase",
+                            "start_unix",
+                        )
+                        if key in state
+                    },
+                },
+            )
+            durable = released
+        except BaseException as error:
             logger.exception("Cleanup proof failed; retaining lock")
             state.update(outcome="EXECUTION_INVALID", cleanup_error=repr(error))
-            print(f"Cleanup evidence/release failed: {error!r}", flush=True)
+        finally:
+            cancel_alarm()
+        if durable:
+            os.close(fd)
+            break
         print(
             (
                 "QUARANTINED_HOLDING_GPU_LOCK"
@@ -554,6 +566,132 @@ def finish(owned, resources, fd, out, state):
             flush=True,
         )
         time.sleep(5)
+
+    # Release is durable before any non-release filesystem work can block.
+    os.sched_setaffinity(0, range(112, 128))
+    os.nice(19 - os.nice(0))
+    end = (
+        state.get("launch_monotonic", time.monotonic())
+        + P["bounds"]["whole"]
+        + sum(P["bounds"][key] for key in ("term", "kill", "release"))
+    )
+    finalize_evidence(out, state, end)
+
+
+def finalize_evidence(out, state, deadline):
+    for sig in STOP:
+        signal.signal(sig, interrupt)
+    arm_deadline(deadline)
+    outcome = state.get("execution_outcome", state["outcome"])
+    state.update(execution_outcome=outcome, outcome="PENDING_VERIFICATION")
+    marker = out / "pending-verification.json"
+    try:
+        save(marker, {"head": state.get("head"), "execution_outcome": outcome})
+        save(out / "controller.json", state)
+        state["cache_after"] = cache_inventory(state["attempt"])
+        state["new_artifacts"] = {
+            path: {
+                "sha256": value,
+                "head": state.get("head"),
+                "aiter": P["aiter_sha"],
+                "plan_sha256": state.get("plan_sha256"),
+            }
+            for path, value in state["cache_after"].items()
+            if state.get("cache_before", {}).get(path) != value
+        }
+        state["artifacts"] = {
+            str(p): sha(p)
+            for p in out.rglob("*")
+            if p.is_file()
+            and p.name not in ("controller.json", marker.name)
+            and p.suffix != ".tmp"
+        }
+        state["outcome"] = outcome
+        save(out / "controller.json", state)
+        seal_registry(state, out)
+        marker.unlink()
+        directory = os.open(out, os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except BaseException:
+        state["outcome"] = "PENDING_VERIFICATION"
+        logger.exception("Evidence remains pending; recover this same attempt offline")
+        raise
+    finally:
+        cancel_alarm()
+
+
+def recover_evidence(output):
+    handlers = {sig: signal.getsignal(sig) for sig in STOP}
+    deadline = time.monotonic() + P["bounds"]["release"]
+    for sig in STOP:
+        signal.signal(sig, interrupt)
+    arm_deadline(deadline)
+    try:
+        if (
+            not os.environ.get("KFD_GUARD_LOG")
+            or os.nice(0) != 19
+            or not set(os.sched_getaffinity(0)).issubset(range(112, 128))
+        ):
+            raise ValueError("offline evidence recovery requires the CPU guard")
+        out = output.resolve()
+        if not out.is_relative_to(PRIVATE / "runs"):
+            raise ValueError("recovery must stay inside this task's runs")
+        plan = json.loads((out / "plan.json").read_text())
+        release = json.loads((out / "release.json").read_text())
+        if (
+            str(out) != plan["output"]
+            or plan["head"] != git("rev-parse", "HEAD")
+            or git("status", "--porcelain")
+            or plan["protocol"] != P
+            or release["head"] != plan["head"]
+            or release["plan_sha256"] != sha(out / "plan.json")
+            or not release["cleanup"]["released"]
+        ):
+            raise ValueError("recovery source/plan/release identity mismatch")
+        if plan["attempt"].startswith("author-"):
+            registry = json.loads((PRIVATE / "attempts.json").read_text())
+            entry = next(row for row in registry if row["attempt"] == plan["attempt"])
+            if (
+                (out / "controller.json").exists()
+                and not (out / "pending-verification.json").exists()
+                and entry.get("status_sha256") == sha(out / "controller.json")
+            ):
+                raise ValueError("attempt already sealed; keep its canonical evidence")
+        state = (
+            json.loads((out / "controller.json").read_text())
+            if (out / "controller.json").exists()
+            else {}
+        )
+        state.update(release["execution"], cleanup=release["cleanup"])
+        state.pop("execution_outcome", None)
+        before = state["cache_before_file"]
+        if (
+            sha(before["path"]) != before["sha256"]
+            or sha(plan["data"]["path"]) != plan["data"]["sha256"]
+        ):
+            raise ValueError("recovery input identity mismatch")
+        state["cache_before"] = json.loads(Path(before["path"]).read_text())
+        if state["outcome"] == "COMPLETE":
+            if state["client_rc"] != 0:
+                raise ValueError("completed execution has a failed client")
+            recovered = bind_results(
+                out, json.loads(Path(plan["data"]["path"]).read_text())
+            )
+            if recovered != state["evidence"]:
+                raise ValueError("scored evidence changed; preserve this attempt")
+        finalize_evidence(out, state, deadline)
+        return {
+            "attempt": state["attempt"],
+            "outcome": state["outcome"],
+            "gpu_work": False,
+        }
+    finally:
+        cancel_alarm()
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
 
 
 def parsed_server_args(command):
@@ -713,9 +851,40 @@ def runtime_check(path):
     save(Path(plan["output"]) / "runtime.json", receipt)
 
 
+def interrupt(signum, frame):
+    raise KeyboardInterrupt(f"signal {signum}")
+
+
+def arm_deadline(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("execution deadline exhausted")
+    signal.signal(signal.SIGALRM, interrupt)
+    signal.setitimer(signal.ITIMER_REAL, remaining)
+
+
+def cancel_alarm():
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+    signal.setitimer(signal.ITIMER_REAL, 0)
+    signal.signal(signal.SIGALRM, signal.SIG_IGN)
+    signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
 def execute(path):
     start = time.monotonic()
-    started_unix = time.time()
+    handlers = {sig: signal.getsignal(sig) for sig in STOP}
+    for sig in STOP:
+        signal.signal(sig, interrupt)
+    arm_deadline(start + min(P["bounds"]["startup"], P["bounds"]["whole"]))
+    try:
+        return execute_bound(path, start, time.time())
+    finally:
+        cancel_alarm()
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
+
+
+def execute_bound(path, start, started_unix):
     whole = start + P["bounds"]["whole"]
     startup = start + P["bounds"]["startup"]
     plan = load_plan(path, grant=True)
@@ -743,11 +912,6 @@ def execute(path):
     }
     fd = None
 
-    def interrupt(signum, frame):
-        raise KeyboardInterrupt(f"signal {signum}")
-
-    for sig in STOP:
-        signal.signal(sig, interrupt)
     try:
         save(out / "plan.json", plan)
         expected = json.loads(Path(plan["data"]["path"]).read_text())
@@ -787,6 +951,11 @@ def execute(path):
                     "independent qualification requires matching A0 source/profile/data"
                 )
         state["cache_before"] = cache_inventory(plan["attempt"])
+        save(out / "cache-before.json", state["cache_before"])
+        state["cache_before_file"] = {
+            "path": str(out / "cache-before.json"),
+            "sha256": sha(out / "cache-before.json"),
+        }
         fd = resources.GpuLock().acquire()
         if PAUSE.exists():
             raise RuntimeError("GPU work paused before admission")
@@ -905,6 +1074,12 @@ def execute(path):
         print(f"EXECUTION_INVALID: {error!r}", flush=True)
     finally:
         if fd is None:
+            cleanup_end = min(
+                whole + sum(P["bounds"][k] for k in ("term", "kill", "release")),
+                time.monotonic()
+                + sum(P["bounds"][k] for k in ("term", "kill", "release")),
+            )
+            arm_deadline(cleanup_end)
             state["cleanup"] = {
                 "released": True,
                 "no_owned_gpu_work_started": True,
@@ -923,6 +1098,7 @@ def main():
     parser.add_argument("--prepare")
     parser.add_argument("--freeze")
     parser.add_argument("--run", type=Path)
+    parser.add_argument("--finalize", type=Path)
     parser.add_argument("--runtime-check", type=Path)
     parser.add_argument("--data", type=Path)
     args = parser.parse_args()
@@ -939,6 +1115,8 @@ def main():
         print(json.dumps({"plan": str(path), "sha256": sha(path)}))
     elif args.runtime_check:
         runtime_check(args.runtime_check)
+    elif args.finalize:
+        print(json.dumps(recover_evidence(args.finalize)))
     elif args.run:
         raise SystemExit(execute(args.run))
     else:

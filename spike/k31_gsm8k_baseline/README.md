@@ -50,3 +50,12 @@ and `--qualify <author controller.json> <independent controller.json>` for paire
 qualification. Startup hardware, imports, full runtime configuration and graphs
 remain checks of the separately authorized model execution. CPU fixtures establish
 no GPU result or quality score.
+
+The entry deadline covers plan hashes, cache inventory and admission. Cleanup writes
+an immutable `release.json` before unlocking. Bulk artifact hashes and registry
+finalization then run on CPU112-127 at nice19, without querying GPU state again.
+A failure there leaves the attempt pending verification and blocks selection or a
+later author run. From the same clean experimental head, use the CPU guard with
+`run.py --finalize <attempt output>` to recover its evidence within a bounded CPU
+operation. Recovery reuses the original answers and release proof; it launches no
+model and cannot replace a valid low score with a later result.
