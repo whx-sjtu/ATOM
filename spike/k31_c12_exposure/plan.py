@@ -179,7 +179,8 @@ def environment():
             "ATOM_MONO_POLL_SLEEP_UNITS": "16",
             "ATOM_MLA_ABSORB_BF16": "1",
             "AITER_META_DIR": P["aiter_root"],
-            "AITER_ASM_DIR": str(Path(P["aiter_root"]) / "hsa"),
+            # Pinned aiter.jit.core overwrites this import-time value with a trailing slash.
+            "AITER_ASM_DIR": str(Path(P["aiter_root"]) / "hsa") + "/",
             "OPUS_GEN_CO_DIR": str(Path(P["aiter_root"]) / "csrc/opus_gemm/gen_co"),
             "ATOM_ENABLE_REPLAYSSM": "1",
             "ATOM_GDN_SSM_DTYPE": "fp32",
@@ -263,6 +264,7 @@ def make_plan(out, mode="exposure"):
                 Path(P["model"]) / "config.json",
                 Path(P["draft"]) / "config.json",
                 Path(P["aiter_root"]) / "aiter/dist/parallel_state.py",
+                Path(P["aiter_root"]) / "aiter/jit/core.py",
             )
         },
         "observer_config_sha256": hashlib.sha256(

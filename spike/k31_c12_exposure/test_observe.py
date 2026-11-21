@@ -431,6 +431,118 @@ def test_runtime_catalog_uses_native_language_model_prefix(tmp_path, monkeypatch
     assert "language_model.model.layers.92.self_attn.indexer" in runtime.catalog
 
 
+def native_asm_environment(environment):
+    """Execute pinned import-time path resolution, excluding get_gfx_list/device work."""
+    import ast
+
+    core = Path(P["aiter_root"]) / "aiter/jit/core.py"
+    nodes = ast.parse(core.read_text()).body
+    start = next(
+        i
+        for i, n in enumerate(nodes)
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "env_meta" for t in n.targets)
+    )
+    # Real override/abspath/csrc fallback statements, then the two actual ASM writes.
+    path_resolution = nodes[start : start + 3]
+    assert isinstance(path_resolution[1], ast.If) and isinstance(
+        path_resolution[2], ast.If
+    )
+    asm_writes = [
+        n
+        for n in nodes
+        if isinstance(n, ast.Assign)
+        and any(
+            ast.unparse(t) in ("AITER_ASM_DIR", "os.environ['AITER_ASM_DIR']")
+            for t in n.targets
+        )
+    ]
+    assert len(asm_writes) == 2
+    actual = dict(environment)
+    namespace = {
+        "os": NS(environ=actual, path=os.path),
+        "AITER_META_DIR": P["aiter_root"],
+        "AITER_ROOT_DIR": P["aiter_root"],
+    }
+    exec(  # noqa: S102 - execute only pinned pure-path statements, without module imports
+        compile(
+            ast.Module(body=path_resolution + asm_writes, type_ignores=[]),
+            str(core),
+            "exec",
+        ),
+        namespace,
+    )
+    return actual
+
+
+def environment_seal(expected, actual, monkeypatch):
+    class ReachedSourceCheck(Exception):
+        pass
+
+    runtime = object.__new__(O.Observer)
+    runtime.plan = {
+        "environments": {"server": expected},
+        "native_sources": {"sentinel": "hash"},
+    }
+    runtime.state = {"worker_environment": actual}
+
+    def source_check(path):
+        raise ReachedSourceCheck()
+
+    monkeypatch.setattr(O, "digest", source_check)
+    return runtime, ReachedSourceCheck
+
+
+def test_frozen_environment_matches_native_aiter_asm(tmp_path, monkeypatch):
+    expected = make_plan(tmp_path, "warmup_observer")["environments"]["server"]
+    actual = native_asm_environment(expected)
+    runtime, next_check = environment_seal(expected, actual, monkeypatch)
+    with pytest.raises(next_check):
+        runtime.seal(None)
+    assert actual == expected
+    assert actual["AITER_ASM_DIR"].endswith("/hsa/")
+
+
+def test_different_asm_directory_is_rejected(tmp_path, monkeypatch):
+    expected = make_plan(tmp_path, "warmup_observer")["environments"]["server"]
+    actual = native_asm_environment(expected)
+    different = tmp_path / "different-aiter" / "hsa"
+    different.mkdir(parents=True)
+    actual["AITER_ASM_DIR"] = str(different) + "/"
+    assert different.resolve() != Path(expected["AITER_ASM_DIR"]).resolve()
+    runtime, _next_check = environment_seal(expected, actual, monkeypatch)
+    with pytest.raises(ValueError, match="effective worker environment differs"):
+        runtime.seal(None)
+    assert runtime.state["worker_environment"]["AITER_ASM_DIR"] == str(different) + "/"
+
+
+@pytest.mark.parametrize("key", ["AITER_JIT_DIR", "ATOM_MLA_ABSORB_BF16"])
+def test_private_cache_and_precision_environment_remain_strict(
+    tmp_path, monkeypatch, key
+):
+    expected = make_plan(tmp_path, "warmup_observer")["environments"]["server"]
+    actual = native_asm_environment(expected)
+    actual[key] = (
+        str(tmp_path / "other-private-cache") if key == "AITER_JIT_DIR" else "0"
+    )
+    runtime, _next_check = environment_seal(expected, actual, monkeypatch)
+    with pytest.raises(ValueError, match="effective worker environment differs"):
+        runtime.seal(None)
+
+
+def test_normalized_environment_still_checks_native_source_hash(tmp_path):
+    expected = make_plan(tmp_path, "warmup_observer")["environments"]["server"]
+    runtime = object.__new__(O.Observer)
+    core = Path(P["aiter_root"]) / "aiter/jit/core.py"
+    runtime.plan = {
+        "environments": {"server": expected},
+        "native_sources": {str(core): "0" * 64},
+    }
+    runtime.state = {"worker_environment": native_asm_environment(expected)}
+    with pytest.raises(ValueError, match="native seam source hash changed"):
+        runtime.seal(None)
+
+
 # The probe below is opt-in and runs as a separate guarded process, never during
 # test collection. No install()/patch() calls: sitecustomize performs registration.
 class ModelBoundary(Exception):

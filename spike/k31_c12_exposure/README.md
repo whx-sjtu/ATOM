@@ -44,7 +44,9 @@ Freeze with `plan.py --mode warmup_observer --out <fresh-run> --plan-out <plan>`
 `run.py --run-plan <plan>` uses the existing owned supervisor and still requires
 an exact reviewed head/plan grant. The plan binds all nested observer sources,
 the native seams, configuration, and server/cache/client/metadata environments.
-Only the server receives `worker_bootstrap` and recorder settings. Native spawned
+Only the server receives `worker_bootstrap` and recorder settings.
+The plan freezes `AITER_ASM_DIR` with the trailing slash written by pinned
+`aiter.jit.core`; worker environment and native-source comparisons remain exact. Native spawned
 workers activate after device/group setup; nonworkers install passive import hooks.
 
 The pre-load exporter/accessor probe and initial event records precede weight
