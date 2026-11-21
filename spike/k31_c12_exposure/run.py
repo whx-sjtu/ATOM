@@ -492,7 +492,10 @@ def execute(frozen, plan_sha):
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGINT, interrupt)
     signal.signal(signal.SIGALRM, interrupt)
-    signal.setitimer(signal.ITIMER_REAL, limit)
+    signal.setitimer(
+        signal.ITIMER_REAL,
+        max(0.001, observer.deadline() - time.monotonic()) if observer else limit,
+    )
     try:
         state["before"] = C.assert_gpus_idle()
         state["admitted"] = True
@@ -574,6 +577,8 @@ def execute(frozen, plan_sha):
                         len(snapshots) == 8
                         and all(v.get("ready") for v in snapshots.values())
                     ):
+                        if observer and observer.check(snapshots, time.monotonic()):
+                            raise RuntimeError("observer stopped at readiness boundary")
                         break
             except (OSError, ValueError):
                 pass
@@ -584,6 +589,9 @@ def execute(frozen, plan_sha):
         if observer:
             observer.ready = time.monotonic()
             state["observer_ready_mono"] = observer.ready
+            signal.setitimer(
+                signal.ITIMER_REAL, max(0.001, observer.deadline() - time.monotonic())
+            )
         save(out / "status.json", state)
         for label in frozen["invocations"]:
             metrics(out, f"before-{label}", state)

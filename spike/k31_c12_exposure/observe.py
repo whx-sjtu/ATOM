@@ -166,18 +166,19 @@ class StopState:
             self.reason = {"reason": reason, "mono": now, "detail": detail}
         return self.reason
 
+    def deadline(self):
+        phase_end = (
+            self.ready + self.config["prefix_s"]
+            if self.ready is not None
+            else self.launched + self.config["startup_s"]
+        )
+        return min(self.launched + self.config["workload_s"], phase_end)
+
     def check(self, snapshots, now, phase=False):
         c = self.config
         if self.reason:
             return self.reason
-        if now >= min(
-            self.launched + c["workload_s"],
-            (
-                self.ready + c["prefix_s"]
-                if self.ready is not None
-                else self.launched + c["startup_s"]
-            ),
-        ):
+        if now >= self.deadline():
             return self.latch("deadline", now)
         if phase:
             return self.latch(

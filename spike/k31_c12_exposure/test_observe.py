@@ -40,7 +40,9 @@ def test_plan_isolates_shim(tmp_path):
 
 def test_deadlines_and_independent_first_unfinished():
     stop = O.StopState(P["observer"], 0)
+    assert stop.deadline() == 900
     stop.ready = 300
+    assert stop.deadline() == 720
     assert stop.check({}, 535) is None  # No candidate: no 30s readiness timer.
     states = {
         0: {
