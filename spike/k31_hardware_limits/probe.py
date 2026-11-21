@@ -549,21 +549,21 @@ def execute_plan(path):
                 resources.save_json(output / "controller.json", state)
             except Exception as error:  # noqa: BLE001 - retain failure evidence
                 released = False
-                output = getattr(error, "stdout", None)
-                stderr = getattr(error, "stderr", None)
+                helper_stdout = getattr(error, "stdout", None)
+                helper_stderr = getattr(error, "stderr", None)
                 emit(
                     {
                         "cleanup_error": repr(error),
                         "retaining_lock": True,
                         "stdout": (
-                            output.decode(errors="replace")
-                            if isinstance(output, bytes)
-                            else output
+                            helper_stdout.decode(errors="replace")
+                            if isinstance(helper_stdout, bytes)
+                            else helper_stdout
                         ),
                         "stderr": (
-                            stderr.decode(errors="replace")
-                            if isinstance(stderr, bytes)
-                            else stderr
+                            helper_stderr.decode(errors="replace")
+                            if isinstance(helper_stderr, bytes)
+                            else helper_stderr
                         ),
                     }
                 )
