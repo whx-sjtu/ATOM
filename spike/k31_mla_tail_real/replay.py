@@ -77,6 +77,158 @@ def save(path, value):
     Path(path).write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
 
 
+def qualify_preserved(plan_path, receipts, report_path):
+    """Qualify unchanged payload bytes; failed producer admission stays refused."""
+    import torch
+
+    helpers()
+    capture.initialize_snapshot()
+    assert os.environ.get("KFD_GUARD_LOG") and os.environ.get("LD_PRELOAD")
+    assert not LEGACY.git("status", "--porcelain") and not report_path.exists()
+    assert report_path.resolve().is_relative_to(WS / "agent-team/evidence")
+    plan = json.loads(plan_path.read_text())
+    assert Path(plan["root"]).resolve() == ROOT
+    output = Path(plan["output"])
+    controller_path, stop_path, release_path = (
+        output / "controller.json",
+        receipts / "root-stop-request.json",
+        receipts / "root-release-verification.json",
+    )
+    controller, stop, release = (
+        json.loads(p.read_text()) for p in (controller_path, stop_path, release_path)
+    )
+    assert (
+        plan["mode"] == controller["mode"] == "capture"
+        and controller["head"] == plan["head"]
+    )
+    assert controller["plan_sha256"] == sha(plan_path) and not controller["complete"]
+    assert (
+        controller["stop_signals"] == [signal.SIGTERM] and stop["signal"] == "SIGTERM"
+    )
+    assert stop["no_foreign_process_targeted"] and stop["no_retry_authorized"]
+    assert release["controller_sha256"] == sha(controller_path) and release[
+        "stop_request_sha256"
+    ] == sha(stop_path)
+    assert (
+        release["controller_absent"]
+        and release["lock_acquired"]
+        and not release["global_kfd"]
+    )
+    assert not release["capture_qualified"] and not release["further_GPU_grant"]
+    used = {
+        f"0000:{slot}:00.0": value for slot, value in release["bdf_vram_bytes"].items()
+    }
+    assert LEGACY.selected_released(
+        controller["cleanup"]["alive"], controller["cleanup"]["snapshot"], used
+    )
+    assert controller["cleanup"]["released"]
+    for name, expected in plan["sources"].items():
+        source = Path(name)
+        if source.is_relative_to(ROOT / "spike/k31_mla_tail_real"):
+            original = subprocess.check_output(
+                [
+                    "git",
+                    "-C",
+                    str(ROOT),
+                    "show",
+                    plan["head"] + ":" + str(source.relative_to(ROOT)),
+                ]
+            )
+            assert hashlib.sha256(original).hexdigest() == expected
+        else:
+            assert sha(source) == expected, name
+    ranks, matches, weights, bdfs, owned_counts = [], [], set(), set(), []
+    for rank in range(8):
+        path = output / "data" / f"rank{rank}.invalid.pt"
+        before = sha(path)
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        validation = capture.validate_snapshot(payload)
+        meta, identity = payload["meta"], payload["meta"]["identity"]
+        assert (
+            identity["rank"] == rank
+            and meta["provenance"]["atom_commit"] == plan["head"]
+        )
+        assert identity["request_hint"] == plan["request"]
+        tensors = capture.views(payload)
+        matched = {
+            k: identity[k]
+            for k in ("epoch", "arm_id", "ordinary_served_witness", "selected_graph")
+        }
+        matched.update(
+            key=meta["key"],
+            abi=meta["abi_scalars"],
+            ids=tensors["input_ids"].tolist(),
+            positions=tensors["positions"].tolist(),
+        )
+        matches.append(matched)
+        weights.add(payload["tensor_hashes"]["w_v"])
+        bdfs.add(meta["hardware"]["bdf"])
+        owned_counts.append(tensors["owned"].tolist())
+        assert sha(path) == before
+        ranks.append(
+            {
+                "rank": rank,
+                "path": str(path),
+                "sha256": before,
+                "bytes": path.stat().st_size,
+                "validation": validation,
+                "identity": identity,
+                "key": meta["key"],
+                "workspace": meta["workspace"],
+                "hardware": meta["hardware"],
+                "tensor_hashes": payload["tensor_hashes"],
+            }
+        )
+    assert (
+        all(m == matches[0] for m in matches)
+        and len(weights) == 1
+        and bdfs == set(plan["selected_bdfs"])
+    )
+    assert [sum(row[i] for row in owned_counts) for i in range(capture.ROWS)] == [
+        p + 1 for p in matches[0]["positions"]
+    ]
+    required = [output / "data/manifest.json", output / "data/request.json"]
+    required += [
+        output / "data" / f"rank{r}.{suffix}.json"
+        for r in range(8)
+        for suffix in ("receipt", "cleanup")
+    ]
+    missing = [str(p) for p in required if not p.exists()]
+    assert len(missing) == len(required), "unexpected producer completion evidence"
+    report = {
+        "state": "PAYLOAD_INTEGRITY_ONLY",
+        "capture_remains_failed": True,
+        "replay_admitted": False,
+        "validator_head": LEGACY.git("rev-parse", "HEAD"),
+        "validator_sha256": sha(Path(capture.__file__)),
+        "qualifier_sha256": sha(Path(__file__)),
+        "original_capture_head": plan["head"],
+        "cpu_runtime": {
+            "python": sys.version,
+            "torch": torch.__version__,
+            "executable": sys.executable,
+        },
+        "raw_files_unchanged": True,
+        "bindings": {
+            str(p): sha(p)
+            for p in (plan_path, controller_path, stop_path, release_path)
+        },
+        "original_sources_verified": len(plan["sources"]),
+        "missing_producer_evidence": missing,
+        "matched_identity": matches[0],
+        "ranks": ranks,
+        "numerical_timing_or_quality_qualified": False,
+    }
+    assert not torch.cuda.is_initialized()
+    save(report_path, report)
+    return {
+        "report": str(report_path),
+        "sha256": sha(report_path),
+        "state": report["state"],
+        "ranks": len(ranks),
+    }
+
+
 def validation_command(path):
     return [
         "flock",
@@ -1065,6 +1217,8 @@ if __name__ == "__main__":
     parser.add_argument("--write-plan", choices=("capture", "replay"))
     parser.add_argument("--plan", type=Path)
     parser.add_argument("--selfcheck", action="store_true")
+    parser.add_argument("--qualify-preserved", action="store_true")
+    parser.add_argument("--root-receipts", type=Path)
     parser.add_argument("--ownership-fixture", type=Path)
     parser.add_argument("--out", type=Path)
     parser.add_argument("--snapshot", type=Path)
@@ -1074,6 +1228,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.selfcheck:
         print(json.dumps(cpu_checks(), indent=2))
+    elif args.qualify_preserved:
+        print(
+            json.dumps(
+                qualify_preserved(args.plan, args.root_receipts, args.out), indent=2
+            )
+        )
     elif args.ownership_fixture:
         ownership_fixture(args.ownership_fixture)
     elif args.write_plan:

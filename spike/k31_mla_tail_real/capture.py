@@ -167,7 +167,8 @@ def validate_snapshot(snapshot, **kwargs):
     assert key["raw_stride"] == list(tensors["raw"].stride())
     assert key["lse_stride"] == list(tensors["lse"].stride())
     assert tensors["input_ids"].numel() == tensors["positions"].numel() == ROWS
-    assert tensors["input_ids"].dtype == tensors["positions"].dtype == torch.int64
+    assert tensors["input_ids"].dtype == torch.int32
+    assert tensors["positions"].dtype == torch.int64
     assert tensors["input_ids"].reshape(-1).tolist() == ident["selected_input_ids"]
     assert tensors["positions"].reshape(-1).tolist() == ident["selected_positions"]
     assert bool(
@@ -537,14 +538,82 @@ def cpu_checks():
 
     initialize_snapshot()
     raw = torch.zeros(ROWS, 96, 514, dtype=torch.bfloat16)[:, :, 1:513]
-    ids_positions = torch.arange(8, dtype=torch.int64)
+    producer_path = ROOT / "atom/model_engine/model_runner.py"
+    producer_tree = ast.parse(producer_path.read_text())
+    producer_classes = {
+        n.name: n for n in producer_tree.body if isinstance(n, ast.ClassDef)
+    }
+    token_init = next(
+        n
+        for n in producer_classes["tokenIDProcessor"].body
+        if isinstance(n, ast.FunctionDef) and n.name == "__init__"
+    )
+    ids_allocation = next(
+        n
+        for n in token_init.body
+        if isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == "self.input_ids"
+    )
+    allocate = next(
+        n
+        for n in producer_classes["ModelRunner"].body
+        if isinstance(n, ast.FunctionDef) and n.name == "allocate_forward_vars"
+    )
+    position_kwargs = next(
+        n
+        for n in allocate.body
+        if isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == "i64_kwargs"
+    )
+    forward_vars = next(
+        n.value
+        for n in allocate.body
+        if isinstance(n, ast.Assign)
+        and ast.unparse(n.targets[0]) == "self.forward_vars"
+    )
+    position_allocation = next(
+        value
+        for key, value in zip(forward_vars.keys, forward_vars.values, strict=True)
+        if isinstance(key, ast.Constant) and key.value == "positions"
+    )
+    holder = NS(device="cpu", max_num_batched_tokens=ROWS)
+    producer_scope = {
+        "torch": torch,
+        "self": holder,
+        "device": "cpu",
+        "max_num_batched_tokens": ROWS,
+        "CpuGpuBuffer": lambda n, **kw: torch.empty(n, dtype=kw["dtype"]),
+    }
+    expressions = ast.Module(
+        body=[
+            ids_allocation,
+            position_kwargs,
+            ast.Assign(
+                targets=[ast.Name(id="positions", ctx=ast.Store())],
+                value=position_allocation,
+            ),
+        ],
+        type_ignores=[],
+    )
+    exec(  # noqa: S102 - native allocation expressions with CPU buffers
+        compile(ast.fix_missing_locations(expressions), str(producer_path), "exec"),
+        producer_scope,
+    )
+    native_ids, native_positions = holder.input_ids[:ROWS], producer_scope["positions"]
+    id_bytes = native_ids.numel() * native_ids.element_size()
+    identity_bytes = torch.zeros(
+        id_bytes + native_positions.numel() * native_positions.element_size(),
+        dtype=torch.uint8,
+    )
+    input_ids = identity_bytes[:id_bytes].view(native_ids.dtype)
+    positions = identity_bytes[id_bytes:].view(native_positions.dtype)
+    input_ids.copy_(torch.arange(ROWS, dtype=native_ids.dtype))
+    positions.copy_(torch.arange(ROWS, 2 * ROWS, dtype=native_positions.dtype))
     tensors = {
         "raw": raw,
         "lse": torch.zeros(96, ROWS).t(),
         "owned": torch.ones(ROWS, dtype=torch.int32),
         "w_v": torch.ones(96, 128, 512, dtype=torch.bfloat16),
-        "input_ids": ids_positions[:4],
-        "positions": ids_positions[4:],
+        "input_ids": input_ids,
+        "positions": positions,
         "gate": torch.ones(ROWS, 1536, dtype=torch.bfloat16),
         "reference": torch.zeros(ROWS, 1536, dtype=torch.bfloat16),
     }
@@ -624,6 +693,25 @@ def cpu_checks():
         == restored["positions"].untyped_storage().data_ptr()
     )
     failures = []
+    for name, wrong_dtype in (("input_ids", torch.int64), ("positions", torch.int32)):
+        candidate = copy.deepcopy(snapshot)
+        wrong = tensors[name].to(wrong_dtype).contiguous()
+        arena = "wrong_identity_dtype"
+        candidate["arenas"][arena] = wrong.view(torch.uint8).clone()
+        candidate["tensors"][name].update(
+            arena=arena,
+            dtype=SNAP.dtype_name(wrong_dtype),
+            itemsize=wrong.element_size(),
+            offset_bytes=0,
+            logical_nbytes=wrong.numel() * wrong.element_size(),
+        )
+        SNAP.seal_snapshot(candidate)
+        try:
+            validate_snapshot(candidate)
+        except AssertionError:
+            failures.append("wrong_" + name + "_dtype")
+        else:
+            raise AssertionError("accepted wrong native identity dtype: " + name)
     for name, edit in (
         (
             "stale_identity",
@@ -873,6 +961,10 @@ def cpu_checks():
     assert not torch.cuda.is_initialized()
     return {
         "controlled_cpu_only": True,
+        "producer_identity_dtypes": {
+            "input_ids": str(native_ids.dtype),
+            "positions": str(native_positions.dtype),
+        },
         "snapshot_negative_controls": failures,
         "actual_context_rejections": context_rejections,
         "actual_wrapper_bodies": [

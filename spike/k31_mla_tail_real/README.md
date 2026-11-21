@@ -73,3 +73,8 @@ inputs or GPU evidence. Exact-zero controls check both native and donor outputs.
 Private cache seeding retains byte-verified native/FlyDSL/Inductor/Triton
 artifacts. Higher-level torch graph indexes containing old absolute artifact
 paths stay in an inactive evidence directory; new graph compilation is private.
+
+`--qualify-preserved` checks original invalid payload bytes on CPU against the
+preserved capture plan/source and strict native int32-ID/int64-position schema.
+Its separate integrity report binds the failed controller and root stop/release,
+retains missing producer evidence, and cannot authorize capture or replay.
