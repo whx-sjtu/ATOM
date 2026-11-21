@@ -92,7 +92,6 @@ def environment(attempt):
     env = dict(P["environment"])
     for key, suffix in {
         "HOME": "home",
-        "TMPDIR": "tmp",
         "XDG_CACHE_HOME": "cache/xdg",
         "HF_HOME": "hf",
         "HF_DATASETS_CACHE": "hf/datasets",
@@ -110,6 +109,7 @@ def environment(attempt):
         "TORCH_EXTENSIONS_DIR": "cache/extensions",
     }.items():
         env[key] = str(namespace / suffix)
+    env["TMPDIR"] = str(PRIVATE / P["tmp_dir"] / attempt)
     env["AITER_ASM_DIR"] += "/"
     env["PYTHONPATH"] = f"{ROOT}:{namespace / 'aiter'}"
     return env
@@ -216,6 +216,132 @@ def check_cache_toolchain(cache):
         for k, value in toolchain["key_environment"]
     ):
         raise ValueError("cache compiler environment changed")
+
+
+def ipc_check(receipt_path):
+    import stat
+    import sys
+    import tempfile
+    from functools import lru_cache
+    from uuid import uuid4
+
+    import zmq
+    from zmq.backend.cython import _zmq
+
+    if (
+        not os.environ.get("KFD_GUARD_LOG")
+        or os.nice(0) != 19
+        or not set(os.sched_getaffinity(0)).issubset(range(112, 128))
+    ):
+        raise ValueError("IPC qualification requires the CPU guard")
+    tmpdir = os.environ["TMPDIR"]
+    state = {
+        "tmpdir": tmpdir,
+        "resolved_tmpdir": tempfile.gettempdir(),
+        "executable": sys.executable,
+        "ipc_path_max_len": zmq.IPC_PATH_MAX_LEN,
+        "probes": [],
+        "errors": [],
+        "verifier_sha256": sha(HERE / "run.py"),
+        "protocol_sha256": sha(HERE / "protocol.json"),
+        "cpu_guard_present": True,
+        "cpus": sorted(os.sched_getaffinity(0)),
+        "nice": os.nice(0),
+        "dependencies": {
+            str(path): sha(path)
+            for path in (
+                zmq.__file__,
+                _zmq.__file__,
+                sys.modules["zmq.sugar.socket"].__file__,
+            )
+        },
+    }
+    for line in Path("/proc/self/maps").read_text().splitlines():
+        path = line.split()[-1]
+        if path.startswith("/") and Path(path).name.startswith("libzmq"):
+            state["dependencies"][path] = sha(path)
+    if state["resolved_tmpdir"] != tmpdir:
+        state["errors"].append("TMPDIR did not resolve exactly; fallback is forbidden")
+    else:
+        for provider, source in (
+            ("atom", ROOT / "atom/utils/__init__.py"),
+            ("aiter", Path(os.environ["AITER_META_DIR"]) / "aiter/dist/utils.py"),
+        ):
+            probe = {"provider": provider}
+            state["probes"].append(probe)
+            context, sockets, socket_identity = None, [], None
+            try:
+                if sha(source) != P["ipc_source_sha256"][provider]:
+                    raise ValueError("IPC generator source changed")
+                state["dependencies"][str(source)] = sha(source)
+                nodes = [
+                    n
+                    for n in ast.parse(source.read_text()).body
+                    if isinstance(n, ast.FunctionDef)
+                    and n.name in ("get_zmq_base_path", "get_open_zmq_ipc_path")
+                ]
+                if len(nodes) != 2:
+                    raise ValueError("IPC generator declarations changed")
+                scope = {"tempfile": tempfile, "uuid4": uuid4, "lru_cache": lru_cache}
+                exec(  # noqa: S102 - hash-pinned production generators
+                    compile(
+                        ast.Module(body=nodes, type_ignores=[]), str(source), "exec"
+                    ),
+                    scope,
+                )
+                address = scope["get_open_zmq_ipc_path"]()
+                probe.update(
+                    address=address,
+                    path_bytes=len(address.removeprefix("ipc://").encode()),
+                )
+                context = zmq.Context()
+                server, client = context.socket(zmq.PAIR), context.socket(zmq.PAIR)
+                sockets = [server, client]
+                for sock in sockets:
+                    sock.setsockopt(zmq.RCVTIMEO, 1000)
+                    sock.setsockopt(zmq.SNDTIMEO, 1000)
+                socket_path = Path(address.removeprefix("ipc://"))
+                if socket_path.exists():
+                    raise ValueError("generated IPC path already exists")
+                server.bind(address)
+                info = socket_path.lstat()
+                socket_identity = (info.st_dev, info.st_ino)
+                client.connect(address)
+                client.send(b"request")
+                if server.recv() != b"request":
+                    raise ValueError("IPC request mismatch")
+                server.send(b"response")
+                if client.recv() != b"response":
+                    raise ValueError("IPC response mismatch")
+                probe["roundtrip"] = True
+            except (OSError, ValueError, zmq.ZMQError) as error:
+                probe["error"] = repr(error)
+                state["errors"].append(f"{provider}: {error}")
+            finally:
+                for sock in sockets:
+                    sock.close(linger=0)
+                if context is not None:
+                    context.term()
+                if "address" in probe:
+                    socket_path = Path(probe["address"].removeprefix("ipc://"))
+                    if socket_path.exists():
+                        info = socket_path.lstat()
+                        if socket_identity == (
+                            info.st_dev,
+                            info.st_ino,
+                        ) and stat.S_ISSOCK(info.st_mode):
+                            socket_path.unlink()
+                    probe["socket_removed"] = not socket_path.exists()
+    state["qualified"] = (
+        not state["errors"]
+        and state["ipc_path_max_len"] == 107
+        and len(state["probes"]) == 2
+        and all(p.get("roundtrip") and p.get("socket_removed") for p in state["probes"])
+    )
+    save(receipt_path, state)
+    if not state["qualified"]:
+        raise ValueError("IPC qualification failed; see the retained receipt")
+    return state
 
 
 def jit_helper(path, expected):
@@ -432,6 +558,7 @@ def prepare(attempt):
     for key, value in env.items():
         if key != "PYTHONPATH" and value.startswith(str(namespace)):
             Path(value).mkdir(parents=True, exist_ok=True)
+    Path(env["TMPDIR"]).mkdir(parents=True, exist_ok=True)
     seed = Path(P["arrow_seed"])
     target = Path(env["HF_DATASETS_CACHE"]) / seed.relative_to(seed.parents[3])
     target.mkdir(parents=True, exist_ok=True)
@@ -481,6 +608,17 @@ def prepare(attempt):
     )
     data = PRIVATE / "preparation" / f"{attempt}-data.json"
     data.parent.mkdir(parents=True, exist_ok=True)
+    ipc = data.with_name(f"{attempt}-ipc.json")
+    subprocess.run(
+        [P["python"], str(HERE / "run.py"), "--ipc-check", str(ipc)],
+        cwd=ROOT,
+        env=cpu_env,
+        check=True,
+        timeout=30,
+    )
+    ipc_witness = json.loads(ipc.read_text())
+    files.update(ipc_witness["dependencies"])
+    files[str(ipc)] = sha(ipc)
     startup = data.with_name(f"{attempt}-startup.json")
     subprocess.run(
         [P["python"], str(HERE / "run.py"), "--startup-check", str(startup)],
@@ -504,6 +642,7 @@ def prepare(attempt):
         "files": files,
         "data": {"path": str(data), "sha256": sha(data)},
         "startup_qualification": {"path": str(startup), "sha256": sha(startup)},
+        "ipc_qualification": {"path": str(ipc), "sha256": sha(ipc)},
         "cache_provenance": provenance,
         "native_publications": native_publications,
         "aiter_ref": P["aiter_sha"],
@@ -619,6 +758,24 @@ def make_plan(attempt):
         dependency(name)
     owned_type()
     env = environment(attempt)
+    ipc = preparation["ipc_qualification"]
+    witness = json.loads(Path(ipc["path"]).read_text())
+    if (
+        sha(ipc["path"]) != ipc["sha256"]
+        or not witness["qualified"]
+        or witness["tmpdir"] != env["TMPDIR"]
+        or witness["resolved_tmpdir"] != env["TMPDIR"]
+        or witness["ipc_path_max_len"] != 107
+        or not witness["cpu_guard_present"]
+        or witness["executable"] != P["python"]
+        or witness["nice"] != 19
+        or not set(witness["cpus"]).issubset(range(112, 128))
+        or witness["verifier_sha256"] != sha(HERE / "run.py")
+        or witness["protocol_sha256"] != sha(HERE / "protocol.json")
+    ):
+        raise ValueError(
+            "IPC qualification is incomplete or stale for the planned TMPDIR"
+        )
     if "SPEC_DECODE_ACCEPTANCE_LENGTH" in env or any(
         k.startswith(("K31_OBSERVER", "ATOM_PROFILER")) for k in env
     ):
@@ -635,6 +792,7 @@ def make_plan(attempt):
         "preparation": {"path": str(receipt_path), "sha256": sha(receipt_path)},
         "data": preparation["data"],
         "startup_qualification": startup,
+        "ipc_qualification": ipc,
         "environment": env,
         "commands": commands(attempt),
     }
@@ -1585,6 +1743,7 @@ def main():
     parser.add_argument("--finalize", type=Path)
     parser.add_argument("--runtime-check", type=Path)
     parser.add_argument("--startup-check", type=Path)
+    parser.add_argument("--ipc-check", type=Path)
     parser.add_argument("--data", type=Path)
     args = parser.parse_args()
     if args.prepare:
@@ -1598,6 +1757,8 @@ def main():
             raise FileExistsError(path)
         save(path, make_plan(args.freeze))
         print(json.dumps({"plan": str(path), "sha256": sha(path)}))
+    elif args.ipc_check:
+        ipc_check(args.ipc_check)
     elif args.startup_check:
         startup_check(args.startup_check)
         if (

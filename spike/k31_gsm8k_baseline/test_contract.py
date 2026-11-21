@@ -987,3 +987,71 @@ def test_after_scoring_refusal_persists_actual_child_details(process_family):
     assert "ATOM_ENABLE_RELAXED_MTP" in refused["mismatch_keys"]
     assert refused["environment"]["ATOM_ENABLE_RELAXED_MTP"] == "1"
     assert verify.sha(samples) == sample_hash == state["evidence"]["samples_sha256"]
+
+
+@pytest.mark.parametrize("case", ["planned", "107", "108", "fallback"])
+def test_real_ipc_generators_roundtrip_and_byte_boundary(tmp_path, case):
+    attempt = os.environ.get("K31_TASK10_CPU_ATTEMPT", "author-005")
+    env = dict(run.environment(attempt))
+    env.update(
+        {k: os.environ[k] for k in ("LD_PRELOAD", "KFD_GUARD_LOG") if k in os.environ}
+    )
+    created = None
+    if case != "planned":
+        import uuid
+
+        base = run.PRIVATE / "cpu-tmp" / ("ipc-" + uuid.uuid4().hex[:8])
+        desired = int(case) - 37 if case in ("107", "108") else len(str(base))
+        created = Path(str(base) + "x" * (desired - len(str(base).encode())))
+        env["TMPDIR"] = str(created)
+    if case != "fallback":
+        Path(env["TMPDIR"]).mkdir(parents=True, exist_ok=True)
+    receipt = tmp_path / "ipc.json"
+    try:
+        result = subprocess.run(
+            [
+                run.P["python"],
+                "-B",
+                str(run.HERE / "run.py"),
+                "--ipc-check",
+                str(receipt),
+            ],
+            cwd=run.ROOT,
+            env=env,
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        witness = json.loads(receipt.read_text())
+        assert witness["tmpdir"] == env["TMPDIR"]
+        assert (result.returncode == 0) == (case in ("planned", "107")), result.stderr
+        assert witness["qualified"] == (case in ("planned", "107"))
+        if case in ("107", "108"):
+            assert {p["path_bytes"] for p in witness["probes"]} == {int(case)}
+        if case == "108":
+            assert all("ZMQError" in p["error"] for p in witness["probes"])
+        if witness["qualified"]:
+            assert all(
+                p["roundtrip"] and p["socket_removed"] for p in witness["probes"]
+            )
+            assert witness["resolved_tmpdir"] == env["TMPDIR"]
+        if case == "fallback":
+            assert witness["resolved_tmpdir"] != env["TMPDIR"] and not witness["probes"]
+    finally:
+        if created is not None and created.exists():
+            created.rmdir()
+
+
+def test_freeze_rejects_changed_ipc_tmpdir(monkeypatch):
+    attempt = os.environ.get("K31_TASK10_CPU_ATTEMPT", "author-005")
+    original = run.environment
+
+    def changed(name):
+        env = original(name)
+        env["TMPDIR"] += "/unqualified-planned-path"
+        return env
+
+    monkeypatch.setattr(run, "environment", changed)
+    with pytest.raises(ValueError, match="IPC qualification"):
+        run.make_plan(attempt)

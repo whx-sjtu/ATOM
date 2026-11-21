@@ -214,5 +214,10 @@
   "deepgemm_opus_preparation": {
     "path": "/app/k31-agent-team-private/task-10/native-deepgemm-opus-preparation/evidence/final-receipt.json",
     "sha256": "fe9edfe65658877ea24d3c6b7a2156602ff9d76275c6dba62b27ed22daaa4acc"
+  },
+  "tmp_dir": "tmp",
+  "ipc_source_sha256": {
+    "atom": "da5dcf1fc3871c459f5d7de8e78bd0e0da878167730a57970f7ea59c8a8e1fb6",
+    "aiter": "d4a79eb6496970b4b2def44e9e81fbe0db673aa3280341f2c2e44ae45afa88d9"
   }
 }
