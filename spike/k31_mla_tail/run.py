@@ -259,14 +259,24 @@ def resource_components():
     return common(), scope["Owned"]
 
 
-def selected_released(alive, seen, snapshot, used):
+def release_snapshot():
+    used = {
+        bdf: int(Path(f"/sys/bus/pci/devices/{bdf}/mem_info_vram_used").read_text())
+        for bdf in SELECTED_BDFS
+    }
+    # KFD PIDs are global; this sample must drain without restarting SMI.
+    kfd = sorted(int(p.name) for p in Path("/sys/class/kfd/kfd/proc").iterdir())
+    return {"kfd_pids": kfd, "kfd_scope": "global", "source": "direct_sysfs"}, used
+
+
+def selected_released(alive, snapshot, used):
     kfd = snapshot["kfd_pids"]
     return (
         not alive
         and set(used) == set(SELECTED_BDFS)
         and all(type(v) is int and 0 <= v < 2 * 1024**3 for v in used.values())
-        and all(type(pid) is int for pid in kfd)
-        and not set(kfd).intersection(seen)
+        and type(kfd) is list
+        and not kfd
     )
 
 
@@ -372,22 +382,8 @@ def launch(args, plan):
             released = False
             try:
                 alive = [p.pid for p in owned.live()]
-                snapshot = harness.gpu_snapshot() if children else None
-                used = (
-                    {
-                        bdf: int(
-                            Path(
-                                f"/sys/bus/pci/devices/{bdf}/mem_info_vram_used"
-                            ).read_text()
-                        )
-                        for bdf in SELECTED_BDFS
-                    }
-                    if children
-                    else {}
-                )
-                released = not children or selected_released(
-                    alive, owned.seen, snapshot, used
-                )
+                snapshot, used = release_snapshot()
+                released = selected_released(alive, snapshot, used)
                 result["final_exit_codes"] = [p.poll() for p in children]
                 result["cleanup"] = {
                     "owned_births": owned.seen,
