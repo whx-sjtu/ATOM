@@ -135,8 +135,11 @@ Only serving processes receive K31_SAVE_OBSERVER_PLAN and the passive shim.
 The indexer observer, GPU markers, FlightRecorder calls and profiler controls are
 inactive. Client, LMCache and metadata roles retain ordinary environments.
 
-The selector is logical request 130 and its actual generations, capped at eight.
-Generation 340 and cross-run input correspondence are never assumed. Native
+The prospective selector is logical request 9 and its first eight distinct actual
+save generations. Generation 111 or 340 and cross-run input correspondence are
+never assumed. One save in flight does not bound the request's total generations;
+cap exhaustion stays inconclusive without a sliding window or budget reset.
+The bfd2bd10 req130 experiment retains its original FAILED/inconclusive result. Native
 submission, future queries/results, existing aggregation and settlement calls keep
 their original arguments, results, exceptions and order. In particular, the
 installed result(timeout=0) path keeps its existing event synchronization; the
@@ -160,6 +163,13 @@ are unavailable. Overflow is explicit and never adds a workload stop or retry.
 A failed stop-control write preserves the original terminal state/error and is
 recorded separately in status.json. Both the status summary and offline reducer
 mark the join unavailable because the shortened worker cutoff was not proved.
+Existing fatal native exceptions publish one scalar global failure header
+independently of the selector or generation/record admission, then re-raise the
+original exception. A byte-capped snapshot retains its source/role identity and
+fatal header within the existing cap while detailed evidence is unavailable.
+The current controller consumes that notification even if the frontend remains
+alive. Recorder write failure stays unavailable and preserves the native exception;
+it cannot establish successful notification delivery.
 Recorder-owned cost counters exclude native calls, overlap and omit their own
 publication tail; cumulative I/O bytes are separate from the retained payload cap.
 

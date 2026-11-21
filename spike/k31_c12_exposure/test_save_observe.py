@@ -22,6 +22,8 @@ sys.path[:0] = [str(HERE), str(ROOT)]
 import plan
 import save_observe as S
 
+SELECTED = plan.P["save_observer"]["req_id"]
+
 
 @pytest.fixture
 def frozen(tmp_path, monkeypatch):
@@ -284,7 +286,7 @@ def test_native_query_order_and_lifetime(frozen, native, case):
     for module in [native.events, native.futures, native.transfer]:
         S.patch(module)
     rec = recorder(frozen)
-    with S.context((130, 71), phase="poll"):
+    with S.context((SELECTED, 71), phase="poll"):
         observed = future_case(native, **case)
     assert getattr(S.TLS, "context", None) is None
     assert observed == baseline
@@ -300,10 +302,10 @@ def test_extra_query_control_and_submit_scope(frozen, native):
     for module in [native.events, native.futures, native.transfer]:
         S.patch(module)
     rec = recorder(frozen)
-    with S.context((130, 1), phase="submit"):
+    with S.context((SELECTED, 1), phase="submit"):
         baseline = future_case(native, pending=True)
     assert rec.data["operations"] == {}
-    with S.context((130, 1), phase="poll"):
+    with S.context((SELECTED, 1), phase="poll"):
         extra = future_case(native, pending=True, extra_query=True)
     with pytest.raises(AssertionError, match="native call ledger differs"):
         assert extra == baseline, "native call ledger differs"
@@ -314,15 +316,15 @@ def test_selector_caps_writer_failure_and_cutoff(frozen, monkeypatch):
     rec.sample("x", (129, 1), {"value": True})
     assert not rec.data["operations"]
     for gen in range(1, 10):
-        rec.sample("x", (130, gen), {"value": False})
+        rec.sample("x", (SELECTED, gen), {"value": False})
     assert set(rec.data["operations"]) == {str(g) for g in range(1, 9)}
     assert "generation cap" in rec.data["unavailable"]
     for unused in range(100):
-        rec.sample("x", (130, 1), {"value": False})
+        rec.sample("x", (SELECTED, 1), {"value": False})
     assert len(rec.data["records"]) == 8
     assert rec.data["operations"]["1"]["stages"]["x"]["count"] == 101
     rec.max_records = len(rec.data["records"])
-    rec.sample("changed", (130, 1), {"value": True})
+    rec.sample("changed", (SELECTED, 1), {"value": True})
     assert "record cap" in rec.data["unavailable"]
     rec.max_bytes = 128
     rec.publish()
@@ -345,6 +347,7 @@ def test_selector_caps_writer_failure_and_cutoff(frozen, monkeypatch):
 
 
 def test_modes_and_clock_latch(frozen):
+    assert frozen["protocol"]["save_observer"]["req_id"] == 9
     assert frozen["invocations"] == ["save_completion_observer"]
     for role, env in frozen["environments"].items():
         assert ("K31_SAVE_OBSERVER_PLAN" in env) == (role == "server")
@@ -417,9 +420,9 @@ def native_save_case(native, mode, clear_logs):
     )
     worker._native_block_ids = lambda *args, **kwargs: [[0, 1, 2, 3]]
     worker._submit_kwargs = dict
-    op = native.types.SaveOperationId(130, 17)
+    op = native.types.SaveOperationId(SELECTED, 17)
     req = native.worker.MPReqMeta(
-        req_id=130,
+        req_id=SELECTED,
         token_ids=list(range(16)),
         block_ids=[0, 1, 2, 3],
         save_spec=SaveSpec(skip_leading_tokens=0, can_save=True),
@@ -433,7 +436,7 @@ def native_save_case(native, mode, clear_logs):
     result = None
     try:
         worker._poll_native_save(
-            output, "save:130:17", worker._native_saves["save:130:17"]
+            output, f"save:{SELECTED}:17", worker._native_saves[f"save:{SELECTED}:17"]
         )
     except native.transfer.LMCacheTransferUnprovable as error:
         result = type(error).__name__
@@ -479,7 +482,10 @@ def test_actual_native_submission_poll_and_report(frozen, native, mode, caplog):
     assert observed == baseline
     assert getattr(S.TLS, "context", None) is None
     stages = rec.data["operations"]["17"]["stages"]
-    assert stages["adapter_enter"]["value"]["session"] == "atom-offload-fixture-dp0:130"
+    assert (
+        stages["adapter_enter"]["value"]["session"]
+        == f"atom-offload-fixture-dp0:{SELECTED}"
+    )
     if mode in ("true", "false", "missing"):
         assert stages["worker_terminal"]["value"]["succeeded"] is (mode == "true")
         assert stages["worker_terminal"]["value"]["aggregation_ordinal"] == 3
@@ -507,11 +513,11 @@ def test_native_poll_emissions_belong_to_each_generation(frozen, native):
         worker._adapter, worker.chunk_size, worker._transfer_deadline_s = None, 4, 30.0
         for generation in (17, 18):
             req = native.worker.MPReqMeta(
-                req_id=130,
+                req_id=SELECTED,
                 token_ids=list(range(16)),
                 block_ids=[0, 1, 2, 3],
                 save_spec=SaveSpec(skip_leading_tokens=0, can_save=True),
-                save_operation=native.types.SaveOperationId(130, generation),
+                save_operation=native.types.SaveOperationId(SELECTED, generation),
                 native_state=NativeStateTransfer((1,), 16, 123),
                 is_last_prefill=True,
             )
@@ -542,13 +548,13 @@ def test_native_poll_emissions_belong_to_each_generation(frozen, native):
     rec = recorder(frozen)
     rec.data["current"] = {"ordinal": 3}
     assert run_case() == baseline
-    assert baseline["terminal"] == [(S.CHANNEL, 130, g, True) for g in (17, 18)]
+    assert baseline["terminal"] == [(S.CHANNEL, SELECTED, g, True) for g in (17, 18)]
     for generation in (17, 18):
         stages = rec.data["operations"][str(generation)]["stages"]
         assert stages["worker_terminal"]["count"] == 1
         assert stages["worker_terminal"]["value"]["aggregation_ordinal"] == 3
         assert stages["poll_return"]["value"]["emitted"] == [
-            [S.CHANNEL, 130, generation, True]
+            [S.CHANNEL, SELECTED, generation, True]
         ]
     assert S.plain(rec.data["operations"]) == rec.data["operations"]
 
@@ -560,7 +566,7 @@ def test_native_quorum_duplicate_generations_and_settlement(frozen, native):
         S.patch(module)
     rec = recorder(frozen, "manager")
     rec.data["current"] = {"ordinal": 9, "rank_mask": 255, "receipts": {}}
-    op = native.types.SaveOperationId(130, 23)
+    op = native.types.SaveOperationId(SELECTED, 23)
     outputs = [
         native.types.KVConnectorOutput(
             connector_completions={
@@ -602,6 +608,102 @@ def test_native_quorum_duplicate_generations_and_settlement(frozen, native):
     assert stages["settlement_return"]["value"]["lease_present"] is False
 
 
+@pytest.mark.parametrize(
+    "admission",
+    [
+        "selected",
+        "unselected",
+        "generation_cap",
+        "record_cap",
+        "byte_cap",
+        "completion",
+    ],
+)
+@pytest.mark.parametrize("write_fails", [False, True])
+def test_fatal_notification_survives_trace_admission(
+    frozen, native, monkeypatch, admission, write_fails
+):
+    monkeypatch.setattr(S.time, "monotonic", lambda: 1000.0)
+    rec = recorder(frozen, "manager")
+    request = (
+        (9 if SELECTED != 9 else 130)
+        if admission in ("unselected", "completion")
+        else SELECTED
+    )
+    operation = native.types.SaveOperationId(request, 111)
+    if admission == "generation_cap":
+        for generation in range(1, 9):
+            assert rec.select((SELECTED, generation))
+    elif admission == "record_cap":
+        rec.max_records = 0
+    elif admission == "byte_cap":
+        rec.max_bytes = 16384
+        rec.data["current"] = {"padding": ["x" * 1024] * 32}
+    initial_operations = set(rec.data["operations"])
+    original_open = Path.open
+
+    def open_file(path, mode="r", *args, **kwargs):
+        if write_fails and path == rec.path and "w" in mode:
+            raise OSError("fatal receipt write failed")
+        return original_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", open_file)
+    native_calls, original_errors, order = [], [], []
+    original_failure = S.native_failure
+
+    def notify(stage, error):
+        order.append("notify")
+        return original_failure(stage, error)
+
+    monkeypatch.setattr(S, "native_failure", notify)
+    original = native.transfer._enforce_transfer_deadline
+    S.verify_method(original)
+
+    def call_native(op, started, bound):
+        order.append("native_enter")
+        native_calls.append((op, started, bound))
+        try:
+            return original(op, started, bound)
+        except native.transfer.LMCacheTransferUnprovable as error:
+            order.append("native_raise")
+            original_errors.append(error)
+            raise
+
+    def completions(owner, output):
+        return call_native(operation, 737.0, 40.0)
+
+    with pytest.raises(native.transfer.LMCacheTransferUnprovable) as caught:
+        if admission == "completion":
+            S.process_completions_factory(completions)(
+                object(), native.types.KVConnectorOutput()
+            )
+        else:
+            S.deadline_factory(call_native)(operation, 737.0, 40.0)
+    order.append("propagated")
+    assert order == ["native_enter", "native_raise", "notify", "propagated"]
+    assert native_calls == [(operation, 737.0, 40.0)]
+    assert caught.value is original_errors[0]
+    assert "after 263s" in str(caught.value)
+    failure = dict(rec.data["native_failure"])
+    assert failure["exception"] == "LMCacheTransferUnprovable"
+    assert S.plain(failure) == failure
+    S.native_failure("later", RuntimeError("second failure"))
+    assert rec.data["native_failure"] == failure
+    assert S.TLS.context is None
+    if admission in ("unselected", "completion", "generation_cap"):
+        assert set(rec.data["operations"]) == initial_operations
+        assert rec.data["records"] == []
+    retained = S.reports(Path(frozen["output"]), frozen)["manager"]
+    if write_fails:
+        assert "write:OSError" in rec.data["unavailable"]
+        assert not retained["ready"] and "native_failure" not in retained
+    else:
+        assert retained["native_failure"] == failure
+        assert rec.path.stat().st_size <= rec.max_bytes
+        if admission == "byte_cap":
+            assert retained["ready"] is False and "byte cap" in retained["unavailable"]
+
+
 def test_no_tensor_access_and_source_binding(frozen, native):
     class NoRead:
         def __len__(self):
@@ -617,17 +719,27 @@ def test_no_tensor_access_and_source_binding(frozen, native):
 
 @pytest.mark.parametrize(
     "outcome",
-    ["normal", "client_error", "deadline", "native_failure", "admission_failure"],
+    [
+        "normal",
+        "client_error",
+        "deadline",
+        "native_selected",
+        "native_unselected",
+        "native_cap",
+        "admission_failure",
+    ],
 )
 @pytest.mark.parametrize("stop_write_fails", [False, True])
 def test_existing_controller_lifecycle(
-    frozen, tmp_path, monkeypatch, outcome, stop_write_fails
+    frozen, native, tmp_path, monkeypatch, outcome, stop_write_fails
 ):
     import os
     import signal
 
     import run
 
+    # Prepare pure accounting before replacing the controller's lifecycle loader.
+    S.costs()
     subject = copy.deepcopy(frozen)
     subject["output"] = str(tmp_path / "controlled")
     subject["protocol"]["save_observer"].update(
@@ -713,15 +825,46 @@ def test_existing_controller_lifecycle(
         else:
             now[0] = target
 
+    native_reports = S.reports
+    fatal_recorder = []
+    native_requests = []
+
     def reports(*args):
         values = {
             name: {"ready": True}
             for name in ["manager", *[f"rank-{r}" for r in range(8)]]
         }
-        if outcome == "native_failure" and any(
+        if outcome.startswith("native_") and any(
             p.role == "client" for p in children.values()
         ):
-            values["manager"]["native_failure"] = {"exception": "FixtureNativeFailure"}
+            assert all(
+                p.poll() is None
+                for p in children.values()
+                if p.role in ("server", "cache")
+            )
+            if not fatal_recorder:
+                rec = S.Recorder(subject, "manager", None)
+                S.RUNTIME = rec
+                rec.enter("engine_core")
+                rec.enter("manager")
+                if outcome == "native_cap":
+                    for generation in range(1, 9):
+                        assert rec.select((SELECTED, generation))
+                request = (
+                    (9 if SELECTED != 9 else 130)
+                    if outcome == "native_unselected"
+                    else SELECTED
+                )
+                operation = native.types.SaveOperationId(request, 111)
+                fatal_recorder.append(rec)
+                native_requests.append(operation)
+                with pytest.raises(native.transfer.LMCacheTransferUnprovable):
+                    S.deadline_factory(native.transfer._enforce_transfer_deadline)(
+                        operation, now[0] - 263, 40
+                    )
+            values["manager"] = native_reports(Path(subject["output"]), subject)[
+                "manager"
+            ]
         return values
 
     release_checks = []
@@ -850,18 +993,35 @@ def test_existing_controller_lifecycle(
         assert alarms[0] == 18 and alarms[-1] == 0
         receipt = state["save_observer_client"]
         assert receipt["instrumented"] and receipt["performance_accepted"] is False
-        assert receipt["censored"] is (outcome in ("deadline", "native_failure"))
+        assert receipt["censored"] is (
+            outcome == "deadline" or outcome.startswith("native_")
+        )
         assert (
             state["save_observer_stop"]["reason"]
             == {
                 "normal": "invocation-end",
                 "client_error": "client-failure",
                 "deadline": "deadline",
-                "native_failure": "native-failure",
+                "native_selected": "native-failure",
+                "native_unselected": "native-failure",
+                "native_cap": "native-failure",
                 "admission_failure": "observer-failure",
             }[outcome]
         )
         assert state["state"] == ("COMPLETED" if outcome == "normal" else "FAILED")
+        if outcome.startswith("native_"):
+            assert len(native_requests) == 1
+            assert (
+                state["save_observer_stop"]["mono"]
+                < state["save_observer_clocks"]["deadline_mono"]
+            )
+            assert state["save_observer_stop"]["reason"] == "native-failure"
+            expected = (
+                {str(g) for g in range(1, 9)} if outcome == "native_cap" else set()
+            )
+            if outcome != "native_selected":
+                assert set(fatal_recorder[0].data["operations"]) == expected
+                assert fatal_recorder[0].data["records"] == []
         assert now[0] <= 118.15
     finally:
         try:
@@ -901,7 +1061,7 @@ def test_terminal_receipt_failure_and_expired_evidence(tmp_path, monkeypatch):
 @pytest.mark.parametrize("mismatch", ["range", "ordinal", "stop_control"])
 def test_reducer_rejects_unavailable_join(frozen, monkeypatch, mismatch):
     fields = {
-        "req_id": 130,
+        "req_id": SELECTED,
         "start": 0,
         "end": 16,
         "boundary": 16,

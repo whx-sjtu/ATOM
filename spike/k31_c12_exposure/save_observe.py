@@ -303,13 +303,30 @@ class Recorder:
                         ).encode()
                     if len(raw) > self.max_bytes:
                         self.fail("byte cap")
-                        raw = json.dumps(
-                            {
-                                "ready": False,
-                                "unavailable": ["byte cap"],
-                                "dropped": self.data["dropped"],
-                            }
-                        ).encode()
+                        header = {
+                            key: self.data[key]
+                            for key in (
+                                "schema",
+                                "role",
+                                "rank",
+                                "pid",
+                                "head",
+                                "config_sha256",
+                                "sources",
+                                "native_sources",
+                                "activated_mono",
+                                "activation_ordinal",
+                                "entry_points",
+                                "native_failure",
+                            )
+                            if key in self.data
+                        }
+                        header.update(
+                            ready=False,
+                            unavailable=["byte cap"],
+                            dropped=self.data["dropped"],
+                        )
+                        raw = json.dumps(header).encode()
                     if len(raw) > self.max_bytes:
                         raw = b""
                     cost["bytes"] = len(raw)
@@ -575,7 +592,11 @@ def deadline_factory(original):
         key = op_key(operation) or current_key()
         value = runtime()
         if value is None or not safe(value.select, key):
-            return original(operation, started_at, deadline_s)
+            try:
+                return original(operation, started_at, deadline_s)
+            except BaseException as error:
+                safe(native_failure, "deadline", error)
+                raise
         entered = time.monotonic()
         ctx = getattr(TLS, "context", None) or {}
         fields = {
@@ -1072,6 +1093,9 @@ def process_completions_factory(original):
         with context(None, snapshot=None if snapshot is None else snapshot["ordinal"]):
             try:
                 result = original(self, output)
+            except BaseException as error:
+                safe(native_failure, "scheduler_completions", error)
+                raise
             finally:
                 if value is not None and value.data["operations"]:
                     safe(value.publish)
