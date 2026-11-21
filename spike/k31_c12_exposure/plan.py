@@ -2,6 +2,7 @@
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -225,7 +226,7 @@ def environment():
 
 
 def make_plan(out, mode="exposure"):
-    if mode not in ("exposure", "warmup_observer"):
+    if mode not in ("exposure", "warmup_observer", "save_completion_observer"):
         raise ValueError(mode)
     server, cache, client = commands(out)
     external = [
@@ -236,8 +237,12 @@ def make_plan(out, mode="exposure"):
     ]
     env = environment()
     roles = {role: dict(env) for role in ("server", "cache", "client", "metadata")}
-    config = P["observer"] if mode == "warmup_observer" else None
-    if config:
+    config = (
+        P["observer"]
+        if mode == "warmup_observer"
+        else P["save_observer"] if mode == "save_completion_observer" else None
+    )
+    if mode == "warmup_observer":
         roles["server"].update(
             {
                 "PYTHONPATH": f"{HERE / 'worker_bootstrap'}:{env['PYTHONPATH']}",
@@ -247,30 +252,44 @@ def make_plan(out, mode="exposure"):
                 "TORCH_NCCL_ENABLE_TIMING": "0",
             }
         )
+    native_sources = {
+        str(p): sha(p)
+        for p in (
+            ROOT / "atom/model_engine/async_proc.py",
+            ROOT / "atom/model_engine/model_runner.py",
+            ROOT / "atom/model_engine/scheduler.py",
+            ROOT / "atom/model_engine/sequence.py",
+            ROOT / "atom/utils/h2d.py",
+            ROOT / "atom/utils/forward_context.py",
+            ROOT / "atom/model_ops/attentions/aiter_mla.py",
+            ROOT / "atom/model_ops/attention_mla.py",
+            ROOT / "atom/model_ops/indexer/indexer_forward.py",
+            ROOT / "atom/config.py",
+            ROOT / "atom/model_engine/model_setup.py",
+            ROOT / "atom/models/kimi_k3/model.py",
+            ROOT / "atom/models/kimi_k3_dspark.py",
+            Path(P["model"]) / "config.json",
+            Path(P["draft"]) / "config.json",
+            Path(P["aiter_root"]) / "aiter/dist/parallel_state.py",
+            Path(P["aiter_root"]) / "aiter/jit/core.py",
+        )
+    }
+    if mode == "save_completion_observer":
+        roles["server"].update(
+            {
+                "PYTHONPATH": f"{HERE / 'worker_bootstrap'}:{env['PYTHONPATH']}",
+                "K31_SAVE_OBSERVER_PLAN": str(out / "plan.json"),
+            }
+        )
+        spec = importlib.util.spec_from_file_location(
+            "_save_plan_sources", HERE / "save_observe.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        native_sources.update({str(p): sha(p) for p in module.SOURCE_FILES.values()})
     return {
         "mode": mode,
-        "native_sources": {
-            str(p): sha(p)
-            for p in (
-                ROOT / "atom/model_engine/async_proc.py",
-                ROOT / "atom/model_engine/model_runner.py",
-                ROOT / "atom/model_engine/scheduler.py",
-                ROOT / "atom/model_engine/sequence.py",
-                ROOT / "atom/utils/h2d.py",
-                ROOT / "atom/utils/forward_context.py",
-                ROOT / "atom/model_ops/attentions/aiter_mla.py",
-                ROOT / "atom/model_ops/attention_mla.py",
-                ROOT / "atom/model_ops/indexer/indexer_forward.py",
-                ROOT / "atom/config.py",
-                ROOT / "atom/model_engine/model_setup.py",
-                ROOT / "atom/models/kimi_k3/model.py",
-                ROOT / "atom/models/kimi_k3_dspark.py",
-                Path(P["model"]) / "config.json",
-                Path(P["draft"]) / "config.json",
-                Path(P["aiter_root"]) / "aiter/dist/parallel_state.py",
-                Path(P["aiter_root"]) / "aiter/jit/core.py",
-            )
-        },
+        "native_sources": native_sources,
         "observer_config_sha256": hashlib.sha256(
             json.dumps(config, sort_keys=True).encode()
         ).hexdigest(),
@@ -289,7 +308,7 @@ def make_plan(out, mode="exposure"):
             if p.is_file() and "__pycache__" not in p.parts
         },
         "atom_compile_cache": str(PRIVATE / "home/.cache/atom/torch_compile_cache"),
-        "invocations": ["warmup_observer"] if config else ["u1", "u2", "diagnostic"],
+        "invocations": [mode] if config else ["u1", "u2", "diagnostic"],
         "official_submission_eligible": False,
         "gpu_authorized_by_plan": False,
         "readiness": {str(p): sha(p) if p.exists() else None for p in external},
@@ -301,7 +320,9 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--plan-out", type=Path)
     parser.add_argument(
-        "--mode", choices=("exposure", "warmup_observer"), default="exposure"
+        "--mode",
+        choices=("exposure", "warmup_observer", "save_completion_observer"),
+        default="exposure",
     )
     args = parser.parse_args()
     plan = make_plan(args.out.resolve(), args.mode)

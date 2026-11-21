@@ -122,5 +122,28 @@
     "target_arrival_s": 240,
     "clock_contract": "prospective-coverage-7057415189",
     "accounting_schema": 1
+  },
+  "save_observer": {
+    "mode": "save_completion_observer",
+    "req_id": 130,
+    "max_generations": 8,
+    "ranks": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "worker_records": 256,
+    "worker_bytes": 131072,
+    "manager_records": 512,
+    "manager_bytes": 262144,
+    "workload_s": 1800,
+    "client_s": 900,
+    "evidence_s": 15,
+    "evidence_absolute_s": 1815
   }
 }

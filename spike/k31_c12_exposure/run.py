@@ -326,7 +326,84 @@ def profile_window(url, out, server_log, trace_root):
     return evidence
 
 
-def run_client(C, frozen, out, label, fd, track, check_deadline, observer=None):
+def scan_save_phases(clock, directory):
+    for path in (directory / "logs/aiperf.log", directory / "console.log"):
+        if not path.exists():
+            continue
+        for line in path.read_text(errors="replace").splitlines():
+            match = OBSERVER_PHASE.search(line)
+            if match and match[2] not in clock.phases:
+                stamp = re.match(r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+)", line)
+                clock.phases[match[2]] = {
+                    "phase_id": match[1],
+                    "observed_mono": time.monotonic(),
+                    "observed_wall": time.time(),
+                    "producer_timestamp_raw": stamp[1] if stamp else None,
+                    "producer_clock_assumption": "container local timezone",
+                    "source": str(path),
+                }
+
+
+def save_completion_receipt(clock, state, collect=True):
+    process = getattr(clock, "client_process", None)
+    result = {
+        "spawn_attempted": clock.client_spawn is not None,
+        "spawned": process is not None,
+        "pid": getattr(clock, "client_pid", None),
+        "spawn_return_mono": getattr(clock, "client_spawn_return", None),
+        "exit_code_at_stop": getattr(clock, "client_exit_at_stop", None),
+        "exit_code": process.poll() if process is not None else None,
+        "censored": getattr(clock, "client_censored", False),
+        "anchors": clock.anchors(),
+        "phase_observed": "profiling" in clock.phases,
+        "instrumented": True,
+        "performance_accepted": False,
+        "ledger": {
+            "available": False,
+            "terminal": None,
+            "reason": "not collected within grace",
+        },
+    }
+    state["save_observer_client"] = result
+    directory = getattr(clock, "client_directory", None)
+    if directory is not None and collect:
+        try:
+            scan_save_phases(clock, directory)
+            result["anchors"], result["phase_observed"] = (
+                clock.anchors(),
+                "profiling" in clock.phases,
+            )
+            result["ledger"] = observer_client_ledger(directory)
+        except (OSError, ValueError, TypeError) as error:
+            result["ledger"]["reason"] = type(error).__name__
+        save(directory / "client-result.json", result)
+
+
+def save_control(clock, out, frozen):
+    deadline = (
+        clock.grace_end()
+        if clock.reason is not None
+        else clock.launched + clock.config["evidence_absolute_s"]
+    )
+    path = out / "save-observer-control.json"
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(
+            {
+                "head": frozen["head"],
+                "evidence_end_mono": deadline,
+                "stop": clock.reason,
+                "launch_mono": clock.launched,
+            }
+        )
+        + "\n"
+    )
+    temporary.replace(path)
+
+
+def run_client(
+    C, frozen, out, label, fd, track, check_deadline, observer=None, save_clock=None
+):
     directory = out / label
     directory.mkdir()
     argv = frozen["client"] + ["--output-artifact-dir", str(directory)]
@@ -336,6 +413,11 @@ def run_client(C, frozen, out, label, fd, track, check_deadline, observer=None):
         observer.client_directory = directory
         observer.start_client(time.monotonic())
         if observer.reason:
+            return
+    if save_clock is not None:
+        save_clock.client_directory = directory
+        save_clock.start_client(time.monotonic())
+        if save_clock.reason:
             return
     try:
         process = C.spawn(
@@ -349,11 +431,26 @@ def run_client(C, frozen, out, label, fd, track, check_deadline, observer=None):
     except Exception as error:
         if observer:
             observer.latch("client-failure", time.monotonic(), type(error).__name__)
+        if save_clock is not None:
+            save_clock.latch("client-failure", time.monotonic(), type(error).__name__)
         raise
     if observer:
         observer.client_pid, observer.client_process = process.pid, process
         observer.client_spawn_return = time.monotonic()
     track(process)
+    if save_clock is not None:
+        save_clock.client_pid, save_clock.client_process = process.pid, process
+        save_clock.client_spawn_return = time.monotonic()
+        while process.poll() is None and save_clock.reason is None:
+            scan_save_phases(save_clock, directory)
+            check_deadline()
+            time.sleep(0.1)
+        save_clock.latch(
+            "invocation-end" if process.poll() == 0 else "client-failure",
+            time.monotonic(),
+            {"exit_code": process.poll()},
+        )
+        return
     if observer:
         while process.poll() is None and observer.reason is None:
             scan_observer_phases(observer, directory)
@@ -489,6 +586,8 @@ def capture_metadata(frozen, out):
         P["concurrency"],
         {"argv": frozen["server"], "environment": env},
     )
+    if frozen.get("mode") == "save_completion_observer":
+        config["validity"]["instrumented"] = True
     save(out / "installed-metadata-config.json", config)
     actual = {}
     for name, module, root, commit in (
@@ -611,7 +710,13 @@ def execute(frozen, plan_sha):
         from observe import StopState
 
         observer = StopState(frozen["protocol"]["observer"], launched)
-    limit = observer.config["workload_s"] if observer else P["workload_timeout_s"]
+    save_clock = None
+    if frozen["mode"] == "save_completion_observer":
+        from save_observe import SaveClock
+
+        save_clock = SaveClock(frozen["protocol"]["save_observer"], launched)
+    clock = observer or save_clock
+    limit = clock.config["workload_s"] if clock else P["workload_timeout_s"]
     deadline = launched + limit
 
     def track(process=None):
@@ -663,20 +768,42 @@ def execute(frozen, plan_sha):
             if p.poll() is not None
         ]
         if exited:
-            if observer:
-                observer.latch("native-failure", time.monotonic(), exited)
+            if clock:
+                clock.latch("native-failure", time.monotonic(), exited)
             raise RuntimeError("a persistent server exited")
         if observer:
             observer.check(observer_snapshots(out, frozen, observer), time.monotonic())
             if observer.reason:
                 raise RuntimeError(f"observer stopped: {observer.reason}")
+        if save_clock is not None:
+            from save_observe import reports
+
+            failures = {
+                name: v["native_failure"]
+                for name, v in reports(out, frozen).items()
+                if v.get("native_failure")
+            }
+            if failures:
+                save_clock.latch("native-failure", time.monotonic(), failures)
+                raise RuntimeError(
+                    "native save observation reports an existing failure"
+                )
+            if time.monotonic() >= save_clock.deadline():
+                save_clock.latch(
+                    "deadline", time.monotonic(), "absolute client/workload bound"
+                )
+                raise TimeoutError("save diagnostic absolute bound exceeded")
         if time.monotonic() >= deadline:
             raise TimeoutError("whole workload bound exceeded")
 
     def interrupt(signum, frame):
-        if observer:
-            observer.latch(
-                "deadline" if signum == signal.SIGALRM else "observer-failure",
+        if clock:
+            clock.latch(
+                (
+                    "deadline"
+                    if signum == signal.SIGALRM
+                    else ("signal" if save_clock else "observer-failure")
+                ),
                 time.monotonic(),
                 f"signal {signum}",
             )
@@ -690,19 +817,27 @@ def execute(frozen, plan_sha):
         # Cancellation must bypass request handlers that retry OSError.
         raise KeyboardInterrupt(f"signal {signum}")
 
-    if observer:
-        observer.on_stop = lambda: arm_evidence_deadline(observer)
-        observer.on_clock_change = lambda: signal.setitimer(
-            signal.ITIMER_REAL, max(0.001, observer.deadline() - time.monotonic())
+    if clock:
+
+        def on_stop():
+            arm_evidence_deadline(clock)
+            if save_clock is not None:
+                save_control(save_clock, out, frozen)
+
+        clock.on_stop = on_stop
+        clock.on_clock_change = lambda: signal.setitimer(
+            signal.ITIMER_REAL, max(0.001, clock.deadline() - time.monotonic())
         )
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGINT, interrupt)
     signal.signal(signal.SIGALRM, interrupt)
     signal.setitimer(
         signal.ITIMER_REAL,
-        max(0.001, (observer.deadline() if observer else deadline) - time.monotonic()),
+        max(0.001, (clock.deadline() if clock else deadline) - time.monotonic()),
     )
     try:
+        if save_clock is not None:
+            save_control(save_clock, out, frozen)
         state["before"] = C.assert_gpus_idle()
         state["admitted"] = True
         if PAUSE.exists():
@@ -779,9 +914,17 @@ def execute(frozen, plan_sha):
                 models = json.loads(request(f"http://127.0.0.1:{P['port']}/v1/models"))
                 if any(m["id"] == P["served_name"] for m in models["data"]):
                     snapshots = observer_snapshots(out, frozen) if observer else {}
-                    if not observer or (
-                        len(snapshots) == 8
-                        and all(v.get("ready") for v in snapshots.values())
+                    save_ready = True
+                    if save_clock is not None:
+                        from save_observe import reports, startup_ready
+
+                        save_ready = startup_ready(reports(out, frozen))
+                    if save_ready and (
+                        not observer
+                        or (
+                            len(snapshots) == 8
+                            and all(v.get("ready") for v in snapshots.values())
+                        )
                     ):
                         if observer and observer.check(snapshots, time.monotonic()):
                             raise RuntimeError("observer stopped at readiness boundary")
@@ -805,18 +948,34 @@ def execute(frozen, plan_sha):
         for label in frozen["invocations"]:
             metrics(out, f"before-{label}", state)
             try:
-                run_client(C, frozen, out, label, fd, track, check_deadline, observer)
+                run_client(
+                    C,
+                    frozen,
+                    out,
+                    label,
+                    fd,
+                    track,
+                    check_deadline,
+                    observer,
+                    save_clock,
+                )
             finally:
-                if not observer or observer.reason is None:
+                if clock is None or clock.reason is None:
                     metrics(out, f"after-{label}", state)
         state["state"] = (
             "COMPLETED"
             if not observer or observer.reason["reason"] == "full-bracket-completion"
             else "FAILED"
         )
+        if save_clock is not None:
+            state["state"] = (
+                "COMPLETED"
+                if save_clock.reason["reason"] == "invocation-end"
+                else "FAILED"
+            )
     except BaseException as error:
-        if observer:
-            observer.latch("observer-failure", time.monotonic(), type(error).__name__)
+        if clock:
+            clock.latch("observer-failure", time.monotonic(), type(error).__name__)
         else:
             logger.exception("Bounded workload failed")
         state["state"] = "FAILED"
@@ -825,6 +984,38 @@ def execute(frozen, plan_sha):
         try:
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             signal.signal(signal.SIGINT, signal.SIG_IGN)
+            if save_clock is not None:
+                try:
+                    save_clock.latch(
+                        "observer-failure", time.monotonic(), state["errors"]
+                    )
+                    state.update(
+                        mode="save_completion_observer",
+                        performance_accepted=False,
+                        save_observer_stop=save_clock.reason,
+                        save_observer_clocks=save_clock.anchors(),
+                    )
+                    save_completion_receipt(
+                        save_clock, state, time.monotonic() < save_clock.grace_end()
+                    )
+                    from save_observe import summarize
+
+                    while time.monotonic() < save_clock.grace_end():
+                        summary = summarize(out, frozen)
+                        state["save_observer_summary"] = {
+                            "join_available": summary["join_available"],
+                            "complete_chains": summary["complete_chains"],
+                            "generations": list(summary["generations"]),
+                            "incomplete": summary["incomplete"],
+                        }
+                        time.sleep(
+                            max(0, min(0.1, save_clock.grace_end() - time.monotonic()))
+                        )
+                except EvidenceDeadline:
+                    state["evidence_deadline_reached"] = True
+                # Evidence failure must still reach owned cleanup.
+                except Exception as error:  # noqa: BLE001
+                    state["errors"].append(f"save evidence grace: {error!r}")
             if observer:
                 try:
                     observer.latch(
@@ -916,6 +1107,11 @@ def execute(frozen, plan_sha):
                     state["cleanup_error"] = repr(error)
                 state["gpu_released"] = released
                 state["finished"] = time.time()
+                if save_clock is not None:
+                    process = getattr(save_clock, "client_process", None)
+                    state.setdefault("save_observer_client", {})[
+                        "exit_code_after_cleanup"
+                    ] = (process.poll() if process is not None else None)
                 if observer:
                     process = getattr(observer, "client_process", None)
                     state.setdefault("observer_client", {})[

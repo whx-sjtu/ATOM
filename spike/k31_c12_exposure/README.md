@@ -126,3 +126,50 @@ the native ModelRunner constructor/setup call. Explicit fixtures replace externa
 kernels, device/PG/Event/exporter, model construction and IO queues; all8 distinct
 workers must publish source-bound hook receipts while CUDA/distributed remain
 uninitialized. This is wiring qualification only, never GPU readiness.
+
+## Native save completion observation
+
+Freeze a separate plan with --mode save_completion_observer. It uses the existing
+execute/--run-plan ownership lifecycle and one first-client-equivalent invocation.
+Only serving processes receive K31_SAVE_OBSERVER_PLAN and the passive shim.
+The indexer observer, GPU markers, FlightRecorder calls and profiler controls are
+inactive. Client, LMCache and metadata roles retain ordinary environments.
+
+The selector is logical request 130 and its actual generations, capped at eight.
+Generation 340 and cross-run input correspondence are never assumed. Native
+submission, future queries/results, existing aggregation and settlement calls keep
+their original arguments, results, exceptions and order. In particular, the
+installed result(timeout=0) path keeps its existing event synchronization; the
+observer adds none. The raw/event query scope excludes adapter housekeeping for
+other outstanding futures.
+
+Source-bound constructor receipts identify EngineCore/manager and eight workers
+before traffic. Diagnostic ordinals count existing broadcasts/executions under
+the native sole-outstanding/FIFO contract. Consumed and newly started snapshots
+remain distinct. Queue reads are observed where native code consumes them; no
+payload or wire identifier is added.
+
+Each role writes one capped JSON snapshot containing bounded transition records,
+coalesced scalar first/last/count summaries and current/previous aggregation state.
+Repeated false queries do not append trace rows or perform file writes. Publication
+uses existing aggregation/startup/failure boundaries. Worker records are capped at
+256/128KiB each; the manager at 512/256KiB, for 1.25MiB of retained role payload.
+In-place writes keep no duplicate temporary payload; interrupted or failed writes
+are unavailable. Overflow is explicit and never adds a workload stop or retry.
+Recorder-owned cost counters exclude native calls, overlap and omit their own
+publication tail; cumulative I/O bytes are separate from the retained payload cap.
+
+The supervisor preserves metadata60s, existing readiness900s and the client120s
+profiling phase with ordinary warmup/seed/grace. Its independent bounds are
+min(C+900,L+1800) for the client and L+1800 for the workload. No readiness,
+selection or generation resets them. Normal invocation end, existing failure,
+signal or deadline latches once. Collection ends at min(stop+15,L+1815), then
+the existing TERM15/KILL15 and retained-lock release checks apply. Native
+worker30s plus scheduler10s remain unchanged. Partial records, native settlement
+and client cancellations remain distinct.
+
+After owned release, run save_observe.py <run> --report-out <new-evidence-file>
+through the CPU guard. This narrow reducer reports keyed chains and missing joins;
+it never constructs an exposure/performance bundle. Missing activation, overflow,
+request absence, semantic mismatch or ordinal/generation disagreement is
+inconclusive. Source/plan review and a fresh root lease remain mandatory.
