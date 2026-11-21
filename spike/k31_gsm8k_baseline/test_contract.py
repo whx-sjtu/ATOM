@@ -217,6 +217,7 @@ def test_low_score_is_complete_and_first_valid_is_sticky(evidence, tmp_path):
 
 @pytest.mark.parametrize("fault", ["status_write", "missing_cards", "owned_kfd"])
 def test_cleanup_keeps_lock_until_durable_release(monkeypatch, tmp_path, fault):
+    monkeypatch.setattr(run, "cache_inventory", lambda attempt: {})
     state = {"attempt": "independent-001", "outcome": "COMPLETE"}
     closed, checks = [], []
     real_save = run.save
@@ -266,7 +267,8 @@ def test_cleanup_keeps_lock_until_durable_release(monkeypatch, tmp_path, fault):
     assert (state["outcome"] == "EXECUTION_INVALID") == (fault == "status_write")
 
 
-def test_owned_pid_birth_cancel_and_early_exit(tmp_path):
+def test_owned_pid_birth_cancel_and_early_exit(tmp_path, monkeypatch):
+    monkeypatch.setattr(run, "cache_inventory", lambda attempt: {})
     common = verify.dependency("common.py")
     owned = run.owned_type()(common)
 
@@ -275,6 +277,15 @@ def test_owned_pid_birth_cancel_and_early_exit(tmp_path):
         return common.spawn(command, **kwargs)
 
     resources = SimpleNamespace(spawn=spawn)
+    fd = common.GpuLock(path=str(tmp_path / "cpu.lock")).acquire()
+    release = SimpleNamespace(
+        wait_gpus_released=lambda **kwargs: (
+            True,
+            {"cards": {str(i): {"used_gib": 0} for i in range(8)}, "kfd_pids": []},
+        )
+    )
+    monkeypatch.setattr(run.signal, "signal", lambda *args: None)
+    monkeypatch.setattr(run.signal, "setitimer", lambda *args: None)
     child = run.launch(
         owned,
         resources,
@@ -282,7 +293,7 @@ def test_owned_pid_birth_cancel_and_early_exit(tmp_path):
         os.environ.copy(),
         tmp_path,
         "child",
-        None,
+        fd,
     )
     born = owned.seen[child.pid]
     try:
@@ -295,8 +306,19 @@ def test_owned_pid_birth_cancel_and_early_exit(tmp_path):
             try:
                 raise KeyboardInterrupt("cancellation")
             finally:
-                owned.stop()
+                run.finish(
+                    owned,
+                    release,
+                    fd,
+                    tmp_path,
+                    {"attempt": "independent-001", "outcome": "EXECUTION_INVALID"},
+                )
         assert child.wait(timeout=1) != 0 and not owned.live()
+        assert json.loads((tmp_path / "controller.json").read_text())["cleanup"][
+            "released"
+        ]
+        with pytest.raises(OSError):
+            os.fstat(fd)
         with pytest.raises(RuntimeError, match="exited early"):
             run.wait_until(owned, lambda: True, time.monotonic() + 1)
     finally:
