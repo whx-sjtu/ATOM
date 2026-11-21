@@ -700,7 +700,7 @@ def execute(frozen, plan_sha):
     signal.signal(signal.SIGALRM, interrupt)
     signal.setitimer(
         signal.ITIMER_REAL,
-        max(0.001, observer.deadline() - time.monotonic()) if observer else limit,
+        max(0.001, (observer.deadline() if observer else deadline) - time.monotonic()),
     )
     try:
         state["before"] = C.assert_gpus_idle()

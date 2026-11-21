@@ -1229,6 +1229,68 @@ def test_clock_callbacks_rearm_remaining_bounds_and_no_late_restart(monkeypatch)
     assert len(calls) == count
 
 
+@pytest.mark.parametrize(
+    "mode,delay,budget",
+    [
+        ("exposure", 0, 3600),
+        ("exposure", 120, 3600),
+        ("exposure", 3601, 3600),
+        ("warmup_observer", 0, 900),
+        ("warmup_observer", 120, 900),
+    ],
+)
+def test_initial_alarm_preserves_absolute_deadline(
+    tmp_path, monkeypatch, mode, delay, budget
+):
+    import signal
+
+    import run
+
+    class AlarmCaptured(Exception):
+        pass
+
+    now = [100.0]
+    frozen = {
+        "head": "cpu-fixture",
+        "output": str(tmp_path / "run"),
+        "mode": mode,
+        "protocol": P,
+    }
+    for name in ("runtime-ready", "dataset-ready"):
+        (tmp_path / f"{name}.json").write_text('{"ready": true}')
+    lifecycle = NS(GpuLock=lambda path: NS(acquire=lambda: -1))
+    monkeypatch.setattr(run, "PRIVATE", tmp_path)
+    monkeypatch.setattr(run, "make_plan", lambda *args: frozen)
+    monkeypatch.setattr(run, "git", lambda *args: "")
+    monkeypatch.setenv("K31_TASK6_GPU_GRANT", frozen["head"])
+    monkeypatch.setenv("K31_TASK6_PLAN_SHA", "cpu-fixture")
+    monkeypatch.setenv("KFD_GUARD_LOG", "")
+    monkeypatch.setattr(run.os, "nice", lambda increment: 0)
+    monkeypatch.setattr(
+        run.importlib.util,
+        "spec_from_file_location",
+        lambda *args: NS(loader=NS(exec_module=lambda module: None)),
+    )
+    monkeypatch.setattr(run.importlib.util, "module_from_spec", lambda spec: lifecycle)
+    monkeypatch.setattr(run.time, "monotonic", lambda: now[0])
+
+    def install(signum, handler):
+        if signum == signal.SIGTERM:
+            now[0] += delay
+
+    durations = []
+
+    def arm(which, seconds):
+        durations.append(seconds)
+        raise AlarmCaptured()
+
+    monkeypatch.setattr(run.signal, "signal", install)
+    monkeypatch.setattr(run.signal, "setitimer", arm)
+    with pytest.raises(AlarmCaptured):
+        run.execute(frozen, "cpu-fixture")
+    assert durations == [max(0.001, budget - delay)]
+
+
 # The probe below is opt-in and runs as a separate guarded process, never during
 # test collection. No install()/patch() calls: sitecustomize performs registration.
 class ModelBoundary(Exception):
