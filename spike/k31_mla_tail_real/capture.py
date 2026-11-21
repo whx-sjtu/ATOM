@@ -192,6 +192,16 @@ def validate_snapshot(snapshot, **kwargs):
     }
 
 
+def invalid_context(ctx):
+    # Class defaults cannot certify missing per-invocation identity.
+    fields = getattr(ctx, "__dict__", {})
+    return (
+        fields.get("is_dummy_run") is not False
+        or fields.get("scheduled_bs") != 1
+        or fields.get("scheduled_tokens") != ROWS
+    )
+
+
 def inherited(name, namespace, *, nested=False):
     """Reuse the pinned routing or driver body with explicit local bindings."""
     path = PRIVATE / "deps/task15/capture.py"
@@ -215,6 +225,7 @@ def inherited(name, namespace, *, nested=False):
         "k31-k2-front-capture": "k31-mla-tail-real",
         "capture graph did not contain exactly one selected K2": "capture graph did not contain exactly one selected MLA",
     }
+    context_bindings = 0
     for item in ast.walk(node):
         if (
             isinstance(item, ast.Constant)
@@ -222,7 +233,20 @@ def inherited(name, namespace, *, nested=False):
             and item.value in substitutions
         ):
             item.value = substitutions[item.value]
-    exec(  # noqa: S102 - pinned body and explicit literal rebinding
+        if (
+            isinstance(item, ast.Call)
+            and isinstance(item.func, ast.Name)
+            and item.func.id == "getattr"
+            and len(item.args) == 3
+            and isinstance(item.args[1], ast.Constant)
+            and item.args[1].value == "is_dummy"
+        ):
+            item.func.id = "invalid_context"
+            item.args = item.args[:1]
+            context_bindings += 1
+    if name == "replay":
+        assert nested and context_bindings == 1, "current Context guard was not rebound"
+    exec(  # noqa: S102 - pinned body and explicit local bindings
         compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace
     )
     return namespace[name]
@@ -406,6 +430,8 @@ def install(plan):
             and key == ROUTE["target"]
             and phase is None
         ):
+            if invalid_context(ROUTE["get_forward_context"]().context):
+                raise RuntimeError("selected graph is not the declared real invocation")
             buffers = controller.model_runner.forward_vars
             ids, positions = (
                 buffers["input_ids"].gpu[:ROWS],
@@ -502,6 +528,7 @@ def worker(plan, path):
 def cpu_checks():
     """Controlled CPU tensors and native wrapper bodies; never real model evidence."""
     import copy
+    from dataclasses import dataclass
     from tempfile import TemporaryDirectory
     from types import SimpleNamespace as NS
     from unittest.mock import patch
@@ -709,7 +736,34 @@ def cpu_checks():
             assert "Tensor" not in str(tree)
     with TemporaryDirectory() as directory:
         graph, calls = object(), []
-        context = NS(context=NS(is_dummy=False, scheduled_bs=1, scheduled_tokens=ROWS))
+        context_path = ROOT / "atom/utils/forward_context.py"
+        context_class = next(
+            n
+            for n in ast.parse(context_path.read_text()).body
+            if isinstance(n, ast.ClassDef) and n.name == "Context"
+        )
+        context_scope = {"torch": torch, "dataclass": dataclass, "__name__": __name__}
+        context_module = ast.Module(
+            body=[
+                ast.ImportFrom(
+                    module="__future__", names=[ast.alias(name="annotations")], level=0
+                ),
+                context_class,
+            ],
+            type_ignores=[],
+        )
+        exec(  # noqa: S102 - actual Context class under CPU torch
+            compile(
+                ast.fix_missing_locations(context_module), str(context_path), "exec"
+            ),
+            context_scope,
+        )
+        current_context = context_scope["Context"]
+        context = NS(
+            context=current_context(
+                tensors["positions"], scheduled_bs=1, scheduled_tokens=ROWS
+            )
+        )
         original_replay = lambda *a, **kw: calls.append(kw.get("phase"))
         route = dict(
             globals(),
@@ -739,8 +793,72 @@ def cpu_checks():
             patch.object(CAP, "_backend", lambda: NS(WORDS=8, ARMED=0)),
             patch.object(torch.cuda, "synchronize", lambda: None),
         ):
+            context_rejections = []
+            for case in (
+                "dummy_run",
+                "missing_dummy_marker",
+                "unknown_dummy_marker",
+                "missing_scheduled_bs",
+                "missing_scheduled_tokens",
+                "missing_context",
+            ):
+                context.context = current_context(
+                    tensors["positions"],
+                    is_dummy_run=case == "dummy_run",
+                    scheduled_bs=1,
+                    scheduled_tokens=ROWS,
+                )
+                assert "is_dummy_run" in vars(context.context) and not hasattr(
+                    context.context, "is_dummy"
+                )
+                if case == "missing_dummy_marker":
+                    del context.context.is_dummy_run
+                elif case == "unknown_dummy_marker":
+                    context.context.is_dummy_run = None
+                elif case.startswith("missing_scheduled_"):
+                    delattr(context.context, case.removeprefix("missing_"))
+                elif case == "missing_context":
+                    context.context = None
+                try:
+                    scope["replay"](graph, key=(1, 4))
+                except RuntimeError:
+                    context_rejections.append(case)
+                else:
+                    raise AssertionError(
+                        f"{case} accepted: ordinal={controller.replay_ordinal}, pending={controller.pending}, witness={route['_WITNESS']}"
+                    )
+                assert (
+                    not calls
+                    and controller.replay_ordinal == 0
+                    and not controller.pending
+                )
+                assert (
+                    route["_WITNESS"] is None
+                    and controller.selected is None
+                    and not bool(controller.state.any())
+                )
+            context.context = current_context(
+                tensors["positions"],
+                is_dummy_run=False,
+                scheduled_bs=1,
+                scheduled_tokens=ROWS,
+            )
             scope["replay"](graph, key=(1, 4))
             assert controller.pending and route["_WITNESS"]["replay_ordinal"] == 1
+            identity_before = dict(controller.meta["identity"])
+            state_before = controller.state.clone()
+            context.context.is_dummy_run = True
+            try:
+                scope["replay"](graph, key=(1, 4))
+            except RuntimeError:
+                context_rejections.append("armed_dummy_run")
+            else:
+                raise AssertionError("armed capture accepted a dummy context")
+            assert controller.pending and controller.replay_ordinal == 1
+            assert controller.selected is None and calls == [None]
+            assert controller.meta["identity"] == identity_before
+            assert torch.equal(controller.state, state_before)
+            context.context.is_dummy_run = False
             tensors["input_ids"].add_(10)
             tensors["positions"].add_(4)
             scope["replay"](graph, key=(1, 4))
@@ -756,6 +874,7 @@ def cpu_checks():
     return {
         "controlled_cpu_only": True,
         "snapshot_negative_controls": failures,
+        "actual_context_rejections": context_rejections,
         "actual_wrapper_bodies": [
             "raw entry",
             "gate exit",
