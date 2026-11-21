@@ -585,6 +585,7 @@ def finalize_evidence(out, state, deadline):
     outcome = state.get("execution_outcome", state["outcome"])
     state.update(execution_outcome=outcome, outcome="PENDING_VERIFICATION")
     marker = out / "pending-verification.json"
+    sealed = False
     try:
         save(marker, {"head": state.get("head"), "execution_outcome": outcome})
         save(out / "controller.json", state)
@@ -609,6 +610,7 @@ def finalize_evidence(out, state, deadline):
         state["outcome"] = outcome
         save(out / "controller.json", state)
         seal_registry(state, out)
+        sealed = True
         marker.unlink()
         directory = os.open(out, os.O_DIRECTORY)
         try:
@@ -616,8 +618,14 @@ def finalize_evidence(out, state, deadline):
         finally:
             os.close(directory)
     except BaseException:
-        state["outcome"] = "PENDING_VERIFICATION"
-        logger.exception("Evidence remains pending; recover this same attempt offline")
+        if sealed and not marker.exists():
+            state["outcome"] = outcome
+            logger.exception("Evidence and registry are durable; marker cleanup failed")
+        else:
+            state["outcome"] = "PENDING_VERIFICATION"
+            logger.exception(
+                "Evidence remains pending; recover this same attempt offline"
+            )
         raise
     finally:
         cancel_alarm()
@@ -651,6 +659,7 @@ def recover_evidence(output):
             or not release["cleanup"]["released"]
         ):
             raise ValueError("recovery source/plan/release identity mismatch")
+        already_sealed = False
         if plan["attempt"].startswith("author-"):
             registry = json.loads((PRIVATE / "attempts.json").read_text())
             entry = next(row for row in registry if row["attempt"] == plan["attempt"])
@@ -659,7 +668,7 @@ def recover_evidence(output):
                 and not (out / "pending-verification.json").exists()
                 and entry.get("status_sha256") == sha(out / "controller.json")
             ):
-                raise ValueError("attempt already sealed; keep its canonical evidence")
+                already_sealed = True
         state = (
             json.loads((out / "controller.json").read_text())
             if (out / "controller.json").exists()
@@ -682,7 +691,15 @@ def recover_evidence(output):
             )
             if recovered != state["evidence"]:
                 raise ValueError("scored evidence changed; preserve this attempt")
-        finalize_evidence(out, state, deadline)
+        if already_sealed:
+            # Retry only the directory sync; the immutable answer/registry bytes stay put.
+            directory = os.open(out, os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        else:
+            finalize_evidence(out, state, deadline)
         return {
             "attempt": state["attempt"],
             "outcome": state["outcome"],

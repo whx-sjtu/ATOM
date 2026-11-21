@@ -54,8 +54,11 @@ no GPU result or quality score.
 The entry deadline covers plan hashes, cache inventory and admission. Cleanup writes
 an immutable `release.json` before unlocking. Bulk artifact hashes and registry
 finalization then run on CPU112-127 at nice19, without querying GPU state again.
-A failure there leaves the attempt pending verification and blocks selection or a
-later author run. From the same clean experimental head, use the CPU guard with
+An unfinished evidence commit blocks selection or a later author run. Once the
+controller and registry are durable and the marker is removed, a marker-directory
+sync error is surfaced with the completed outcome. Critical durability errors
+still keep the pending gate. From the same clean experimental head, use the CPU guard with
 `run.py --finalize <attempt output>` to recover its evidence within a bounded CPU
-operation. Recovery reuses the original answers and release proof; it launches no
-model and cannot replace a valid low score with a later result.
+operation. Recovery reuses the original answers and release proof; an already
+sealed attempt only retries the directory sync. It launches no model, does not
+rewrite sealed answers and cannot replace a valid low score with a later result.

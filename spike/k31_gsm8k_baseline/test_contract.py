@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -402,8 +403,11 @@ def test_release_io_timeout_preserves_lock_until_retry(tmp_path, monkeypatch, bl
             pass
 
 
+@pytest.mark.parametrize(
+    "failure", ["registry", "registry_directory", "marker_directory"]
+)
 def test_registry_failure_is_pending_and_recovers_same_low_attempt(
-    evidence, tmp_path, monkeypatch
+    evidence, tmp_path, monkeypatch, failure
 ):
     expected, _, _, seal = evidence
     original = seal()
@@ -471,15 +475,43 @@ def test_registry_failure_is_pending_and_recovers_same_low_attempt(
         assert json.loads((out / "release.json").read_text())["cleanup"]["released"]
         raise OSError("injected post-release registry failure")
 
-    monkeypatch.setattr(run, "seal_registry", fail_seal)
+    real_fsync = os.fsync
+    marker = out / "pending-verification.json"
+
+    def fail_sync(fd):
+        info = os.fstat(fd)
+        if stat.S_ISDIR(info.st_mode):
+            if failure == "marker_directory" and not marker.exists():
+                raise OSError("marker cleanup fsync failure")
+            if (
+                failure == "registry_directory"
+                and info.st_ino == tmp_path.stat().st_ino
+                and "status_sha256"
+                in json.loads((tmp_path / "attempts.json").read_text())[0]
+            ):
+                raise OSError("critical registry fsync failure")
+        return real_fsync(fd)
+
+    if failure == "registry":
+        monkeypatch.setattr(run, "seal_registry", fail_seal)
+    else:
+        monkeypatch.setattr(run.os, "fsync", fail_sync)
     handlers = {sig: signal.getsignal(sig) for sig in run.STOP}
     try:
         with pytest.raises(OSError):
             run.finalize_evidence(out, state, time.monotonic() + 10)
-        assert state["outcome"] == "PENDING_VERIFICATION"
-        with pytest.raises(ValueError, match="pending verification"):
-            verify.first_valid(registry, expected)
+        actual_registry = json.loads((tmp_path / "attempts.json").read_text())
+        if failure == "marker_directory":
+            assert state["outcome"] == "COMPLETE"
+            assert (
+                verify.first_valid(actual_registry, expected)["attempt"] == "author-001"
+            )
+        else:
+            assert state["outcome"] == "PENDING_VERIFICATION"
+            with pytest.raises(ValueError, match="pending verification"):
+                verify.first_valid(actual_registry, expected)
         monkeypatch.setattr(run, "seal_registry", real_seal)
+        monkeypatch.setattr(run.os, "fsync", real_fsync)
         result = run.recover_evidence(out)
         assert result == {
             "attempt": "author-001",
@@ -494,6 +526,11 @@ def test_registry_failure_is_pending_and_recovers_same_low_attempt(
             and chosen["score"]["quality_floor"] == "FAIL"
         )
         assert chosen["score"]["correct"]["flexible-extract"] == 0
+        preserved = {
+            name: verify.sha(out / name) for name in ("controller.json", "release.json")
+        }
+        assert run.recover_evidence(out) == result
+        assert preserved == {name: verify.sha(out / name) for name in preserved}
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         for sig, handler in handlers.items():
