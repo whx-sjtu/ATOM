@@ -70,8 +70,8 @@ reachable Apport, user hooks and altered exception/tracing behavior fail closed.
 `--startup-check <receipt>` is a guarded CPU helper with no target-runtime imports
 or device discovery; full runtime/hardware checks remain in leased startup.
 
-Keep the sealed invalid `author-001`, `author-002`, `author-003` and `author-004` records intact.
-CPU checks for the prospective next attempt use `K31_TASK10_CPU_ATTEMPT=author-005`; preparing that namespace does not
+Keep the sealed invalid `author-001`, `author-002`, `author-003`, `author-004` and `author-005` records intact.
+CPU checks for the prospective next attempt use `K31_TASK10_CPU_ATTEMPT=author-006`; preparing that namespace does not
 consume a lease or select A0. A new independently qualified head/plan and root grant
 are required before its existing `--run` entry may execute.
 
@@ -109,3 +109,10 @@ HOME, source and cache namespaces keep their declared paths. A guarded fresh CPU
 child executes both pinned production UUID IPC generators and proves real ZeroMQ
 bind/connect and bidirectional delivery before freezing. The plan requires its
 exact TMPDIR-bound witness; fallback or stale qualification refuses preflight.
+
+The pinned setproctitle dependency receives `SPT_NOENV=1` before import. Its
+documented mode preserves procfs environment visibility while keeping ordinary
+process names. The real CPU setup-route checks compare Python/libc values with
+external procfs before/after title changes; actual overrides and forbidden
+acceptance remain rejected by the unchanged process checker. Author-005 has no
+internal environment witness, so the CPU reproduction does not rewrite its state.

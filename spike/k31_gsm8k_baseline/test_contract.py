@@ -1077,3 +1077,149 @@ print('IPC_PLAN_REFUSED')
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "IPC_PLAN_REFUSED" in result.stdout
+
+
+@pytest.mark.parametrize("case", ["baseline", "planned", "override", "forbidden"])
+def test_whole_enginecore_title_route_preserves_observation(
+    tmp_path, monkeypatch, case
+):
+    monkeypatch.setattr(run, "PRIVATE", tmp_path)
+    common = verify.dependency("common.py")
+    owned = run.owned_type()(common)
+    script = tmp_path / "title_child.py"
+    script.write_text(r"""
+import ast, ctypes, importlib.util, json, logging, multiprocessing, os, signal, sys, time, types
+from pathlib import Path
+root = Path(sys.argv[1]); setup = json.loads((root/'input.json').read_text())
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name,path)
+    module = importlib.util.module_from_spec(spec); sys.modules[name] = module
+    spec.loader.exec_module(module); return module
+# Resolve only the real pure CPU helpers; inference package initializers are not imported.
+package = types.ModuleType('atom'); package.__path__ = []
+utils = types.ModuleType('atom.utils'); utils.__path__ = []; package.utils = utils
+sys.modules['atom'] = package; sys.modules['atom.utils'] = utils
+base = Path(setup['root'])
+utils.envs = load('atom.utils.envs',base/'atom/utils/envs.py')
+gc = load('atom.utils.gc_utils',base/'atom/utils/gc_utils.py')
+source = base/'atom/utils/__init__.py'
+nodes = [n for n in ast.parse(source.read_text()).body if isinstance(n,ast.FunctionDef)
+         and n.name in ('set_process_title','engine_process_name','enable_orphan_reaping')]
+scope = {'os':os,'sys':sys,'signal':signal,'multiprocessing':multiprocessing,
+         'logger':logging.getLogger('atom'),'EngineCore':type('EngineCore',(),{}),
+         'tune_gc':gc.tune_gc,'maybe_attach_gc_debug_callback':gc.maybe_attach_gc_debug_callback}
+exec(compile(ast.Module(body=nodes,type_ignores=[]),str(source),'exec'),scope)
+utils.enable_orphan_reaping = scope['enable_orphan_reaping']
+source = base/'atom/model_engine/engine_core.py'
+method = next(n for n in ast.walk(ast.parse(source.read_text()))
+              if isinstance(n,ast.FunctionDef) and n.name=='_setup_engine_process')
+exec(compile(ast.Module(body=[method],type_ignores=[]),str(source),'exec'),scope)
+scope['EngineCore']._setup_engine_process = scope['_setup_engine_process']
+config = types.SimpleNamespace(pipeline_parallel_size=1,
+         parallel_config=types.SimpleNamespace(data_parallel_size=1,data_parallel_rank=0,pipeline_parallel_rank=0))
+libc = ctypes.CDLL(None); libc.getenv.argtypes = [ctypes.c_char_p]; libc.getenv.restype = ctypes.c_char_p
+keys = setup['keys']
+def witness(phase):
+    c_values = {}
+    for key in keys:
+        value = libc.getenv(key.encode()); c_values[key] = None if value is None else value.decode()
+    data = {'pid':os.getpid(),'python':{k:os.environ.get(k) for k in keys},'libc':c_values,
+            'target_modules':[n for n in sys.modules if n=='torch' or n.startswith(('torch.','aiter','atom.models','atom.model_engine'))]}
+    temporary = root/(phase+'.tmp'); temporary.write_text(json.dumps(data)); temporary.replace(root/(phase+'.json'))
+witness('before')
+while not (root/'go').exists(): time.sleep(0.005)
+scope['EngineCore']._setup_engine_process(scope['engine_process_name'](config))
+assert scope['EngineCore']._process_name == 'EngineCore'
+witness('after')
+while not (root/'exit').exists(): time.sleep(0.005)
+""")
+    expected = run.environment("author-006")
+    if case == "baseline":
+        expected.pop("SPT_NOENV", None)
+    actual = dict(expected)
+    if case == "override":
+        actual["ATOM_ENABLE_RELAXED_MTP"] = "1"
+    if case == "forbidden":
+        actual["SPEC_DECODE_ACCEPTANCE_LENGTH"] = "8"
+    keys = sorted(
+        set(expected)
+        | ({"SPEC_DECODE_ACCEPTANCE_LENGTH"} if case == "forbidden" else set())
+    )
+    (tmp_path / "input.json").write_text(
+        json.dumps({"root": str(run.ROOT), "keys": keys})
+    )
+    actual.update(
+        {k: os.environ[k] for k in ("LD_PRELOAD", "KFD_GUARD_LOG") if k in os.environ}
+    )
+    for name, digest in run.P["process_environment"]["sources"].items():
+        assert verify.sha(run.ROOT / name) == digest
+    command = [run.P["python"], "-B", str(script), str(tmp_path)]
+    child = common.spawn(
+        command,
+        env=actual,
+        cwd=run.ROOT,
+        log_path=tmp_path / "child.log",
+        cpus="112-127",
+    )
+    owned.add(child)
+    try:
+        run.wait_until(
+            owned, lambda: (tmp_path / "before.json").exists(), time.monotonic() + 10
+        )
+        proc = owned.psutil.Process(child.pid)
+        before = json.loads((tmp_path / "before.json").read_text())
+        before_external = {k: proc.environ().get(k) for k in keys}
+        assert before["python"] == before["libc"] == before_external
+        (tmp_path / "go").touch()
+        run.wait_until(
+            owned, lambda: (tmp_path / "after.json").exists(), time.monotonic() + 10
+        )
+        after = json.loads((tmp_path / "after.json").read_text())
+        after_external = {k: proc.environ().get(k) for k in keys}
+        assert after["python"] == after["libc"] == before["python"]
+        assert not before["target_modules"] and not after["target_modules"]
+        assert proc.cmdline()[0] == "ATOM::EngineCore"
+        plan = {
+            "attempt": "author-006",
+            "environment": expected,
+            "commands": {"server": command},
+        }
+        receipt = tmp_path / "processes.json"
+        if case == "planned":
+            assert after_external == after["python"]
+            assert run.process_receipt(owned, plan, receipt)[0]["role"] == "unchanged"
+        else:
+            with pytest.raises(ValueError):
+                run.process_receipt(owned, plan, receipt)
+            refused = next(
+                row for row in json.loads(receipt.read_text()) if "refusal" in row
+            )
+            if case == "baseline":
+                assert all(value is None for value in after_external.values())
+            else:
+                assert after_external == after["python"]
+                key = (
+                    "ATOM_ENABLE_RELAXED_MTP"
+                    if case == "override"
+                    else "SPEC_DECODE_ACCEPTANCE_LENGTH"
+                )
+                assert key in refused["mismatch_keys"]
+        (tmp_path / "combined.json").write_text(
+            json.dumps(
+                {
+                    "before_internal": before,
+                    "before_external": before_external,
+                    "after_internal": after,
+                    "after_external": after_external,
+                    "cmdline": proc.cmdline(),
+                    "comm": proc.name(),
+                    "case": case,
+                },
+                indent=2,
+            )
+        )
+        (tmp_path / "exit").touch()
+        assert child.wait(timeout=2) == 0
+    finally:
+        owned.stop()
+        assert not owned.live()

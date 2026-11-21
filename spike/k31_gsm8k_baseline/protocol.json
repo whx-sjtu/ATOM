@@ -140,7 +140,8 @@
     "ATOM_STATE_CHECKPOINT_DEMAND": "1",
     "LMCACHE_CHUNK_SIZE": "512",
     "ATOM_ENABLE_RELAXED_MTP": "0",
-    "ATOM_SPEC_LOSSLESS_SAMPLING": "0"
+    "ATOM_SPEC_LOSSLESS_SAMPLING": "0",
+    "SPT_NOENV": "1"
   },
   "preparation_inputs": {
     "cache_receipt": {
@@ -207,7 +208,16 @@
       "/usr/lib/python3.12/multiprocessing/resource_tracker.py": "b0099f5e2285fe2462b77c47bbf29220b57c778741a34f386c10c1e9940884c8",
       "/usr/lib/python3.12/multiprocessing/spawn.py": "ebf9fa40eb622384c37690d8c78e7208744df031155ab4ceedab0fc791a1669b",
       "/usr/lib/python3.12/multiprocessing/popen_spawn_posix.py": "97b5d25aa479516894489877e6a7921252ee35f51e118c2f1f91f32919e7caa8",
-      "/usr/lib/python3.12/multiprocessing/util.py": "6752c4515ec69f82e9df64e017da490c3754e51d818c270ea1ad2d64e09268be"
+      "/usr/lib/python3.12/multiprocessing/util.py": "6752c4515ec69f82e9df64e017da490c3754e51d818c270ea1ad2d64e09268be",
+      "atom/utils/__init__.py": "da5dcf1fc3871c459f5d7de8e78bd0e0da878167730a57970f7ea59c8a8e1fb6",
+      "atom/utils/envs.py": "ad042726fc08b059da2b34078971b733ffbe7b31debab1b40d1fbbdd50a4e3ac",
+      "atom/utils/gc_utils.py": "f3e2a11fe04145be054ccbeea4d013a95237cf24147755e2b0481cdda0440db7",
+      "atom/model_engine/engine_core.py": "dc83899827b2f0536d8ad7515d1da77408b30b87187784ed8a5bef62875c1880",
+      "atom/model_engine/async_proc.py": "f41048e964792f5bf65b394ef1290595133582e18dcfd3591d828f3828925d0e",
+      "/opt/venv/lib/python3.12/site-packages/setproctitle/__init__.py": "f198d6dafafc5c67df9c9fab747312281c36204c88ceef03d61bfdec413be330",
+      "/opt/venv/lib/python3.12/site-packages/setproctitle/_setproctitle.cpython-312-x86_64-linux-gnu.so": "cd224a2b9ff6a489260fb910c713dc92c9c155c98fdbd636a94dac386c04768e",
+      "/opt/venv/lib/python3.12/site-packages/setproctitle-1.3.8.dist-info/METADATA": "8093ff8af9357364b865abc215932a8e19f8e139007ba9516cde5331d526d281",
+      "/opt/venv/lib/python3.12/site-packages/setproctitle-1.3.8.dist-info/RECORD": "afe89764543fe45c649d1d46d4209d5deb93c607dca5f9a4fe5091f9c9ea3f9b"
     }
   },
   "namespace_dir": "namespaces/deepgemm-opus-qualified",
