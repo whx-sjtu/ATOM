@@ -31,9 +31,11 @@ op_tests/test_gemm_a4w4.py -d bf16 -mnk 2048,8192,8192 -mnk_splitk
 ```
 
 Set `PYTHONPATH` to the exact ATOM checkout followed by the pinned AITER root
-and `/opt/rocm-7.2.4/share/amd_smi`. Set `HIP_VISIBLE_DEVICES=0` and
-`ROCR_VISIBLE_DEVICES=0`; the adapter verifies that the sole visible device
-has the reviewed BDF and gfx950 architecture. Use `AITER_LOG_TUNED_CONFIG=1`
+and `/opt/rocm-7.2.4/share/amd_smi`. Use only `ROCR_VISIBLE_DEVICES=GPU-0b39ee760a63f98a`; omit
+`HIP_VISIBLE_DEVICES`, `CUDA_VISIBLE_DEVICES` and `GPU_DEVICE_ORDINAL`.
+Conflicting inherited masks are rejected. The owned child verifies one HIP
+device, logical0, and its actual BDF75/gfx950/CU256 identity before benchmark
+tensor allocation. Management indices do not define HIP ordinals. Use `AITER_LOG_TUNED_CONFIG=1`
 and `AITER_LOG_MORE=0`; leave `AITER_SMI_MONITOR` disabled, because this adapter
 records clocks during the original timing interval. Fix `PYTHONHASHSEED=0`,
 `PYTHONNOUSERSITE=1`, `PYTHONDONTWRITEBYTECODE=1`, and one Torch/OMP/BLAS thread.
@@ -58,8 +60,14 @@ verified release. It checks GPU_PAUSE and every card's idle memory, uses
 CPU0-111 at normal priority, preserves combined stdout/stderr, and imposes a
 55-second command deadline, TERM grace 3 seconds and KILL grace 2 seconds.
 Only that invocation's process group is eligible for cleanup. Failed cleanup
-retains the lock and evidence until root verifies release. Release requires no live owned PID/birth, no owned KFD entry and less than
-2 GiB used at the selected BDF's sysfs allocation counter. Other GPU/process
+retains the lock and evidence until root verifies release. Release requires no live owned PID/birth, an actually empty global KFD list,
+and less than2 GiB used at the selected BDF's sysfs allocation counter.
+The pinned helper reads the global KFD list before invoking rocm-smi. Its
+emptiness proves absence without translating host/container PIDs. A separate
+three-second AMD SMI child resolves the selected BDF and requires numeric zero
+gfx/UMC activity; missing, ambiguous, malformed or timed-out evidence retains
+ownership. The controller creates no HIP context. This remains whole-node
+admission; the prospective co-host branch is stopped. Other GPU/process
 state is recorded; it is never signalled by this controller. Bounded TERM/KILL
 attempts precede an unbounded retained-lock release wait if verification fails.
 The controller and child do not grant themselves a lease.

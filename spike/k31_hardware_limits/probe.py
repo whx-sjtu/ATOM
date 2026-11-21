@@ -20,6 +20,9 @@ from pathlib import Path
 
 PROBE_SHA = "6a63deee204d31a5e49ed1e1536b1a15c024725dac07ca57df8406b86256ec5f"
 AITER_SHA = "572232d23661a094fbc4e98e879713f0e7d2d5f4"
+TARGET_BDF = "0000:75:00.0"
+TARGET_TOKEN = "GPU-0b39ee760a63f98a"
+POSITIONAL_MASKS = ("HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL")
 
 
 def positive(value):
@@ -385,13 +388,45 @@ def resource_components():
     return resources, scope["Owned"]
 
 
-def selected_released(alive, seen, snapshot, used_bytes):
-    kfd = snapshot["kfd_pids"]
+def visibility(env, required=True):
+    if any(key in env for key in POSITIONAL_MASKS):
+        raise ValueError("positional visibility masks are forbidden")
+    token = env.get("ROCR_VISIBLE_DEVICES")
+    if (required or token is not None) and token != TARGET_TOKEN:
+        raise ValueError("expected the sole frozen ROCr token")
+
+
+def release_activity():
+    import amdsmi
+
+    amdsmi.amdsmi_init()
+    try:
+        handles = [
+            h
+            for h in amdsmi.amdsmi_get_processor_handles()
+            if amdsmi.amdsmi_get_gpu_device_bdf(h).lower() == TARGET_BDF
+        ]
+        assert len(handles) == 1, "selected management BDF is missing or ambiguous"
+        row = amdsmi.amdsmi_get_gpu_activity(handles[0])
+        result = {key: row[key] for key in ("gfx_activity", "umc_activity")}
+        for value in result.values():
+            assert (
+                type(value) in (int, float)
+                and math.isfinite(value)
+                and 0 <= value <= 100
+            )
+        return {"bdf": TARGET_BDF, "activity": result, "monotonic_s": time.monotonic()}
+    finally:
+        amdsmi.amdsmi_shut_down()
+
+
+def selected_released(alive, snapshot, used_bytes, activity):
     return (
         not alive
+        and snapshot["kfd_pids"] == []
         and 0 <= used_bytes < 2 * 1024**3
-        and all(isinstance(pid, int) for pid in kfd)
-        and not set(kfd).intersection(seen)
+        and activity["bdf"] == TARGET_BDF
+        and activity["activity"] == {"gfx_activity": 0, "umc_activity": 0}
     )
 
 
@@ -407,7 +442,9 @@ def execute_plan(path):
         ).strip()
         == plan["head"]
     )
-    assert plan["bdf"] == "0000:75:00.0" and plan["execution_limit_s"] == 55
+    assert plan["bdf"] == TARGET_BDF and plan["execution_limit_s"] == 55
+    visibility(os.environ, required=False)
+    visibility(plan["environment"])
     assert not os.environ.get("KFD_GUARD_LOG") and not os.environ.get("LD_PRELOAD")
     assert os.nice(0) == 0 and set(os.sched_getaffinity(0)).issubset(range(112))
     for filename, expected in plan["files"].items():
@@ -479,8 +516,25 @@ def execute_plan(path):
                     if child is not None
                     else 0
                 )
+                activity = None
+                if child is not None:
+                    observed = subprocess.run(
+                        [
+                            "/opt/venv/bin/python",
+                            str(Path(__file__).resolve()),
+                            "--release-activity",
+                        ],
+                        env=plan["environment"],
+                        cwd=root,
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                        timeout=3,
+                        pass_fds=(fd,),
+                    )
+                    activity = json.loads(observed.stdout)
                 released = child is None or selected_released(
-                    alive, owned.seen, snapshot, used
+                    alive, snapshot, used, activity
                 )
                 state["cleanup"] = {
                     "owned_births": owned.seen,
@@ -488,6 +542,8 @@ def execute_plan(path):
                     "snapshot": snapshot,
                     "selected_bdf": plan["bdf"],
                     "selected_used_bytes": used,
+                    "selected_activity": activity,
+                    "kfd_proof": "global list empty, no cross-namespace PID comparison",
                     "released": released,
                 }
                 resources.save_json(output / "controller.json", state)
@@ -510,6 +566,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--mode", choices=("roofline", "a16w16", "a4w4"), default="roofline")
     p.add_argument("--run-plan", type=Path)
+    p.add_argument("--release-activity", action="store_true")
     p.add_argument("--probe", type=Path)
     p.add_argument("--aiter", type=Path)
     p.add_argument("--bdf")
@@ -519,10 +576,14 @@ def main():
     args = p.parse_args()
     if args.run_plan:
         return execute_plan(args.run_plan)
-    if not all((args.probe, args.aiter, args.bdf, args.out)):
-        p.error("measurement requires --probe, --aiter, --bdf and --out")
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     assert os.environ.get("K31_TASK13_GPU_GRANT") == head, "root GPU grant required"
+    visibility(os.environ)
+    if args.release_activity:
+        emit(release_activity())
+        return
+    if not all((args.probe, args.aiter, args.bdf, args.out)):
+        p.error("measurement requires --probe, --aiter, --bdf and --out")
     assert not args.out.exists(), "refusing to replace evidence"
     assert hashlib.sha256(args.probe.read_bytes()).hexdigest() == PROBE_SHA
     assert 6 <= args.clock_seconds <= 12
@@ -550,7 +611,8 @@ def main():
     assert torch.cuda.device_count() == 1, "expose only the reviewed device"
     prop = torch.cuda.get_device_properties(0)
     bdf = f"{prop.pci_domain_id:04x}:{prop.pci_bus_id:02x}:{prop.pci_device_id:02x}.0"
-    assert bdf == args.bdf and prop.gcnArchName.split(":")[0] == "gfx950"
+    assert bdf == args.bdf == TARGET_BDF and prop.gcnArchName.split(":")[0] == "gfx950"
+    assert prop.multi_processor_count == 256, "selected device CU identity differs"
     result = {
         "mode": args.mode,
         "bdf": bdf,
