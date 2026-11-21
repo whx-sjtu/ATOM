@@ -35,6 +35,20 @@ def dependency(name):
     return module
 
 
+def client_model_args():
+    return {
+        "model": "kimi-k3.1-pro",
+        "base_url": f"http://127.0.0.1:{P['ports']['server']}/v1/completions",
+        "num_concurrent": 8,
+        "max_retries": 3,
+        "tokenized_requests": False,
+        "tokenizer": P["model"],
+        "trust_remote_code": True,
+        "max_gen_toks": 256,
+        "timeout": 300,
+    }
+
+
 def prepare_data():
     import importlib.metadata
 
@@ -43,7 +57,7 @@ def prepare_data():
 
     if importlib.metadata.version("lm_eval") != "0.4.13":
         raise ValueError("unqualified lm_eval version")
-    task = TaskManager().load("gsm8k")["tasks"]["gsm8k"]
+    task = TaskManager(metadata=client_model_args()).load("gsm8k")["tasks"]["gsm8k"]
     if {k: len(v) for k, v in task.dataset.items()} != {"train": 7473, "test": 1319}:
         raise ValueError("wrong dataset split sizes")
     content = {}
@@ -104,48 +118,47 @@ def validate(manifest, expected):
     if result["n-samples"]["gsm8k"]["effective"] != P["samples"]:
         raise ValueError("incomplete result count")
     rows = {}
-    for line in (
-        checked_file(manifest["samples"], manifest["output"]).read_text().splitlines()
-    ):
-        row = json.loads(line)
-        doc_id, filt = row["doc_id"], row["filter"]
-        key = (doc_id, filt)
-        if (
-            type(doc_id) is not int
-            or str(doc_id) not in expected["docs"]
-            or filt not in P["filters"]
-            or key in rows
-        ):
-            raise ValueError("duplicate or unexpected sample")
-        identity = expected["docs"][str(doc_id)]
-        raw_identity = {
-            "doc_hash": hashlib.sha256(
-                json.dumps(row["doc"], indent=2, ensure_ascii=False).encode()
-            ).hexdigest(),
-            "prompt_hash": hashlib.sha256(
-                row["arguments"]["gen_args_0"]["arg_0"].encode()
-            ).hexdigest(),
-            "target_hash": hashlib.sha256(str(row["target"]).encode()).hexdigest(),
-        }
-        if raw_identity != identity:
-            raise ValueError("sample content disagrees with its identity")
-        if (
-            row["arguments"]["gen_args_0"]["arg_1"]
-            != expected["config"]["generation_kwargs"]
-        ):
-            raise ValueError("sample generation configuration mismatch")
-        if any(row.get(k) != v for k, v in identity.items()):
-            raise ValueError("document/prompt/target identity mismatch")
-        # Empty, wrong and cap-limited model answers remain scored evidence.
-        if (
-            row["exact_match"] not in (0, 1)
-            or not isinstance(row["resps"], list)
-            or not isinstance(row["filtered_resps"], list)
-        ):
-            raise ValueError("malformed scored response")
-        if row.get("task", "gsm8k") != "gsm8k":
-            raise ValueError("wrong task")
-        rows[key] = row
+    with checked_file(manifest["samples"], manifest["output"]).open() as stream:
+        for line in stream:
+            row = json.loads(line)
+            doc_id, filt = row["doc_id"], row["filter"]
+            key = (doc_id, filt)
+            if (
+                type(doc_id) is not int
+                or str(doc_id) not in expected["docs"]
+                or filt not in P["filters"]
+                or key in rows
+            ):
+                raise ValueError("duplicate or unexpected sample")
+            identity = expected["docs"][str(doc_id)]
+            raw_identity = {
+                "doc_hash": hashlib.sha256(
+                    json.dumps(row["doc"], indent=2, ensure_ascii=False).encode()
+                ).hexdigest(),
+                "prompt_hash": hashlib.sha256(
+                    row["arguments"]["gen_args_0"]["arg_0"].encode()
+                ).hexdigest(),
+                "target_hash": hashlib.sha256(str(row["target"]).encode()).hexdigest(),
+            }
+            if raw_identity != identity:
+                raise ValueError("sample content disagrees with its identity")
+            if (
+                row["arguments"]["gen_args_0"]["arg_1"]
+                != expected["config"]["generation_kwargs"]
+            ):
+                raise ValueError("sample generation configuration mismatch")
+            if any(row.get(k) != v for k, v in identity.items()):
+                raise ValueError("document/prompt/target identity mismatch")
+            # Empty, wrong and cap-limited model answers remain scored evidence.
+            if (
+                row["exact_match"] not in (0, 1)
+                or not isinstance(row["resps"], list)
+                or not isinstance(row["filtered_resps"], list)
+            ):
+                raise ValueError("malformed scored response")
+            if row.get("task", "gsm8k") != "gsm8k":
+                raise ValueError("wrong task")
+            rows[key] = row
     if set(rows) != {(i, f) for i in range(P["samples"]) for f in P["filters"]}:
         raise ValueError("missing document/filter evidence")
     counts = {

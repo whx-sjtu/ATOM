@@ -70,8 +70,8 @@ reachable Apport, user hooks and altered exception/tracing behavior fail closed.
 `--startup-check <receipt>` is a guarded CPU helper with no target-runtime imports
 or device discovery; full runtime/hardware checks remain in leased startup.
 
-Keep the sealed invalid `author-001`, `author-002`, `author-003`, `author-004` and `author-005` records intact.
-CPU checks for the prospective next attempt use `K31_TASK10_CPU_ATTEMPT=author-006`; preparing that namespace does not
+Keep the sealed invalid `author-001`, `author-002`, `author-003`, `author-004`, `author-005` and `author-006` records intact.
+CPU checks for the prospective next attempt use `K31_TASK10_CPU_ATTEMPT=author-007`; preparing that namespace does not
 consume a lease or select A0. A new independently qualified head/plan and root grant
 are required before its existing `--run` entry may execute.
 
@@ -116,3 +116,10 @@ process names. The real CPU setup-route checks compare Python/libc values with
 external procfs before/after title changes; actual overrides and forbidden
 acceptance remain rejected by the unchanged process checker. Author-005 has no
 internal environment witness, so the CPU reproduction does not rewrite its state.
+
+Task preparation uses the native TaskManager with the exact declared client
+metadata, so result identity still compares the complete configuration digest.
+Samples are read as physical JSONL records; Unicode separators inside JSON strings
+remain answer/prompt content. The existing final process witness is collected
+before fallible result binding. Author-006's complete answers stay diagnostic-only
+with the original INVALID/no-A0 state; no missing final witness is reconstructed.

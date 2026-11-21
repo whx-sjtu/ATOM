@@ -16,6 +16,7 @@ from verify import (
     HERE,
     P,
     bind_results,
+    client_model_args,
     dependency,
     digest,
     first_valid,
@@ -145,10 +146,8 @@ def commands(attempt):
             "--instance-id": f"task10-{attempt}",
         },
     )
-    model_args = (
-        f"model=kimi-k3.1-pro,base_url=http://127.0.0.1:{ports['server']}/v1/completions,"
-        f"num_concurrent=8,max_retries=3,tokenized_requests=False,tokenizer={P['model']},"
-        "trust_remote_code=True,max_gen_toks=256,timeout=300"
+    model_args = ",".join(
+        f"{key}={value}" for key, value in client_model_args().items()
     )
     client = [
         "/opt/venv/bin/lm_eval",
@@ -1702,10 +1701,10 @@ def execute_bound(path, start, started_unix):
             raise RuntimeError("owned service exited before the final receipt")
         if client.returncode != 0:
             raise RuntimeError("scored client failed; partial evidence retained")
-        state["evidence"] = bind_results(out, expected)
         state["processes_after_scoring"] = process_receipt(
             owned, plan, out / "after-scoring-processes.json"
         )
+        state["evidence"] = bind_results(out, expected)
         state["execution_elapsed_s"] = time.monotonic() - start
         if time.monotonic() >= whole:
             raise TimeoutError("whole execution deadline")

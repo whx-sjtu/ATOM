@@ -29,6 +29,9 @@ attempt = os.environ['K31_TASK10_CPU_ATTEMPT']
 commands = run.commands(attempt)
 sys.argv = commands['client'][:]
 args = HarnessCLI().parse_args()
+from lm_eval.utils import simple_parse_args_string
+parsed_model_args = simple_parse_args_string(args.model_args) if isinstance(args.model_args,str) else args.model_args
+assert verify.digest(parsed_model_args) == verify.digest(verify.client_model_args())
 assert args.seed == [0, 1234, 1234, 1234] and args.limit is None
 assert args.num_fewshot == 5 and args.tasks == ['gsm8k']
 with patch('lm_eval.utils.check_remote_tokenizer_support', return_value=False):
@@ -1223,3 +1226,170 @@ while not (root/'exit').exists(): time.sleep(0.005)
     finally:
         owned.stop()
         assert not owned.live()
+
+
+@pytest.fixture
+def sealed_006_corpus():
+    root = Path(verify.P["private_root"])
+    output = root / "runs/author-006"
+    result = output / "quality/kimi-k3.1-pro/results_2026-11-21T11-58-44.533398.json"
+    samples = (
+        output / "quality/kimi-k3.1-pro/samples_gsm8k_2026-11-21T11-58-44.533398.jsonl"
+    )
+    expected_hashes = {
+        result: "f2b36b4541e90a83b82454fd0c8d6448e9fe9308875e34b4ffc431def427e48b",
+        samples: "5cb581fa7e9590b764d8a2129404d0f87eecd414d235d1dca1c01a88cf14d21f",
+        output
+        / "controller.json": "6fb387c7fc6343ed09ac0d6f051bbf1978fab7a8ec2578f4b6bca3f83bfdb1be",
+    }
+    assert all(verify.sha(path) == value for path, value in expected_hashes.items())
+    old = json.loads((root / "preparation/author-006-data.json").read_text())
+    attempt = os.environ.get("K31_TASK10_CPU_ATTEMPT", "author-007")
+    corrected = json.loads((root / "preparation" / f"{attempt}-data.json").read_text())
+    assert (
+        old["docs"] == corrected["docs"]
+        and old["content_sha256"] == corrected["content_sha256"]
+    )
+    assert {k: v for k, v in old["config"].items() if k != "metadata"} == {
+        k: v for k, v in corrected["config"].items() if k != "metadata"
+    }
+    assert (
+        corrected["config"]["metadata"]
+        == old["config"]["metadata"] | verify.client_model_args()
+    )
+    frozen_plan = json.loads((output / "plan.json").read_text())
+    assert run.commands("author-006") == frozen_plan["commands"]
+    manifest = {
+        "output": str(output),
+        "result": {"path": str(result), "sha256": expected_hashes[result]},
+        "samples": {"path": str(samples), "sha256": expected_hashes[samples]},
+    }
+    yield manifest, old, corrected
+    assert all(verify.sha(path) == value for path, value in expected_hashes.items())
+    assert (
+        json.loads((output / "controller.json").read_text())["outcome"]
+        == "EXECUTION_INVALID"
+    )
+
+
+@pytest.mark.parametrize(
+    "metadata_fixed,reader_fixed",
+    [(False, False), (True, False), (False, True), (True, True)],
+)
+def test_immutable_006_real_writer_contract_matrix(
+    sealed_006_corpus, metadata_fixed, reader_fixed
+):
+    import importlib.util
+
+    manifest, old, corrected = sealed_006_corpus
+    source = (
+        Path(verify.P["private_root"])
+        / "frozen/c99b17c4/ATOM/spike/k31_gsm8k_baseline/verify.py"
+    )
+    spec = importlib.util.spec_from_file_location("old_writer_contract_verify", source)
+    frozen = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(frozen)
+    validate = verify.validate if reader_fixed else frozen.validate
+    expected = corrected if metadata_fixed else old
+    if not metadata_fixed:
+        with pytest.raises(ValueError, match="task identity mismatch"):
+            validate(manifest, expected)
+    elif not reader_fixed:
+        with pytest.raises(json.JSONDecodeError):
+            validate(manifest, expected)
+    else:
+        rows, score = validate(manifest, expected)
+        assert len(rows) == 2638
+        assert score["correct"] == {"strict-match": 1287, "flexible-extract": 1288}
+        assert score["quality_floor"] == "PASS"
+        assert (
+            "\u2028"
+            in rows[(604, "flexible-extract")]["arguments"]["gen_args_0"]["arg_0"]
+        )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("max_gen_toks", 512), ("num_concurrent", 4), ("unexpected_metadata", True)],
+)
+def test_real_result_keeps_exact_model_metadata_binding(
+    tmp_path, sealed_006_corpus, field, value
+):
+    import shutil
+
+    manifest, _old, corrected = sealed_006_corpus
+    result = json.loads(Path(manifest["result"]["path"]).read_text())
+    result["configs"]["gsm8k"]["metadata"][field] = value
+    run.save(tmp_path / "results.json", result)
+    shutil.copyfile(manifest["samples"]["path"], tmp_path / "samples.jsonl")
+    faulty = {
+        "output": str(tmp_path),
+        "result": {
+            "path": str(tmp_path / "results.json"),
+            "sha256": verify.sha(tmp_path / "results.json"),
+        },
+        "samples": {
+            "path": str(tmp_path / "samples.jsonl"),
+            "sha256": verify.sha(tmp_path / "samples.jsonl"),
+        },
+    }
+    with pytest.raises(ValueError, match="task identity mismatch"):
+        verify.validate(faulty, corrected)
+
+
+def test_final_process_witness_survives_result_binding_failure(process_family):
+    import ast
+
+    owned, plan, root = process_family()
+    samples = root / "scored-samples.jsonl"
+    samples.write_text('{"answer":"retained CPU fixture"}\n')
+    before = verify.sha(samples)
+    source = run.HERE / "run.py"
+    function = next(
+        n
+        for n in ast.parse(source.read_text()).body
+        if isinstance(n, ast.FunctionDef) and n.name == "execute_bound"
+    )
+    execution = next(n for n in function.body if isinstance(n, ast.Try))
+    first = next(
+        i
+        for i, n in enumerate(execution.body)
+        if isinstance(n, ast.Assign)
+        and any(
+            isinstance(t, ast.Subscript)
+            and isinstance(t.slice, ast.Constant)
+            and t.slice.value in ("evidence", "processes_after_scoring")
+            for t in n.targets
+        )
+    )
+    tail = ast.Try(
+        body=execution.body[first:],
+        handlers=execution.handlers,
+        orelse=[],
+        finalbody=[],
+    )
+    module = ast.fix_missing_locations(ast.Module(body=[tail], type_ignores=[]))
+
+    def fail_binding(*args):
+        raise ValueError("injected result identity failure")
+
+    state = {"outcome": "EXECUTION_INVALID", "phase": "scoring"}
+    scope = dict(
+        vars(run),
+        owned=owned,
+        plan=plan,
+        out=root,
+        state=state,
+        expected={},
+        bind_results=fail_binding,
+        start=time.monotonic(),
+        whole=time.monotonic() + 10,
+    )
+    exec(  # noqa: S102 - unchanged production final-stage control flow
+        compile(module, str(source), "exec"), scope
+    )
+    rows = json.loads((root / "after-scoring-processes.json").read_text())
+    assert len(rows) == 3 and all("refusal" not in row for row in rows)
+    assert state["processes_after_scoring"] == rows and "evidence" not in state
+    assert state["outcome"] == "EXECUTION_INVALID" and state["phase"] == "scoring"
+    assert verify.sha(samples) == before
