@@ -228,9 +228,12 @@ def prepare(attempt):
     namespace = PRIVATE / "namespaces" / attempt
     namespace.mkdir(parents=True, exist_ok=False)
     files, provenance = {}, {}
-    for name, expected in P["startup_module"]["files"].items():
-        if sha(name) != expected:
-            raise ValueError(f"startup dependency changed: {name}")
+    for name, expected in {
+        **P["startup_module"]["files"],
+        **P["process_environment"]["sources"],
+    }.items():
+        if sha(ROOT / name) != expected:
+            raise ValueError(f"runtime dependency changed: {name}")
         files[name] = expected
     for record in P["preparation_inputs"].values():
         if sha(record["path"]) != record["sha256"]:
@@ -361,6 +364,11 @@ def prepare(attempt):
         for item in (site / package).rglob("*"):
             if item.is_file() and item.suffix in (".py", ".yaml", ".so"):
                 files[str(item)] = sha(item)
+    for name, expected in P["process_environment"]["sources"].items():
+        source = ROOT / name
+        if sha(source) != expected:
+            raise ValueError(f"process environment source changed: {name}")
+        files[str(source)] = expected
     # The CPU guard is propagated only for preparation, never into a frozen GPU child.
     cpu_env = dict(
         env,
@@ -467,9 +475,12 @@ def make_plan(attempt):
     check_cache_toolchain(
         json.loads(Path(P["preparation_inputs"]["cache_receipt"]["path"]).read_text())
     )
-    for name, expected in P["startup_module"]["files"].items():
-        if sha(name) != expected:
-            raise ValueError(f"startup dependency changed: {name}")
+    for name, expected in {
+        **P["startup_module"]["files"],
+        **P["process_environment"]["sources"],
+    }.items():
+        if sha(ROOT / name) != expected:
+            raise ValueError(f"runtime dependency changed: {name}")
     for filename, expected in preparation["files"].items():
         if sha(filename) != expected:
             raise ValueError(f"preparation artifact changed: {filename}")
@@ -917,35 +928,142 @@ def cache_inventory(attempt):
     }
 
 
-def process_receipt(owned, plan):
-    rows = []
+def rank_cache_evidence(plan):
+    import hashlib
+    import re
+
+    path = Path(plan["output"]) / "server.log"
+    raw = path.read_bytes()
+    root = Path(plan["environment"]["HOME"]) / ".cache/atom/torch_compile_cache"
+    pattern = re.compile(
+        r"\[atom [0-9:]{8}\] Using cache directory: "
+        + re.escape(str(root))
+        + r"/([0-9a-f]{10})/rank_([0-7])/backbone for vLLM's torch.compile"
+    )
+    rows = [
+        match.groups()
+        for line in raw.decode(errors="replace").splitlines()
+        if (match := pattern.fullmatch(line))
+    ]
+    keys = {key for key, _rank in rows}
+    if len(keys) != 1 or {int(rank) for _key, rank in rows} != set(range(8)):
+        raise ValueError("current service rank-cache producer evidence is incomplete")
+    return {
+        "server_log": str(path),
+        "prefix_bytes": len(raw),
+        "prefix_sha256": hashlib.sha256(raw).hexdigest(),
+        "compile_cache_key": next(iter(keys)),
+        "ranks": list(range(8)),
+    }
+
+
+def inherited_cache_role(proc, plan, row, server_births, cache_evidence):
+    import re
+
+    args = row["argv"]
+    if args[:4] != [P["python"], "-B", "-s", "-c"]:
+        return None
+    role = None
+    if len(args) == 5 and re.fullmatch(
+        r"from multiprocessing.resource_tracker import main;main\([0-9]+\)", args[4]
+    ):
+        role = "resource_tracker"
+    if (
+        len(args) == 6
+        and args[5] == "--multiprocessing-fork"
+        and re.fullmatch(
+            r"from multiprocessing.spawn import spawn_main; "
+            r"spawn_main\(tracker_fd=[0-9]+, pipe_handle=[0-9]+\)",
+            args[4],
+        )
+    ):
+        role = "spawn"
+    if role is None or not any(
+        parent.pid in server_births
+        and parent.create_time() == server_births[parent.pid]
+        for parent in proc.parents()
+    ):
+        return None
     private = PRIVATE / "namespaces" / plan["attempt"]
-    for proc in owned.live():
-        env = proc.environ()
-        if "SPEC_DECODE_ACCEPTANCE_LENGTH" in env or any(
-            env.get(k) != value for k, value in plan["environment"].items()
+    root = Path(plan["environment"]["HOME"]) / ".cache/atom/torch_compile_cache"
+    keys = {
+        "TRITON_CACHE_DIR": "triton_cache",
+        "TORCHINDUCTOR_CACHE_DIR": "inductor_cache",
+    }
+    if set(row["mismatch_keys"]) != set(keys):
+        return None
+    if not cache_evidence:
+        cache_evidence.update(rank_cache_evidence(plan))
+    root /= cache_evidence["compile_cache_key"]
+    for rank in range(8):
+        expected = {key: root / f"rank_{rank}" / suffix for key, suffix in keys.items()}
+        if all(
+            row["environment"][key] == str(path)
+            and path.resolve() == path
+            and path.is_dir()
+            and path.resolve().is_relative_to(private.resolve())
+            for key, path in expected.items()
         ):
-            raise ValueError(
-                "owned child environment differs from the frozen allowlist"
+            row["cache_evidence"] = cache_evidence
+            return role
+    return None
+
+
+def process_receipt(owned, plan, receipt_path=None):
+    rows = []
+    cache_evidence = {}
+    private = PRIVATE / "namespaces" / plan["attempt"]
+    for name, expected in P["process_environment"]["sources"].items():
+        if sha(ROOT / name) != expected:
+            raise ValueError(f"process environment source changed: {name}")
+    server_births = {}
+    for child in owned.roots:
+        if child.poll() is None:
+            proc = owned.psutil.Process(child.pid)
+            if (
+                proc.create_time() == owned.seen[child.pid]
+                and proc.cmdline() == plan["commands"]["server"]
+            ):
+                server_births[child.pid] = proc.create_time()
+    for proc in owned.live():
+        row = {"pid": proc.pid, "birth": proc.create_time()}
+        rows.append(row)
+        try:
+            row["argv"] = proc.cmdline()
+            env = proc.environ()
+            row["environment"] = {k: env.get(k) for k in plan["environment"]}
+            row["mismatch_keys"] = [
+                k for k, value in plan["environment"].items() if env.get(k) != value
+            ]
+            if "SPEC_DECODE_ACCEPTANCE_LENGTH" in env:
+                row["mismatch_keys"].append("SPEC_DECODE_ACCEPTANCE_LENGTH")
+            row["role"] = (
+                inherited_cache_role(proc, plan, row, server_births, cache_evidence)
+                if row["mismatch_keys"]
+                else "unchanged"
             )
-        modules = sorted(
-            {
-                m.path
-                for m in proc.memory_maps(grouped=False)
-                if "/module_" in m.path and m.path.endswith(".so")
-            }
-        )
-        if any(not Path(name).is_relative_to(private) for name in modules):
-            raise ValueError("a worker loaded a shared native module")
-        rows.append(
-            {
-                "pid": proc.pid,
-                "birth": proc.create_time(),
-                "argv": proc.cmdline(),
-                "environment": {k: env.get(k) for k in plan["environment"]},
-                "native_modules": {name: sha(name) for name in modules},
-            }
-        )
+            if row["role"] is None:
+                raise ValueError(
+                    f"owned child {proc.pid} environment differs on "
+                    + ", ".join(row["mismatch_keys"])
+                )
+            modules = sorted(
+                {
+                    m.path
+                    for m in proc.memory_maps(grouped=False)
+                    if "/module_" in m.path and m.path.endswith(".so")
+                }
+            )
+            if any(not Path(name).is_relative_to(private) for name in modules):
+                raise ValueError("a worker loaded a shared native module")
+            row["native_modules"] = {name: sha(name) for name in modules}
+        except BaseException as error:
+            row["refusal"] = repr(error)
+            if receipt_path is not None:
+                save(receipt_path, rows)
+            raise
+    if receipt_path is not None:
+        save(receipt_path, rows)
     return rows
 
 
@@ -1277,7 +1395,9 @@ def execute_bound(path, start, started_unix):
             v["used_gib"] < 2 for v in snapshot["cards"].values()
         ):
             raise ValueError("eight-card service residency not established")
-        state["processes_at_startup"] = process_receipt(owned, plan)
+        state["processes_at_startup"] = process_receipt(
+            owned, plan, out / "startup-processes.json"
+        )
         state["startup"] = {
             "smoke": replies,
             "requested_concurrency": 8,

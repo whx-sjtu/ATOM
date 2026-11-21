@@ -70,8 +70,8 @@ reachable Apport, user hooks and altered exception/tracing behavior fail closed.
 `--startup-check <receipt>` is a guarded CPU helper with no target-runtime imports
 or device discovery; full runtime/hardware checks remain in leased startup.
 
-Keep the sealed invalid `author-001` record intact. CPU checks for the repaired next
-attempt use `K31_TASK10_CPU_ATTEMPT=author-002`; preparing that namespace does not
+Keep the sealed invalid `author-001`, `author-002` and `author-003` records intact.
+CPU checks for the prospective next attempt use `K31_TASK10_CPU_ATTEMPT=author-004`; preparing that namespace does not
 consume a lease or select A0. A new independently qualified head/plan and root grant
 are required before its existing `--run` entry may execute.
 
@@ -86,3 +86,13 @@ Fresh preparation adds only the independently reviewable, source-bound CPU-built
 compiler/runtime and build/load receipts are checked before copying. Incomplete
 build files and the failed run's whole mutable cache are not promoted. CPU build
 and load readiness do not establish request completion or GPU correctness.
+
+The process witness keeps all declared environment keys exact. Only the pinned
+stdlib spawn/resource-tracker launch roles beneath the owned service may inherit
+the paired ATOM rank-cache layout from its pinned cache initializer. Its key is
+bound to this service's eight rank initialization records and their log-prefix hash,
+so a separately checked source root may derive a different key. Other keys,
+roles, cache keys, ranks, mixed pairs and paths escaping the private namespace are
+rejected. The witness saves PID, birth, role and declared environment values before
+refusing a mismatch. Author-003 did not retain its rejected PID/key; a CPU
+reproduction of this checker defect does not retrospectively identify that child.

@@ -735,3 +735,194 @@ def test_smoke_does_not_wait_for_workers_before_owned_cleanup(
         owned.stop()
     assert child.wait(timeout=1) != 0 and not owned.live()
     assert time.monotonic() - started < 2
+
+
+@pytest.fixture
+def process_family(tmp_path, monkeypatch):
+    monkeypatch.setattr(run, "PRIVATE", tmp_path)
+    common = verify.dependency("common.py")
+    families = []
+    script = tmp_path / "spawn_family.py"
+    script.write_text(r"""
+import ast, hashlib, json, multiprocessing, os, subprocess, sys, time, types
+from pathlib import Path
+if __name__ == '__main__':
+    root = Path(sys.argv[1]); config = json.loads((root/'case.json').read_text())
+    assert hashlib.sha256(Path(config['source']).read_bytes()).hexdigest() == config['source_sha256']
+    tree = ast.parse(Path(config['source']).read_text())
+    cls = next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='InductorAdaptor')
+    method = next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='initialize_cache')
+    scope = {'os':os}
+    exec(compile(ast.Module(body=[method],type_ignores=[]),config['source'],'exec'),scope)
+    cache_root = Path(os.environ['HOME'])/'.cache/atom/torch_compile_cache'/config['cache_key']
+    lines = []
+    for rank in range(8):
+        cache = cache_root/f'rank_{rank}'/'backbone'
+        scope['initialize_cache'](types.SimpleNamespace(),str(cache),False,'backbone')
+        lines.append(f"[atom 00:00:00] Using cache directory: {cache} for vLLM's torch.compile")
+    if config['case'] == 'missing_rank': lines.pop()
+    if config['case'] == 'mixed_key': lines[-1] = lines[-1].replace(config['cache_key'],'abcdef0123')
+    (root/'server.log').write_text('\n'.join(lines)+'\n')
+    scope['initialize_cache'](types.SimpleNamespace(),str(cache_root/'rank_3/backbone'),False,'backbone')
+    case = config['case']
+    if case == 'policy': os.environ['ATOM_ENABLE_RELAXED_MTP'] = '1'
+    if case == 'missing': os.environ.pop('ATOM_MONO_ENABLE')
+    if case == 'forced': os.environ['SPEC_DECODE_ACCEPTANCE_LENGTH'] = '3'
+    if case == 'wrong_pair': os.environ['TRITON_CACHE_DIR'] = os.environ['TRITON_CACHE_DIR'].replace('rank_3','rank_4')
+    if case == 'foreign_path': os.environ['TRITON_CACHE_DIR'] = '/tmp/unqualified-triton'
+    if case == 'unrecorded_key':
+        for key in ['TRITON_CACHE_DIR','TORCHINDUCTOR_CACHE_DIR']:
+            os.environ[key] = os.environ[key].replace(config['cache_key'],'abcdef0123')
+    if case == 'symlink':
+        target = root/'foreign-cache'; target.mkdir()
+        link = Path(os.environ['TRITON_CACHE_DIR']); link.rmdir(); link.symlink_to(target, target_is_directory=True)
+    if case == 'unknown_role':
+        child = subprocess.Popen([sys.executable,'-B','-c','import time;time.sleep(60)'])
+    else:
+        child = multiprocessing.get_context('spawn').Process(target=time.sleep,args=(60,)); child.start()
+    (root/'ready').write_text(str(child.pid))
+    time.sleep(60)
+""")
+
+    def start(case="valid"):
+        root = tmp_path / case
+        root.mkdir()
+        monkeypatch.setattr(run, "PRIVATE", root)
+        env = run.environment("author-004")
+        import ast
+
+        backend = run.ROOT / "atom/utils/backends.py"
+        traced_hash = next(
+            n
+            for n in ast.parse(backend.read_text()).body
+            if isinstance(n, ast.FunctionDef) and n.name == "_hash_traced_files"
+        )
+        scope = {}
+        assert (
+            verify.sha(backend)
+            == run.P["process_environment"]["sources"]["atom/utils/backends.py"]
+        )
+        exec(  # noqa: S102 - the hash-pinned pure source hashing function
+            compile(
+                ast.Module(body=[traced_hash], type_ignores=[]), str(backend), "exec"
+            ),
+            scope,
+        )
+        traced_source = root / "same_source.py"
+        traced_source.write_text("value = 1\n")
+        factors = [
+            "CPU configuration",
+            scope["_hash_traced_files"]([str(traced_source)]),
+            "CPU compiler",
+        ]
+        cache_key = hashlib.md5(
+            str(factors).encode(), usedforsecurity=False
+        ).hexdigest()[:10]
+        (root / "case.json").write_text(
+            json.dumps(
+                {
+                    "case": case,
+                    "source": str(run.ROOT / "atom/utils/compiler_inferface.py"),
+                    "source_sha256": run.P["process_environment"]["sources"][
+                        "atom/utils/compiler_inferface.py"
+                    ],
+                    "cache_key": cache_key,
+                }
+            )
+        )
+        command = [run.P["python"], "-B", str(script), str(root)]
+        child_env = dict(
+            env,
+            **{
+                k: os.environ[k]
+                for k in ("LD_PRELOAD", "KFD_GUARD_LOG")
+                if k in os.environ
+            },
+        )
+        owned = run.owned_type()(common)
+        fd = common.GpuLock(path=str(root / "cpu-resource.lock")).acquire()
+        child = common.spawn(
+            command,
+            env=child_env,
+            cwd=run.ROOT,
+            log_path=root / "family.log",
+            lock_fd=fd,
+            cpus="112-127",
+        )
+        owned.add(child)
+        families.append((owned, child, fd))
+        run.wait_until(owned, lambda: (root / "ready").exists(), time.monotonic() + 5)
+        plan = {
+            "attempt": "author-004",
+            "output": str(root),
+            "environment": env,
+            "commands": {
+                "server": command if case != "wrong_lineage" else ["unrelated-server"]
+            },
+        }
+        return owned, plan, root
+
+    yield start
+    for owned, child, fd in families:
+        owned.stop()
+        child.wait(timeout=1)
+        assert not owned.live()
+        os.close(fd)
+
+
+def test_real_spawn_children_inherit_qualified_rank_caches(process_family):
+    owned, plan, _root = process_family()
+    rows = run.process_receipt(owned, plan)
+    assert len(rows) == 3
+    assert {row["role"] for row in rows} == {"unchanged", "resource_tracker", "spawn"}
+    for row in rows:
+        if row["role"] != "unchanged":
+            assert row["environment"]["TRITON_CACHE_DIR"].endswith(
+                "rank_3/triton_cache"
+            )
+            assert row["environment"]["TORCHINDUCTOR_CACHE_DIR"].endswith(
+                "rank_3/inductor_cache"
+            )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "policy",
+        "missing",
+        "forced",
+        "wrong_pair",
+        "foreign_path",
+        "symlink",
+        "unknown_role",
+        "wrong_lineage",
+        "missing_rank",
+        "mixed_key",
+        "unrecorded_key",
+    ],
+)
+def test_unqualified_child_environment_keeps_refusal_evidence(process_family, case):
+    owned, plan, root = process_family(case)
+    receipt = root / "refusal.json"
+    with pytest.raises(ValueError):
+        run.process_receipt(owned, plan, receipt)
+    rows = json.loads(receipt.read_text())
+    refused = next(row for row in rows if "refusal" in row)
+    assert refused["pid"] and refused["birth"] and refused["mismatch_keys"]
+    assert set(refused["environment"]) == set(plan["environment"])
+    assert "SPEC_DECODE_ACCEPTANCE_LENGTH" not in refused["environment"]
+    assert not (root / "quality").exists()
+
+
+def test_private_cache_key_follows_separate_source_roots(process_family):
+    keys = []
+    for case in ("valid", "separate_root"):
+        owned, plan, _root = process_family(case)
+        rows = run.process_receipt(owned, plan)
+        key = next(
+            row["cache_evidence"]["compile_cache_key"]
+            for row in rows
+            if row["role"] == "spawn"
+        )
+        keys.append(key)
+    assert keys[0] != keys[1]
