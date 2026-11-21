@@ -1,0 +1,143 @@
+{
+  "atom_base": "8a7afa1f54a2f78826b2d781cbf319595b85a582",
+  "aiter_sha": "572232d23661a094fbc4e98e879713f0e7d2d5f4",
+  "private_root": "/app/k31-agent-team-private/task-10",
+  "python": "/opt/venv/bin/python",
+  "dependencies": {
+    "common.py": {
+      "path": "/app/k31-agent-team-private/task-10/dependencies/common.py",
+      "sha256": "1479cc118a3d667cc19c570dae34f779c6c7fcac5df8bd061c6537a9fbddd3ab"
+    },
+    "gsm8k_compare.py": {
+      "path": "/app/k31-agent-team-private/task-10/dependencies/gsm8k_compare.py",
+      "sha256": "437a64f4c5eb1db8ef82580c97073fcb67babf3caf58262b0eea3f23cee60c33"
+    },
+    "owned-run.py": {
+      "path": "/app/k31-agent-team-private/task-10/dependencies/owned-run.py",
+      "sha256": "a102579f60f77f78faf47c3999cccc7d3b1b46dd7ed68f7ba40cf5fe583558ea"
+    },
+    "owned-protocol.json": {
+      "path": "/app/k31-agent-team-private/task-10/dependencies/owned-protocol.json",
+      "sha256": "d3345964118cecd1d786824a38220258dad654af12a0040c662d8a0422158ca3"
+    }
+  },
+  "model": "/share_nfs/models/moonshotai/Kimi-K3.1-Pro",
+  "draft": "/app/agent-team-scratch/models/Kimi-K3.1-Pro-DSpark-preview-6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94",
+  "model_pins": "/share_nfs/whx/work/k31_perf_opt/.opt-team/refs/prev-team/comparison-model-pins.json",
+  "ports": {
+    "server": 8670,
+    "cache": 5590,
+    "cache_http": 8690
+  },
+  "bounds": {
+    "startup": 900,
+    "client": 1200,
+    "whole": 2100,
+    "term": 15,
+    "kill": 15,
+    "release": 60
+  },
+  "samples": 1319,
+  "floor_correct": 1267,
+  "alpha": 0.05,
+  "filters": [
+    "flexible-extract",
+    "strict-match"
+  ],
+  "seeds": [
+    0,
+    1234,
+    1234,
+    1234
+  ],
+  "first_attempt": "author-001",
+  "smoke": {
+    "prompt": "Complete this greeting: Hello",
+    "requests": 8,
+    "max_tokens": 8
+  },
+  "hardware": {
+    "count": 8,
+    "name": "AMD Radeon Graphics",
+    "gcnArchName": "gfx950:sramecc+:xnack-",
+    "total_memory": 309220868096
+  },
+  "server_flags": {
+    "--served-model-name": "kimi-k3.1-pro",
+    "--host": "127.0.0.1",
+    "--trust-remote-code": null,
+    "-tp": 8,
+    "--decode-context-parallel-size": 8,
+    "--kv_cache_dtype": "fp8",
+    "--index-cache-dtype": "fp4",
+    "--index-cache-layout": "mfma",
+    "--block-size": 64,
+    "--enable_prefix_caching": null,
+    "--max-model-len": 1048576,
+    "--max-num-seqs": 24,
+    "--max-num-batched-tokens": 8192,
+    "--gpu-memory-utilization": 0.9,
+    "--state-checkpoint-interval-tokens": 8192,
+    "--level": 3,
+    "--cudagraph-mode": "FULL",
+    "--cudagraph-capture-sizes": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      16,
+      24
+    ],
+    "--method": "dspark",
+    "--num-speculative-tokens": 3
+  },
+  "cache_flags": {
+    "--host": "127.0.0.1",
+    "--chunk-size": 512,
+    "--null-block-id": -1,
+    "--separate-object-groups": null,
+    "--supported-transfer-mode": "lmcache_driven",
+    "--l1-size-gb": 400,
+    "--l1-use-lazy": null,
+    "--eviction-policy": "LRU",
+    "--max-gpu-workers": 1
+  },
+  "environment": {
+    "PATH": "/opt/venv/bin:/opt/rocm/bin:/usr/local/bin:/usr/bin:/bin",
+    "LD_LIBRARY_PATH": "/opt/rocm/lib",
+    "LANG": "C.UTF-8",
+    "PYTHONNOUSERSITE": "1",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONUNBUFFERED": "1",
+    "PYTHONHASHSEED": "0",
+    "HIP_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
+    "ROCR_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
+    "ARCH": "gfx950",
+    "GPU_ARCHS": "gfx950",
+    "FLYDSL_GPU_ARCH": "gfx950",
+    "MAX_JOBS": "1",
+    "CMAKE_BUILD_PARALLEL_LEVEL": "1",
+    "TORCHINDUCTOR_COMPILE_THREADS": "1",
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "HF_HUB_OFFLINE": "1",
+    "HF_DATASETS_OFFLINE": "1",
+    "TRANSFORMERS_OFFLINE": "1",
+    "ATOM_MONO_ENABLE": "1",
+    "ATOM_MONO_POLL_SLEEP_UNITS": "16",
+    "ATOM_MLA_ABSORB_BF16": "1",
+    "ATOM_ENABLE_REPLAYSSM": "1",
+    "ATOM_GDN_SSM_DTYPE": "fp32",
+    "AITER_SITUV2_A4W4": "1",
+    "AITER_LOG_LEVEL": "WARNING",
+    "ATOM_STATE_CHECKPOINT_DEMAND": "1",
+    "LMCACHE_CHUNK_SIZE": "512",
+    "ATOM_ENABLE_RELAXED_MTP": "0",
+    "ATOM_SPEC_LOSSLESS_SAMPLING": "0"
+  }
+}
