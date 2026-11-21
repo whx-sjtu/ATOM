@@ -6,11 +6,13 @@ import hashlib
 import importlib.abc
 import importlib.machinery
 import json
+import math
 import os
 import signal
 import sys
 import threading
 import time
+from contextlib import contextmanager, nullcontext
 from numbers import Integral
 from pathlib import Path
 
@@ -32,15 +34,136 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def atomic(path, value):
+class ObserverCosts:
+    """Fixed-size, inclusive observer scopes; no operands or per-call history."""
+
+    NAMES = (
+        "iteration_work",
+        "query_sweep",
+        "host_snapshot",
+        "host_array_copy",
+        "descriptor",
+        "marker_initial_record",
+        "marker_record",
+        "initial_event_query",
+        "pending_event_query",
+        "json_encode",
+        "file_write",
+        "publication",
+        "fr_startup_call",
+        "fr_final_call",
+        "fr_decode",
+        "controller_phase_scan",
+        "controller_snapshot_read",
+        "client_ledger",
+    )
+
+    BYTE_CATEGORIES = frozenset(
+        {
+            "host_array_copy",
+            "json_encode",
+            "file_write",
+            "fr_startup_call",
+            "fr_final_call",
+            "fr_decode",
+            "controller_phase_scan",
+            "controller_snapshot_read",
+        }
+    )
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.rows = {
+            name: {
+                "started": 0,
+                "finished": 0,
+                "failed": 0,
+                "in_flight": 0,
+                "max_in_flight": 0,
+                "wall_sum_s": 0.0,
+                "thread_cpu_sum_s": 0.0,
+                "wall_max_s": 0.0,
+                "thread_cpu_max_s": 0.0,
+                "bytes_completed": 0 if name in self.BYTE_CATEGORIES else None,
+                "bytes_unavailable_calls": 0 if name in self.BYTE_CATEGORIES else None,
+                "true_results": 0,
+                "false_results": 0,
+            }
+            for name in self.NAMES
+        }
+
+    @contextmanager
+    def measure(self, name):
+        row = self.rows[name]
+        wall, cpu = time.monotonic(), time.thread_time()
+        with self.lock:
+            row["started"] += 1
+            row["in_flight"] += 1
+            row["max_in_flight"] = max(row["max_in_flight"], row["in_flight"])
+        result, failed = {"bytes": None, "query_result": None}, True
+        try:
+            yield result
+            failed = False
+        finally:
+            elapsed, used = time.monotonic() - wall, time.thread_time() - cpu
+            with self.lock:
+                row["finished"] += 1
+                row["failed"] += int(failed)
+                row["in_flight"] -= 1
+                row["wall_sum_s"] += elapsed
+                row["thread_cpu_sum_s"] += used
+                row["wall_max_s"] = max(row["wall_max_s"], elapsed)
+                row["thread_cpu_max_s"] = max(row["thread_cpu_max_s"], used)
+                if name in self.BYTE_CATEGORIES:
+                    if result["bytes"] is None:
+                        row["bytes_unavailable_calls"] += 1
+                    else:
+                        row["bytes_completed"] += result["bytes"]
+                row["true_results"] += int(result["query_result"] is True)
+                row["false_results"] += int(result["query_result"] is False)
+
+    def snapshot(self):
+        with self.lock:
+            return {
+                "schema": 1,
+                "available": True,
+                "sampled_mono": time.monotonic(),
+                "categories": {name: dict(row) for name, row in self.rows.items()},
+                "limits": "Inclusive/nested scopes and concurrent calls overlap; do not sum them as native/GPU duration. Iteration_work includes query_sweep/queries, export/decode and publication but excludes the unchanged sleep. Failed counts mean exceptions escaping that scope, not every logical observer failure. Host_snapshot includes its encode/write/descriptor children; publication includes encode/write. Clock/aggregation overhead is not separately measured. Byte-null categories have no measured byte quantity; payload bytes are not GPU traffic. Bytes cover completed host-array copies, encodes/writes/FR returns/decodes and controller file reads; partial failed writes and unfinished calls are unavailable. This snapshot precedes its own encode/write completion; later work may be absent.",
+            }
+
+
+def measured(name):
+    def decorate(method):
+        @functools.wraps(method)
+        def call(self, *args, **kwargs):
+            costs = getattr(self, "costs", None)
+            with costs.measure(name) if costs is not None else nullcontext():
+                return method(self, *args, **kwargs)
+
+        return call
+
+    return decorate
+
+
+def atomic(path, value, costs=None):
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(f".tmp-{os.getpid()}")
-    if isinstance(value, bytes):
-        tmp.write_bytes(value)
-    else:
-        tmp.write_text(json.dumps(value, allow_nan=False) + "\n")
-    tmp.replace(path)
+    if not isinstance(value, bytes):
+        with (
+            costs.measure("json_encode")
+            if costs is not None
+            else nullcontext({"bytes": 0})
+        ) as item:
+            value = (json.dumps(value, allow_nan=False) + "\n").encode()
+            item["bytes"] = len(value)
+    with (
+        costs.measure("file_write") if costs is not None else nullcontext({"bytes": 0})
+    ) as item:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f".tmp-{os.getpid()}")
+        written = tmp.write_bytes(value)
+        tmp.replace(path)
+        item["bytes"] = written
 
 
 def host_int(value, name):
@@ -178,7 +301,11 @@ class StopState:
         self.ready = None
         self.reason = None
         self.frontiers = {}
-        self.on_stop = None
+        self.on_stop = self.on_clock_change = None
+        self.client_spawn = self.warmup = self.target_first = self.target_quorum = None
+        self.target_identity = None
+        self.phases = {}
+        self.costs = ObserverCosts()
 
     def latch(self, reason, now, detail=None):
         if self.reason is None:
@@ -188,12 +315,139 @@ class StopState:
         return self.reason
 
     def deadline(self):
-        phase_end = (
-            self.ready + self.config["prefix_s"]
-            if self.ready is not None
-            else self.launched + self.config["startup_s"]
+        absolute = self.launched + self.config["workload_s"]
+        if self.ready is None:
+            return min(absolute, self.launched + self.config["startup_s"])
+        if self.target_quorum is not None:
+            return absolute
+        ends = [absolute, self.ready + self.config["prefix_s"]]
+        if self.warmup is not None:
+            ends.append(self.warmup + self.config["target_arrival_s"])
+        elif self.client_spawn is not None:
+            ends.append(self.client_spawn + self.config["client_setup_s"])
+        return min(ends)
+
+    def anchors(self):
+        return {
+            "L": self.launched,
+            "R": self.ready,
+            "C": self.client_spawn,
+            "W": self.warmup,
+            "T": self.target_first,
+            "quorum_observed_mono": self.target_quorum,
+            "target_identity": self.target_identity,
+            "deadline_mono": self.deadline(),
+            "phase_receipts": self.phases,
+        }
+
+    def start_client(self, now):
+        if self.reason:
+            return self.reason
+        if self.client_spawn is not None:
+            raise ValueError("observer client already spawned; no second arm")
+        if self.ready is None or now < self.ready:
+            raise ValueError("client spawn requires sealed readiness")
+        if now >= self.deadline():
+            return self.latch("deadline", now, "before client spawn")
+        self.client_spawn = now
+        if self.on_clock_change:
+            self.on_clock_change()
+
+    def observe_warmup(self, receipt):
+        if self.warmup is not None or self.reason:
+            return
+        now = receipt["observed_mono"]
+        if self.client_spawn is not None and now < self.client_spawn:
+            return self.latch(
+                "observer-failure", now, "warmup observation precedes spawn"
+            )
+        if self.client_spawn is None or now >= self.deadline():
+            return self.latch(
+                "deadline", now, "warmup setup observation late/unavailable"
+            )
+        self.warmup = now
+        self.phases["warmup"] = receipt
+        if self.on_clock_change:
+            self.on_clock_change()
+
+    def entry_quorum(self, snapshots, now):
+        if self.target_quorum is not None or self.warmup is None:
+            return
+        keys, recorded, streams = [], [], {}
+        first_layer = self.config["layers"][0]
+        expected_cache = (
+            self.config["indexer_prefix_template"].format(layer=first_layer)
+            + ".k_cache"
         )
-        return min(self.launched + self.config["workload_s"], phase_end)
+        for rank in self.config["ranks"]:
+            state = snapshots.get(rank, {})
+            markers = state.get("markers", [])
+            if not markers or markers[0].get("recorded") is not True:
+                return
+            marker = markers[0]
+            headers = state.get("bracket", [])
+            if not headers:
+                raise ValueError("recorded entry without request header")
+            header, semantic, stream = (
+                headers[0],
+                marker.get("semantic", {}),
+                marker.get("stream", {}),
+            )
+            when = marker.get("recorded_mono")
+            valid = (
+                state.get("ready") is True
+                and state.get("rank") == rank
+                and header.get("context") == [self.config["contexts"][0]]
+                and header.get("new") == [self.config["new_tokens"]]
+                and header.get("cached")
+                == [self.config["contexts"][0] - self.config["new_tokens"]]
+                and len(header.get("request_ids", [])) == 1
+                and header.get("total") == header.get("prefill") == 1
+                and header.get("decode") == 0
+                and header.get("dummy") is False
+                and marker.get("boundary") == 0
+                and marker.get("generation") == 1
+                and marker.get("state") in ("recorded-pending", "completed")
+                and semantic.get("request") == header["request_ids"][0]
+                and semantic.get("forward") == header.get("forward")
+                and semantic.get("context") == self.config["contexts"][0]
+                and semantic.get("layer") == first_layer
+                and semantic.get("cache") == expected_cache
+                and semantic.get("layout") == "mfma"
+                and stream.get("device") == rank
+                and type(stream.get("stream_id")) is int
+                and type(stream.get("cuda_stream")) is int
+                and type(when) in (int, float)
+                and math.isfinite(when)
+                and self.client_spawn <= when <= now
+            )
+            if not valid:
+                raise ValueError(f"rank {rank}: first-target entry identity invalid")
+            if any(
+                m.get("recorded")
+                and (m.get("generation") != 1 or m.get("stream") != stream)
+                for m in markers[:6]
+            ):
+                raise ValueError(
+                    f"rank {rank}: first-helper generation/stream mismatch"
+                )
+            keys.append(
+                {
+                    "header": header,
+                    "semantic": semantic,
+                    "generation": marker["generation"],
+                }
+            )
+            streams[rank] = dict(stream)
+            recorded.append(when)
+        if any(key != keys[0] for key in keys):
+            raise ValueError("cross-rank first-target entry mismatch")
+        self.target_first, self.target_quorum = min(recorded), now
+        self.target_identity = dict(
+            keys[0], per_rank_streams=streams, last_recorded_mono=max(recorded)
+        )
+        if self.on_clock_change:
+            self.on_clock_change()
 
     def check(self, snapshots, now, phase=False):
         c = self.config
@@ -226,6 +480,10 @@ class StopState:
                 return self.latch(
                     "no-progress", now, {"rank": rank, "frontier": current}
                 )
+        try:
+            self.entry_quorum(snapshots, now)
+        except (ValueError, TypeError, KeyError) as error:
+            return self.latch("observer-failure", now, str(error))
         if len(snapshots) == len(c["ranks"]) and all(
             s.get("complete") for s in snapshots.values()
         ):
@@ -300,6 +558,7 @@ class Observer:
             "complete": False,
         }
         self.lock = threading.RLock()
+        self.costs = ObserverCosts()
         self.maps, self.receipts, self.calibrations = [], [], []
         self.state["gathers"] = self.receipts
         self.catalog, self.first_request, self.forward_number = {}, None, 0
@@ -325,8 +584,8 @@ class Observer:
         if list(selected.ranks) != self.config["ranks"] or selected is not tp:
             raise ValueError("selected group/rank ordering changed")
         probe = self.dump()
-        atomic(
-            self.path / "probe.json",
+        self.write(
+            "probe.json",
             {
                 "version": probe["version"],
                 "group": self.state["group"],
@@ -346,24 +605,39 @@ class Observer:
         self.state["initial_stream"] = stream_identity(torch)
         for _ in range(count):
             event = torch.cuda.Event(enable_timing=False)
-            event.record(torch.cuda.current_stream())
+            with self.costs.measure("marker_initial_record"):
+                event.record(torch.cuda.current_stream())
             self.events.append(event)
             self.initialized.append(False)
         self.state["pool_generation"] = 0
         self.publish()
         threading.Thread(target=self.loop, daemon=True, name="k31-observer").start()
 
+    def write(self, name, value):
+        atomic(self.path / name, value, getattr(self, "costs", None))
+
     def dump(self, destination=None):
-        raw = self.torch._C._distributed_c10d._dump_nccl_trace_json(
-            includeCollectives=True, onlyActive=False
+        costs = getattr(self, "costs", None)
+        category = (
+            "fr_final_call" if destination == "final-trace.json" else "fr_startup_call"
         )
+        with costs.measure(category) if costs is not None else nullcontext({}) as item:
+            raw = self.torch._C._distributed_c10d._dump_nccl_trace_json(
+                includeCollectives=True, onlyActive=False
+            )
+            if isinstance(raw, bytes):
+                item["bytes"] = len(raw)
         if not isinstance(raw, bytes) or len(raw) > self.config["export_bytes"]:
             raise ValueError("FlightRecorder format/size unavailable")
-        result = json.loads(raw)
+        with (
+            costs.measure("fr_decode") if costs is not None else nullcontext({})
+        ) as item:
+            result = json.loads(raw)
+            item["bytes"] = len(raw)
         if not all(k in result for k in ("version", "pg_config", "pg_status")):
             raise ValueError("FlightRecorder schema unavailable")
         if destination:
-            atomic(self.path / destination, raw)
+            self.write(destination, raw)
         return result
 
     def fail(self, message):
@@ -371,15 +645,34 @@ class Observer:
             if not self.state["failure"]:
                 self.state["failure"] = str(message)
 
+    @measured("publication")
     def publish(self):
         with self.lock:
             self.state["heartbeat"] = time.monotonic()
-            atomic(self.path / "state.json", self.state)
+            self.state["observer_costs"] = (
+                self.costs.snapshot()
+                if hasattr(self, "costs")
+                else {"available": False}
+            )
+            atomic(self.path / "state.json", self.state, getattr(self, "costs", None))
 
+    def query(self, event, initial=False):
+        costs = getattr(self, "costs", None)
+        name = "initial_event_query" if initial else "pending_event_query"
+        with costs.measure(name) if costs is not None else nullcontext({}) as item:
+            value = event.query()
+            item["query_result"] = value
+            return value
+
+    @measured("descriptor")
+    def describe(self, tensor):
+        return descriptor(tensor)
+
+    @measured("query_sweep")
     def poll(self):
         for i, event in enumerate(self.events):
             if not self.initialized[i]:
-                if event.query():
+                if self.query(event, initial=True):
                     self.initialized[i] = True
                 continue
             with self.lock:
@@ -393,7 +686,7 @@ class Observer:
             ):
                 continue
             try:
-                complete = event.query()
+                complete = self.query(event)
             except Exception:
                 with self.lock:
                     marker["state"] = "query-unavailable"
@@ -406,56 +699,72 @@ class Observer:
     def loop(self):
         try:
             while True:
-                self.poll()
-                with self.lock:
-                    all_done = (
-                        len(self.state["markers"]) == self.config["pool_size"]
-                        and frontier(self.state["markers"]) == self.config["pool_size"]
-                    )
-                trigger = (self.root / "trigger.json").exists()
-                if (trigger or all_done) and not self.final_exported:
-                    self.final_exported = True
-                    trace = self.dump("final-trace.json")
-                    joined = []
-                    try:
-                        joined = associate(
-                            trace, self.group, self.calibrations[0], self.receipts
-                        )
-                    except (ValueError, IndexError) as error:
-                        self.state["association_unavailable"] = str(error)
-                    entries = sorted(
-                        selected_entries(trace, self.group),
-                        key=lambda e: e["collective_seq_id"],
-                    )
-                    first = next(
-                        (i for i, e in enumerate(entries) if e["state"] != "completed"),
-                        None,
-                    )
-                    self.state["communication_frontier"] = {
-                        "first_unfinished": (
-                            entries[first] if first is not None else None
-                        ),
-                        "preceding_completed": (
-                            entries[first - 1] if first is not None and first else None
-                        ),
-                        "first_retained_record": (
-                            entries[0]["record_id"] if entries else None
-                        ),
-                        "history_complete_before_ring_start": "unavailable",
-                    }
+                costs = getattr(self, "costs", None)
+                with (
+                    costs.measure("iteration_work")
+                    if costs is not None
+                    else nullcontext()
+                ):
+                    self.poll()
                     with self.lock:
-                        self.state["associations"] = joined
-                        self.state["complete"] = bool(
-                            all_done and len(joined) == 96 and not self.state["failure"]
+                        all_done = (
+                            len(self.state["markers"]) == self.config["pool_size"]
+                            and frontier(self.state["markers"])
+                            == self.config["pool_size"]
                         )
-                self.publish()
-                if trigger:
-                    return
+                    trigger = (self.root / "trigger.json").exists()
+                    if (trigger or all_done) and not self.final_exported:
+                        self.final_exported = True
+                        trace = self.dump("final-trace.json")
+                        joined = []
+                        try:
+                            joined = associate(
+                                trace, self.group, self.calibrations[0], self.receipts
+                            )
+                        except (ValueError, IndexError) as error:
+                            self.state["association_unavailable"] = str(error)
+                        entries = sorted(
+                            selected_entries(trace, self.group),
+                            key=lambda e: e["collective_seq_id"],
+                        )
+                        first = next(
+                            (
+                                i
+                                for i, e in enumerate(entries)
+                                if e["state"] != "completed"
+                            ),
+                            None,
+                        )
+                        self.state["communication_frontier"] = {
+                            "first_unfinished": (
+                                entries[first] if first is not None else None
+                            ),
+                            "preceding_completed": (
+                                entries[first - 1]
+                                if first is not None and first
+                                else None
+                            ),
+                            "first_retained_record": (
+                                entries[0]["record_id"] if entries else None
+                            ),
+                            "history_complete_before_ring_start": "unavailable",
+                        }
+                        with self.lock:
+                            self.state["associations"] = joined
+                            self.state["complete"] = bool(
+                                all_done
+                                and len(joined) == 96
+                                and not self.state["failure"]
+                            )
+                    self.publish()
+                    if trigger:
+                        return
                 time.sleep(0.1)
         except Exception as error:  # noqa: BLE001
             self.fail(f"observer query/export: {type(error).__name__}: {error}")
             self.publish()
 
+    @measured("host_snapshot")
     def seal(self, runner):
         if self.state["worker_environment"] != self.plan["environments"]["server"]:
             raise ValueError("effective worker environment differs from server plan")
@@ -514,6 +823,7 @@ class Observer:
             )
         self.publish()
 
+    @measured("host_snapshot")
     def prepare(self, runner, batch):
         self.forward_number += 1
         TLS.semantic = TLS.target = None
@@ -542,7 +852,13 @@ class Observer:
             "input_fingerprint": "unavailable",
         }
         # Native batch fields are CPU arrays/scalars. Serialize now to prevent aliasing.
-        semantic = json.loads(json.dumps(semantic))
+        costs = getattr(self, "costs", None)
+        with (
+            costs.measure("json_encode") if costs is not None else nullcontext({})
+        ) as item:
+            encoded = json.dumps(semantic)
+            item["bytes"] = len(encoded.encode())
+        semantic = json.loads(encoded)
         TLS.semantic, TLS.target = semantic, None
         if (
             semantic["dummy"]
@@ -568,6 +884,7 @@ class Observer:
             with self.lock:
                 self.state["bracket"].append(semantic)
 
+    @measured("host_snapshot")
     def metadata(self, builder, bs, lpad, cu_pad, g_cu, g_lens, block_tables):
         target = getattr(TLS, "target", None)
         if target is None:
@@ -587,8 +904,15 @@ class Observer:
         ):
             if not isinstance(value, np.ndarray):
                 raise TypeError("metadata witness is not host ndarray")
-            arrays[name] = value.copy(order="C")
-            arrays[name].flags.writeable = False
+            costs = getattr(self, "costs", None)
+            with (
+                costs.measure("host_array_copy")
+                if costs is not None
+                else nullcontext({})
+            ) as item:
+                arrays[name] = value.copy(order="C")
+                arrays[name].flags.writeable = False
+                item["bytes"] = arrays[name].nbytes
         index = self.config["contexts"].index(target["context"][0])
         if int(cu_pad[bs]) != self.config["local_padded"][index]:
             raise ValueError("candidate local padded count changed")
@@ -612,8 +936,9 @@ class Observer:
                 for k, v in arrays.items()
             },
         }
-        atomic(self.path / f"host-map-{index}.json", record)
+        self.write(f"host-map-{index}.json", record)
 
+    @measured("host_snapshot")
     def published(self, metadata):
         if getattr(TLS, "target", None) is not None:
             record = {
@@ -621,7 +946,7 @@ class Observer:
                 "stream": stream_identity(self.torch),
                 "source": "upload_numpy and decomposition use current stream",
                 "fields": {
-                    name: descriptor(getattr(metadata, name))
+                    name: self.describe(getattr(metadata, name))
                     for name in (
                         "dcp_indexer_fp4_read_page",
                         "dcp_indexer_fp4_read_row",
@@ -635,6 +960,7 @@ class Observer:
             with self.lock:
                 self.state.setdefault("metadata_publication", []).append(record)
 
+    @measured("host_snapshot")
     def begin_call(self, prefix, cache, scale, metadata, layout):
         target = getattr(TLS, "target", None)
         if target is None or self.torch.cuda.is_current_stream_capturing():
@@ -672,13 +998,13 @@ class Observer:
             self.state.setdefault("operands", []).append(
                 {
                     "semantic": key,
-                    "cache": descriptor(cache),
-                    "scale": descriptor(scale),
-                    "read_page": descriptor(metadata.dcp_indexer_fp4_read_page),
-                    "read_row": descriptor(metadata.dcp_indexer_fp4_read_row),
-                    "gather_index": descriptor(metadata.dcp_indexer_gather_index),
-                    "stage_page": descriptor(metadata.dcp_indexer_fp4_stage_page),
-                    "stage_row": descriptor(metadata.dcp_indexer_fp4_stage_row),
+                    "cache": self.describe(cache),
+                    "scale": self.describe(scale),
+                    "read_page": self.describe(metadata.dcp_indexer_fp4_read_page),
+                    "read_row": self.describe(metadata.dcp_indexer_fp4_read_row),
+                    "gather_index": self.describe(metadata.dcp_indexer_gather_index),
+                    "stage_page": self.describe(metadata.dcp_indexer_fp4_stage_page),
+                    "stage_row": self.describe(metadata.dcp_indexer_fp4_stage_row),
                     "stage_pages": int(metadata.dcp_indexer_fp4_stage_pages),
                 }
             )
@@ -696,7 +1022,9 @@ class Observer:
         stream = stream_identity(self.torch)
         if boundary and stream != self.state["markers"][call["offset"]]["stream"]:
             raise ValueError("helper stream identity changed")
-        self.events[slot].record(self.torch.cuda.current_stream())
+        costs = getattr(self, "costs", None)
+        with costs.measure("marker_record") if costs is not None else nullcontext():
+            self.events[slot].record(self.torch.cuda.current_stream())
         with self.lock:
             marker.update(
                 recorded=True,
@@ -916,7 +1244,13 @@ def patch(module):
                                 runtime.receipts.append(r)
                         return r, trace
 
-                    captured = safe(before)
+                    costs = getattr(runtime, "costs", None)
+                    with (
+                        costs.measure("host_snapshot")
+                        if costs is not None
+                        else nullcontext()
+                    ):
+                        captured = safe(before)
                     if captured:
                         receipt, before_trace = captured
                 try:
@@ -942,13 +1276,18 @@ def patch(module):
                                 before_trace, runtime.dump(), receipt, runtime.group
                             )
                             runtime.calibrations.append(calibration)
-                            atomic(
-                                runtime.path
-                                / f"calibration-{len(runtime.calibrations)}.json",
+                            runtime.write(
+                                f"calibration-{len(runtime.calibrations)}.json",
                                 {"receipt": receipt, "mapping": calibration},
                             )
 
-                    safe(after)
+                    costs = getattr(runtime, "costs", None)
+                    with (
+                        costs.measure("host_snapshot")
+                        if costs is not None
+                        else nullcontext()
+                    ):
+                        safe(after)
                 return result
 
             return hooked

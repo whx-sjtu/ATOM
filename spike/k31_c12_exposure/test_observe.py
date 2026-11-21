@@ -837,6 +837,398 @@ def test_native_capture_context_bypasses_batch_preparation(tmp_path):
     assert not torch.cuda.is_initialized() and not torch.distributed.is_initialized()
 
 
+def coverage_state(now=700, recorded=699):
+    config = P["observer"]
+    header = {
+        "forward": 202,
+        "request_ids": [9],
+        "external_request_ids": [None],
+        "new": [8192],
+        "cached": [385024],
+        "context": [393216],
+        "dummy": False,
+        "total": 1,
+        "prefill": 1,
+        "decode": 0,
+        "publication_epoch": 223,
+    }
+    semantic = {
+        "request": 9,
+        "context": 393216,
+        "forward": 202,
+        "layer": 3,
+        "cache": config["indexer_prefix_template"].format(layer=3) + ".k_cache",
+        "layout": "mfma",
+    }
+    return {
+        rank: {
+            "rank": rank,
+            "ready": True,
+            "heartbeat": now,
+            "failure": None,
+            "bracket": [copy.deepcopy(header)],
+            "complete": False,
+            "markers": [
+                {
+                    "semantic": dict(semantic),
+                    "generation": 1,
+                    "boundary": 0,
+                    "recorded": True,
+                    "recorded_mono": recorded,
+                    "state": "recorded-pending",
+                    "stream": {
+                        "device": rank,
+                        "stream_id": 0,
+                        "cuda_stream": rank * 100,
+                    },
+                }
+            ],
+        }
+        for rank in range(8)
+    }
+
+
+def coverage_clock():
+    stop = O.StopState(P["observer"], 0)
+    stop.ready = 400
+    stop.start_client(410)
+    return stop
+
+
+def test_coverage_anchors_and_quorum_retire_only_pre_target_cap():
+    stop = coverage_clock()
+    assert stop.deadline() == 560
+    stop.observe_warmup({"observed_mono": 500, "producer_wall": 450})
+    assert stop.warmup == 500 and stop.deadline() == 740
+    rows = coverage_state()
+    assert stop.check(rows, 700) is None
+    assert stop.target_first == 699 and stop.target_quorum == 700
+    assert stop.deadline() == 1320 and stop.launched == 0
+    assert (
+        stop.anchors()["target_identity"]["per_rank_streams"][7]["cuda_stream"] == 700
+    )
+    assert stop.check({}, 1320)["reason"] == "deadline"
+    assert stop.grace_end() == 1335
+    previous = copy.deepcopy(stop.anchors())
+    stop.observe_warmup({"observed_mono": 1330})
+    assert stop.start_client(1330) == stop.reason
+    assert stop.anchors() == previous
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "header_only",
+        "unrecorded",
+        "missing_rank",
+        "mismatch_request",
+        "wrong_generation",
+        "wrong_stream",
+        "wrong_context",
+    ],
+)
+def test_quorum_rejects_incomplete_or_mismatched_entry(bad):
+    stop = coverage_clock()
+    stop.observe_warmup({"observed_mono": 500})
+    rows = coverage_state()
+    if bad == "header_only":
+        rows[7]["markers"] = []
+    elif bad == "unrecorded":
+        rows[7]["markers"][0]["recorded"] = False
+    elif bad == "missing_rank":
+        del rows[7]
+    elif bad == "mismatch_request":
+        rows[7]["bracket"][0]["request_ids"] = [99]
+        rows[7]["markers"][0]["semantic"]["request"] = 99
+    elif bad == "wrong_generation":
+        rows[7]["markers"][0]["generation"] = 2
+    elif bad == "wrong_stream":
+        rows[7]["markers"][0]["stream"]["device"] = 0
+    else:
+        rows[7]["markers"][0]["semantic"]["context"] = 401408
+    result = stop.check(rows, 700)
+    assert stop.target_quorum is None and stop.deadline() == 740
+    if bad not in ("header_only", "unrecorded", "missing_rank"):
+        assert result["reason"] == "observer-failure"
+
+
+def test_stage_deadlines_and_late_quorum_cannot_revive():
+    stop = coverage_clock()
+    stop.observe_warmup({"observed_mono": 560, "producer_wall": 500})
+    assert stop.reason["reason"] == "deadline" and stop.warmup is None
+    stop = coverage_clock()
+    stop.observe_warmup({"observed_mono": 500})
+    assert (
+        stop.check(coverage_state(now=740, recorded=739), 740)["reason"] == "deadline"
+    )
+    assert stop.target_quorum is None
+    early = O.StopState(P["observer"], 100)
+    early.ready = 1000
+    early.start_client(1001)
+    early.observe_warmup({"observed_mono": 1150})
+    assert early.deadline() == 1390  # min(W+240, R+420, L+1320)
+    assert early.check(coverage_state(now=1300, recorded=1299), 1300) is None
+    assert early.deadline() == 1420
+
+
+def test_no_progress_still_uses_each_ranks_earliest_incomplete():
+    stop = coverage_clock()
+    stop.observe_warmup({"observed_mono": 500})
+    rows = coverage_state(now=700, recorded=699)
+    assert stop.check(rows, 700) is None
+    for rank, row in rows.items():
+        row["heartbeat"] = 730
+        if rank != 0:
+            row["markers"][0].update(state="completed", completed_mono=729)
+    assert stop.check(rows, 730)["reason"] == "no-progress"
+    assert stop.reason["detail"] == {"rank": 0, "frontier": 0}
+
+
+def test_real_phase_observation_keeps_producer_delay_separate(tmp_path, monkeypatch):
+    import run
+
+    stop = coverage_clock()
+    log = tmp_path / "logs/aiperf.log"
+    log.parent.mkdir()
+    log.write_text("1970-01-01 00:16:00.000 AIPerf System is PROFILING\n")
+    monkeypatch.setattr(run.time, "monotonic", lambda: 500)
+    monkeypatch.setattr(run.time, "time", lambda: 1100)
+    run.scan_observer_phases(stop, tmp_path)
+    assert stop.warmup is None
+    log.write_text(
+        "1970-01-01 00:16:00.000 - Phase warmup (warmup) started | target: 131 requests\n"
+    )
+    run.scan_observer_phases(stop, tmp_path)
+    assert stop.warmup == 500 and stop.deadline() == 740
+    receipt = stop.phases["warmup"]
+    assert receipt["producer_timestamp_raw"] == "1970-01-01 00:16:00.000"
+    assert receipt["discovery_delay_wall_s"] == 1100 - receipt["producer_wall"]
+
+
+def test_costs_are_bounded_and_report_nested_inflight_bytes(tmp_path):
+    costs = O.ObserverCosts()
+    with costs.measure("host_snapshot"):
+        snap = costs.snapshot()
+        assert snap["categories"]["host_snapshot"]["in_flight"] == 1
+        O.atomic(tmp_path / "one.json", {"field": [1, 2]}, costs)
+    with pytest.raises(RuntimeError), costs.measure("pending_event_query"):
+        raise RuntimeError("query failed")
+    data = costs.snapshot()["categories"]
+    assert len(data) == len(O.ObserverCosts.NAMES)
+    assert data["host_snapshot"]["finished"] == 1
+    assert data["host_snapshot"]["in_flight"] == 0
+    assert data["pending_event_query"]["failed"] == 1
+    assert (
+        data["file_write"]["bytes_completed"] == (tmp_path / "one.json").stat().st_size
+    )
+    assert (
+        data["json_encode"]["bytes_completed"] == data["file_write"]["bytes_completed"]
+    )
+    json.dumps(costs.snapshot(), allow_nan=False)
+
+
+def test_accounted_poll_keeps_full_pending_sweep_and_skips_unrecorded():
+    import threading
+
+    runtime = object.__new__(O.Observer)
+    runtime.costs = O.ObserverCosts()
+    runtime.lock = threading.RLock()
+    called = []
+    runtime.events = [NS(query=lambda i=i: called.append(i) or False) for i in range(4)]
+    runtime.initialized = [True] * 4
+    runtime.state = {
+        "markers": [marker(), marker("completed"), marker(recorded=False), marker()]
+    }
+    runtime.poll()
+    assert called == [0, 3]
+    row = runtime.costs.snapshot()["categories"]["pending_event_query"]
+    assert row["started"] == row["finished"] == row["false_results"] == 2
+
+
+def test_terminal_receipt_preserves_signal_phase_and_unknown_cancellations(tmp_path):
+    import run
+
+    stop = coverage_clock()
+    stop.observe_warmup({"observed_mono": 500})
+    stop.client_directory = tmp_path
+    stop.client_pid = 42
+    stop.client_process = NS(poll=lambda: -9)
+    stop.client_censored = True
+    stop.client_exit_at_stop = None
+    stop.client_stop_requested_mono = 730
+    stop.latch("deadline", 730)
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs/aiperf.log").write_text(
+        "Phase warmup progress | returned=8/131 | sent=11 | in_flight=3 | errors=0\n"
+    )
+    state = {}
+    run.observer_terminal_receipt(stop, state)
+    result = json.loads((tmp_path / "client-result.json").read_text())
+    assert result["exit_code"] == -9 and result["censored"]
+    assert result["ledger"]["terminal"] is None
+    assert result["ledger"]["last_progress"]["warmup"]["in_flight"] == 3
+    assert result["ledger"]["exports"] is None
+    assert "warmup" in result["anchors"]["phase_receipts"]
+
+
+def test_native_collective_time_is_excluded_from_observer_counters(
+    tmp_path, monkeypatch
+):
+    import threading
+    import types
+
+    clock = [0.0]
+    monkeypatch.setattr(O.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(O.time, "thread_time", lambda: clock[0])
+    seq = [0]
+    calls = []
+    result = object()
+
+    class GroupCoordinator:
+        def all_gather(self, tensor, use_custom=False, dim=-1):
+            calls.append((tensor, use_custom, dim))
+            clock[0] += 100  # Native work must not enter observer scopes.
+            seq[0] += 1
+            return result
+
+    module = types.ModuleType("aiter.dist.parallel_state")
+    module.GroupCoordinator = GroupCoordinator
+    runtime = NS(
+        group=["2", "tp"],
+        lock=threading.RLock(),
+        receipts=[],
+        costs=O.ObserverCosts(),
+        mark=lambda *a: None,
+        fail=lambda message: pytest.fail(message),
+    )
+    monkeypatch.setattr(O, "RUNTIME", runtime)
+    monkeypatch.setattr(O, "HOOKS", [])
+    monkeypatch.setattr(O.TLS, "loading", False, raising=False)
+    monkeypatch.setattr(
+        O.TLS, "call", {"semantic": {"layer": 3}, "gathers": 0}, raising=False
+    )
+    O.patch(module)
+    group = GroupCoordinator()
+    group.device_group = NS(
+        group_name="2", group_desc="tp", _get_sequence_number_for_group=lambda: seq[0]
+    )
+    tensor = NS(shape=(49152, 4, 16), dtype="torch.uint8")
+    assert group.all_gather(tensor, dim=0) is result
+    assert calls == [(tensor, False, 0)] and len(runtime.receipts) == 1
+    cost = runtime.costs.snapshot()["categories"]["host_snapshot"]
+    assert cost["started"] == cost["finished"] == 2
+    assert cost["wall_sum_s"] == cost["thread_cpu_sum_s"] == 0
+
+
+def test_explicit_fr_calls_count_bytes_separately_from_export_files(tmp_path):
+    runtime = object.__new__(O.Observer)
+    runtime.path = tmp_path
+    runtime.costs = O.ObserverCosts()
+    runtime.config = {"export_bytes": 1024}
+    calls = []
+    raw = b'{"version":"2.10","pg_config":{},"pg_status":{}}'
+
+    def export(**kwargs):
+        calls.append(kwargs)
+        return raw
+
+    runtime.torch = NS(_C=NS(_distributed_c10d=NS(_dump_nccl_trace_json=export)))
+    runtime.dump()  # Probe.
+    for _ in range(2):
+        runtime.dump()
+        runtime.dump()  # Existing startup before/after pairs.
+    runtime.dump("startup-trace.json")
+    runtime.dump("final-trace.json")
+    data = runtime.costs.snapshot()["categories"]
+    assert len(calls) == 7 and all(
+        c == {"includeCollectives": True, "onlyActive": False} for c in calls
+    )
+    assert (
+        data["fr_startup_call"]["finished"] == 6
+        and data["fr_final_call"]["finished"] == 1
+    )
+    assert data["fr_startup_call"]["bytes_completed"] == 6 * len(raw)
+    assert data["fr_final_call"]["bytes_completed"] == len(raw)
+    assert data["file_write"]["finished"] == 2 and len(list(tmp_path.glob("*"))) == 2
+
+
+def test_state_accounting_snapshot_discloses_current_publication_lag(tmp_path):
+    import threading
+
+    runtime = object.__new__(O.Observer)
+    runtime.costs = O.ObserverCosts()
+    runtime.lock = threading.RLock()
+    runtime.path = tmp_path
+    runtime.state = {}
+    runtime.publish()
+    archived = json.loads((tmp_path / "state.json").read_text())["observer_costs"][
+        "categories"
+    ]
+    assert archived["publication"]["in_flight"] == 1
+    assert archived["file_write"]["finished"] == 0
+    live = runtime.costs.snapshot()["categories"]
+    assert (
+        live["publication"]["finished"] == 1 and live["publication"]["in_flight"] == 0
+    )
+    assert live["file_write"]["finished"] == 1
+
+
+def test_terminal_io_failure_keeps_process_receipt_and_unknown_ledger(
+    tmp_path, monkeypatch
+):
+    import run
+
+    stop = coverage_clock()
+    stop.client_directory = tmp_path
+    stop.client_pid = 42
+    stop.client_process = NS(poll=lambda: -9)
+    stop.client_censored = True
+    stop.latch("deadline", 730)
+    monkeypatch.setattr(
+        run,
+        "observer_client_ledger",
+        lambda directory: (_ for _ in ()).throw(OSError("unavailable")),
+    )
+    state = {}
+    run.observer_terminal_receipt(stop, state)
+    result = json.loads((tmp_path / "client-result.json").read_text())
+    assert result["exit_code"] == -9 and result["censored"]
+    assert result["ledger"] == {
+        "available": False,
+        "terminal": None,
+        "reason": "OSError",
+    }
+    assert state["observer_client"]["exit_code"] == -9
+
+
+def test_clock_callbacks_rearm_remaining_bounds_and_no_late_restart(monkeypatch):
+    import run
+
+    now = [410]
+    calls = []
+    monkeypatch.setattr(run.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(
+        run.signal, "setitimer", lambda which, seconds: calls.append(seconds)
+    )
+    stop = O.StopState(P["observer"], 0)
+    stop.ready = 400
+    stop.on_clock_change = lambda: run.signal.setitimer(
+        run.signal.ITIMER_REAL, stop.deadline() - run.time.monotonic()
+    )
+    stop.start_client(now[0])
+    assert calls[-1] == 150
+    now[0] = 500
+    stop.observe_warmup({"observed_mono": 500})
+    assert calls[-1] == 240
+    now[0] = 700
+    stop.check(coverage_state(), 700)
+    assert calls[-1] == 620
+    stop.latch("deadline", 1320)
+    count = len(calls)
+    stop.start_client(1321)
+    assert len(calls) == count
+
+
 # The probe below is opt-in and runs as a separate guarded process, never during
 # test collection. No install()/patch() calls: sitecustomize performs registration.
 class ModelBoundary(Exception):

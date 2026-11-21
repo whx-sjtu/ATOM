@@ -1,6 +1,7 @@
 """Execute only the reviewed, bounded exposure plan; never a candidate run."""
 
 import argparse
+import datetime
 import importlib.util
 import json
 import logging
@@ -21,6 +22,7 @@ COMMON = WS / "harness/common.py"
 LOCK = "/app/agent-team-scratch/g24-gpu.lock"
 PAUSE = WS / "lead/GPU_PAUSE"
 PHASE = re.compile(r"\bPhase \S+ \(profiling\) started\b")
+OBSERVER_PHASE = re.compile(r"\bPhase (\S+) \((warmup|profiling)\) started\b")
 RANK_EVENT = re.compile(r"Rank (\d+): profiler (started|stop completed)")
 EXPORT = re.compile(r"Rank (\d+): trace exported to (\S+\.json\.gz)")
 RANKS = {str(rank) for rank in range(8)}
@@ -39,17 +41,188 @@ def arm_evidence_deadline(observer):
         signal.ITIMER_REAL, max(0.001, observer.grace_end() - time.monotonic())
     )
     # Arm before any stop/receipt I/O. The callback runs once, at the first latch.
-    client_pid = getattr(observer, "client_pid", None)
-    if client_pid is not None:
+    process = getattr(observer, "client_process", None)
+    observer.client_exit_at_stop = process.poll() if process is not None else None
+    observer.client_censored = (
+        process is not None and observer.client_exit_at_stop is None
+    )
+    if observer.client_censored:
+        observer.client_stop_requested_mono = time.monotonic()
         try:
-            os.killpg(client_pid, signal.SIGKILL)
+            os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
 
 
-def save(path, value):
+def save(path, value, costs=None):
+    if costs is not None:
+        from observe import atomic
+
+        return atomic(path, value, costs)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
+
+
+def scan_observer_phases(observer, directory):
+    with observer.costs.measure("controller_phase_scan") as cost:
+        cost["bytes"] = 0
+        for path in (directory / "logs/aiperf.log", directory / "console.log"):
+            if not path.exists():
+                continue
+            raw = path.read_bytes()
+            cost["bytes"] += len(raw)
+            for line in raw.decode(errors="replace").splitlines():
+                match = OBSERVER_PHASE.search(line)
+                if not match or match[2] in observer.phases:
+                    continue
+                now, wall = time.monotonic(), time.time()
+                stamp = re.match(r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+)", line)
+                producer = (
+                    datetime.datetime.fromisoformat(stamp[1]).timestamp()
+                    if stamp
+                    else None
+                )
+                receipt = {
+                    "phase_id": match[1],
+                    "source": str(path),
+                    "observed_mono": now,
+                    "observed_wall": wall,
+                    "producer_timestamp_raw": stamp[1] if stamp else line[:12],
+                    "producer_wall": producer,
+                    "producer_clock_assumption": "naive timestamp in shared container local timezone",
+                    "container_timezone": list(time.tzname),
+                    "discovery_delay_wall_s": (
+                        wall - producer if producer is not None else None
+                    ),
+                    "observed_after_stop": observer.reason is not None,
+                }
+                if observer.reason is None and now >= observer.deadline():
+                    observer.latch(
+                        "deadline", now, "phase observation at expired bound"
+                    )
+                if match[2] == "warmup" and observer.reason is None:
+                    observer.observe_warmup(receipt)
+                else:
+                    observer.phases[match[2]] = receipt
+                if match[2] == "profiling" and observer.reason is None:
+                    observer.latch(
+                        "phase-transition",
+                        now,
+                        "profiling traffic may precede this log",
+                    )
+
+
+def observer_client_ledger(directory):
+    """Counts only available records; progress is never a terminal cancellation ledger."""
+    from atom.benchmarks.results.records import from_aiperf
+
+    result = {
+        "terminal": None,
+        "last_progress": {},
+        "exports": None,
+        "limitation": "Unknown terminal counts remain unknown; exported rows/progress do not prove all requests settled.",
+    }
+    logs = [directory / "logs/aiperf.log", directory / "console.log"]
+    source = next((p for p in logs if p.exists()), None)
+    if source:
+        result["log_source"] = str(source)
+        for line in source.read_text(errors="replace").splitlines():
+            progress = re.search(
+                r"Phase (warmup|profiling) progress \| returned=([\d,]+)/([\d,]+) \| sent=([\d,]+) \| in_flight=([\d,]+) \| errors=([\d,]+)",
+                line,
+            )
+            if progress:
+                result["last_progress"][progress[1]] = dict(
+                    zip(
+                        ("returned", "target", "sent", "in_flight", "errors"),
+                        (int(v.replace(",", "")) for v in progress.groups()[1:]),
+                    )
+                )
+            terminal = re.search(
+                r"Phase (\S+) \((warmup|profiling)\) complete \| completed=([\d,]+), cancelled=([\d,]+), errors=([\d,]+)",
+                line,
+            )
+            if terminal:
+                if result["terminal"] is None:
+                    result["terminal"] = {}
+                result["terminal"][terminal[2]] = dict(
+                    zip(
+                        ("completed", "cancelled", "errors"),
+                        (int(v.replace(",", "")) for v in terminal.groups()[2:]),
+                    )
+                )
+    path = directory / "profile_export.jsonl"
+    if path.exists():
+        counts = {
+            phase: {
+                status: 0 for status in ("success", "error", "cancelled", "unknown")
+            }
+            for phase in ("warmup", "profiling", "unknown")
+        }
+        result["exports"] = {
+            "source": str(path),
+            "rows": 0,
+            "counts": counts,
+            "parse_complete": True,
+        }
+        with path.open() as source:
+            for index, line in enumerate(source):
+                try:
+                    row = from_aiperf(json.loads(line), index)
+                except (ValueError, TypeError) as error:
+                    result["exports"].update(
+                        parse_complete=False,
+                        unavailable_after_line=index + 1,
+                        parse_error=type(error).__name__,
+                    )
+                    break
+                phase = row["phase"] if row["phase"] in counts else "unknown"
+                status = row["status"] if row["status"] in counts[phase] else "unknown"
+                counts[phase][status] += 1
+                result["exports"]["rows"] += 1
+    return result
+
+
+def observer_terminal_receipt(observer, state):
+    process = getattr(observer, "client_process", None)
+    result = {
+        "spawn_attempted": observer.client_spawn is not None,
+        "spawned": process is not None,
+        "pid": getattr(observer, "client_pid", None),
+        "spawn_return_mono": getattr(observer, "client_spawn_return", None),
+        "exit_code_at_stop": getattr(observer, "client_exit_at_stop", None),
+        "exit_code": process.poll() if process is not None else None,
+        "censored": getattr(observer, "client_censored", False),
+        "stop_request_mono": getattr(observer, "client_stop_requested_mono", None),
+        "stop": observer.reason,
+        "anchors": observer.anchors(),
+        "phase_observed": "profiling" in observer.phases,
+        "performance_accepted": False,
+        "ledger": {
+            "available": False,
+            "terminal": None,
+            "reason": "not collected within grace",
+        },
+    }
+    state["observer_client"] = (
+        result  # Preserve scalar process evidence before any I/O.
+    )
+    directory = getattr(observer, "client_directory", None)
+    if directory is None:
+        return
+    try:
+        scan_observer_phases(observer, directory)
+        result["phase_observed"] = "profiling" in observer.phases
+        result["anchors"] = observer.anchors()
+        with observer.costs.measure("client_ledger"):
+            result["ledger"] = observer_client_ledger(directory)
+    except (OSError, ValueError, TypeError) as error:
+        result["ledger"] = {
+            "available": False,
+            "terminal": None,
+            "reason": type(error).__name__,
+        }
+    save(directory / "client-result.json", result, observer.costs)
 
 
 def request(url, timeout=2, post=False):
@@ -159,46 +332,41 @@ def run_client(C, frozen, out, label, fd, track, check_deadline, observer=None):
     argv = frozen["client"] + ["--output-artifact-dir", str(directory)]
     env = frozen["environments"]["client"]
     save(directory / "launch.json", {"argv": argv, "environment": env})
-    process = C.spawn(
-        argv,
-        env=env,
-        cwd=ROOT,
-        log_path=directory / "console.log",
-        lock_fd=fd,
-        cpus="0-111",
-    )
+    if observer:
+        observer.client_directory = directory
+        observer.start_client(time.monotonic())
+        if observer.reason:
+            return
+    try:
+        process = C.spawn(
+            argv,
+            env=env,
+            cwd=ROOT,
+            log_path=directory / "console.log",
+            lock_fd=fd,
+            cpus="0-111",
+        )
+    except Exception as error:
+        if observer:
+            observer.latch("client-failure", time.monotonic(), type(error).__name__)
+        raise
+    if observer:
+        observer.client_pid, observer.client_process = process.pid, process
+        observer.client_spawn_return = time.monotonic()
     track(process)
     if observer:
-        observer.client_pid = process.pid
-        phase = False
         while process.poll() is None and observer.reason is None:
-            for path in (directory / "logs/aiperf.log", directory / "console.log"):
-                phase = phase or (
-                    path.exists()
-                    and bool(PHASE.search(path.read_text(errors="replace")))
-                )
-            observer.check(observer_snapshots(out, frozen), time.monotonic(), phase)
+            scan_observer_phases(observer, directory)
+            observer.check(observer_snapshots(out, frozen, observer), time.monotonic())
             if observer.reason is None:
                 check_deadline()
                 time.sleep(0.1)
         if observer.reason is None:
             observer.latch(
-                "observer-failure",
+                "client-failure",
                 time.monotonic(),
-                "client exited before full bracket",
+                {"exit_code": process.poll(), "coverage": "incomplete before stop"},
             )
-        # The first-stop callback has already stopped submissions and armed grace.
-        save(
-            directory / "client-result.json",
-            {
-                "exit_code": process.poll(),
-                "stop": observer.reason,
-                "phase_observed": phase,
-                "phase_overlap_possible": phase,
-                "performance_accepted": False,
-                "cancellation_ledger": "partial; preserve raw client artifacts and server request logs",
-            },
-        )
         return
     deadline = time.monotonic() + P["client_timeout_s"]
     expired = threading.Event()
@@ -373,13 +541,21 @@ def metrics(out, label, state):
             state["errors"].append(f"metrics {suffix}: {error!r}")
 
 
-def observer_snapshots(out, frozen):
+def observer_snapshots(out, frozen, observer=None, _cost=None):
+    if observer is not None:
+        with observer.costs.measure("controller_snapshot_read") as cost:
+            cost["bytes"] = 0
+            return observer_snapshots(out, frozen, _cost=cost)
+
     snapshots = {}
     for rank in frozen["protocol"]["observer"]["ranks"]:
         path = out / "observer" / f"rank-{rank}" / "state.json"
         if not path.exists():
             continue
-        value = json.loads(path.read_text())
+        raw = path.read_bytes()
+        if _cost is not None:
+            _cost["bytes"] += len(raw)
+        value = json.loads(raw)
         if value.get("ready") and (
             value.get("head") != frozen["head"]
             or value.get("config_sha256") != frozen["observer_config_sha256"]
@@ -429,6 +605,7 @@ def execute(frozen, plan_sha):
     }
     save(out / "plan.json", frozen)
     launched = time.monotonic()
+    state["launch_mono"] = launched
     observer = None
     if frozen["mode"] == "warmup_observer":
         from observe import StopState
@@ -480,10 +657,17 @@ def execute(frozen, plan_sha):
 
     def check_deadline():
         track()
-        if any(p.poll() is not None for p in services):
+        exited = [
+            {"pid": p.pid, "exit_code": p.returncode}
+            for p in services
+            if p.poll() is not None
+        ]
+        if exited:
+            if observer:
+                observer.latch("native-failure", time.monotonic(), exited)
             raise RuntimeError("a persistent server exited")
         if observer:
-            observer.check(observer_snapshots(out, frozen), time.monotonic())
+            observer.check(observer_snapshots(out, frozen, observer), time.monotonic())
             if observer.reason:
                 raise RuntimeError(f"observer stopped: {observer.reason}")
         if time.monotonic() >= deadline:
@@ -508,6 +692,9 @@ def execute(frozen, plan_sha):
 
     if observer:
         observer.on_stop = lambda: arm_evidence_deadline(observer)
+        observer.on_clock_change = lambda: signal.setitimer(
+            signal.ITIMER_REAL, max(0.001, observer.deadline() - time.monotonic())
+        )
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGINT, interrupt)
     signal.signal(signal.SIGALRM, interrupt)
@@ -611,7 +798,10 @@ def execute(frozen, plan_sha):
             signal.setitimer(
                 signal.ITIMER_REAL, max(0.001, observer.deadline() - time.monotonic())
             )
-        save(out / "status.json", state)
+        if observer:
+            state["observer_clocks"] = observer.anchors()
+            state["observer_costs"] = observer.costs.snapshot()
+        save(out / "status.json", state, observer.costs if observer else None)
         for label in frozen["invocations"]:
             metrics(out, f"before-{label}", state)
             try:
@@ -619,7 +809,11 @@ def execute(frozen, plan_sha):
             finally:
                 if not observer or observer.reason is None:
                     metrics(out, f"after-{label}", state)
-        state["state"] = "COMPLETED"
+        state["state"] = (
+            "COMPLETED"
+            if not observer or observer.reason["reason"] == "full-bracket-completion"
+            else "FAILED"
+        )
     except BaseException as error:
         if observer:
             observer.latch("observer-failure", time.monotonic(), type(error).__name__)
@@ -637,17 +831,46 @@ def execute(frozen, plan_sha):
                         "observer-failure", time.monotonic(), state["errors"]
                     )
                     state["observer_stop"] = observer.reason
+                    state["observer_clocks"] = observer.anchors()
                     state["mode"] = "warmup_observer"
                     state["performance_accepted"] = False
+                    process = getattr(observer, "client_process", None)
+                    state["observer_client"] = {
+                        "spawned": process is not None,
+                        "pid": getattr(observer, "client_pid", None),
+                        "exit_code_at_stop": getattr(
+                            observer, "client_exit_at_stop", None
+                        ),
+                        "censored": getattr(observer, "client_censored", False),
+                        "anchors": observer.anchors(),
+                        "ledger": {
+                            "available": False,
+                            "terminal": None,
+                            "reason": "grace unavailable",
+                        },
+                    }
                     # Keep the first-stop alarm armed across every evidence read/write.
                     if time.monotonic() < observer.grace_end():
-                        save(out / "observer/trigger.json", observer.reason)
+                        save(
+                            out / "observer/trigger.json",
+                            observer.reason,
+                            observer.costs,
+                        )
+                        observer_terminal_receipt(observer, state)
                         snapshots = observer_snapshots(out, frozen)
                         alive = {p.pid for p in track()}
                         for snap in snapshots.values():
                             if snap.get("stack_registered") and snap["pid"] in alive:
                                 os.kill(snap["pid"], signal.SIGUSR2)
                         while time.monotonic() < observer.grace_end():
+                            process = getattr(observer, "client_process", None)
+                            terminal = state.get("observer_client", {})
+                            if (
+                                process is not None
+                                and terminal.get("exit_code") is None
+                                and process.poll() is not None
+                            ):
+                                observer_terminal_receipt(observer, state)
                             time.sleep(
                                 max(
                                     0, min(0.1, observer.grace_end() - time.monotonic())
@@ -674,7 +897,9 @@ def execute(frozen, plan_sha):
                 if not state.get("admitted"):
                     state["no_owned_gpu_work_started"] = True
                     state["finished"] = time.time()
-                    save(out / "status.json", state)
+                    save(
+                        out / "status.json", state, observer.costs if observer else None
+                    )
                     os.close(fd)
                     break
                 state["alive"] = [p.pid for p in track()]
@@ -691,8 +916,17 @@ def execute(frozen, plan_sha):
                     state["cleanup_error"] = repr(error)
                 state["gpu_released"] = released
                 state["finished"] = time.time()
+                if observer:
+                    process = getattr(observer, "client_process", None)
+                    state.setdefault("observer_client", {})[
+                        "exit_code_after_cleanup"
+                    ] = (process.poll() if process is not None else None)
+                    state["observer_clocks"] = observer.anchors()
+                    state["observer_costs"] = observer.costs.snapshot()
                 try:
-                    save(out / "status.json", state)
+                    save(
+                        out / "status.json", state, observer.costs if observer else None
+                    )
                 except OSError as error:
                     logger.exception(
                         "Cleanup receipt write failed; release still required"

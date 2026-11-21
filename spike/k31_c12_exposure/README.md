@@ -70,13 +70,46 @@ PublicationOwner, including mixed batches and both target lengths. Native captur
 uses Context directly and bypasses prepare_model; its model/upload boundaries are
 controlled in the CPU check, without executing a GPU graph.
 
-Startup is bounded by900s; workload always ends bymin(readiness+420,launch+1320).
-After a candidate starts, each rank's earliest incomplete frontier also has a30s
-limit. The first completion/failure/phase/deadline stop is latched. The client
-process group is killed before export grace; profiling overlap may already exist.
-Evidence ends bymin(trigger+15,launch+1335), then normal TERM/KILL/release runs.
-The parent does not wait on a worker's GIL, event query or exporter. A worker may
-still have queued GPU work during grace. There is no retry or second arm.
+The prospective coverage contract is issue6 ruling7057415189. It does not
+reinterpret the sealed0c83 deadline result. L is the original supervisor launch
+anchor, R sealed readiness, C the client-spawn call (return is separately recorded),
+and W first controller observation of an actual warmup-phase start. Producer log
+time and discovery delay are separate, with their clock assumption retained.
+Startup ends by L+900. Setup must reach W by min(C+150,R+420,L+1320); all eight
+workers must then join the same recorded393216 first-helper entry by
+min(W+240,R+420,L+1320). Headers/maps and unrecorded events cannot retire this cap.
+Only a matching quorum switches coverage to L+1320, without resetting L. T records
+the earliest entry and the parent quorum-observation time is retained separately.
+Recorded streams are checked within each rank; raw handles are not compared across
+processes as if they were global identities.
+
+The per-rank earliest-incomplete30s rule and first-stop latch remain unchanged.
+The actual profiling-phase transition stops the client even if traffic preceded
+its log. The existing hard evidence alarm ends collection by
+min(trigger+15,L+1335), then the same TERM15/KILL15/retained-lock release runs.
+There is no observer-mode900s client timer. Inner AgentX and native600s watchdog
+settings are unchanged. Signal/failure paths preserve actual process return/censor
+and phase evidence in a bounded client receipt and final cleanup status. Available
+export/progress/terminal fields are kept separate; missing cancellation counts
+remain unknown. Missing ledger data does not delay cleanup or imply a second arm.
+
+Observer costs are fixed-size aggregate categories with started/finished/failed,
+in-flight/max-in-flight, inclusive wall/thread-CPU sums/maxima, completed payload bytes and
+query outcomes (byte-null categories have no measured byte quantity; these are
+not GPU traffic counts). They cover host snapshots/descriptors, marker calls, initial and
+pending queries, the query sweep, JSON/file/publication work and each explicit FR
+call. Original native calls are outside these scopes. A successful startup still
+has six explicit FR calls but one startup file; the target has no FR calls before
+completion/trigger and one final export. The full pending sweep, work+0.1s sleep
+and full-state publication policy are unchanged.
+
+The categories overlap/nest and wall time may include waiting/preemption; they
+must not be summed or subtracted into native/GPU durations. Snapshots precede their
+own encode/write completion, so the current publication appears in flight and its
+child costs need a later snapshot. Unfinished calls, missing snapshots and partial
+failed-write bytes remain unavailable. Timing/aggregation overhead and some setup
+bookkeeping are not separately measured; host accounting cannot prove zero device
+perturbation. No per-query file writes, localization marker or on/off arm is added.
 
 Analyze with `analyze.py <run>`; observer mode rejects performance bundle creation.
 The report preserves first unfinished communication and host-map bounds, using
