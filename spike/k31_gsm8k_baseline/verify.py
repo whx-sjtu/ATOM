@@ -37,6 +37,7 @@ def dependency(name):
 
 def prepare_data():
     import importlib.metadata
+
     from lm_eval.tasks import TaskManager
     from lm_eval.utils import hash_string
 
@@ -185,7 +186,14 @@ def bind_results(output, expected):
         },
     }
     _, score = validate(manifest, expected)
-    return dict(manifest, score=score)
+    plan = json.loads((output / "plan.json").read_text())
+    return dict(
+        manifest,
+        score=score,
+        head=plan["head"],
+        profile_sha256=digest(plan["protocol"]),
+        data_sha256=plan["data"]["sha256"],
+    )
 
 
 def first_valid(registry, expected):
@@ -193,6 +201,8 @@ def first_valid(registry, expected):
     for number, entry in enumerate(registry, 1):
         if entry["attempt"] != f"author-{number:03d}":
             raise ValueError("author attempt history is not contiguous")
+        if sha(entry["status"]) != entry["status_sha256"]:
+            raise ValueError("attempt status was not sealed")
         status = json.loads(Path(entry["status"]).read_text())
         if (
             status["plan_sha256"] != entry["plan_sha256"]
@@ -213,6 +223,10 @@ def first_valid(registry, expected):
 
 
 def qualify(author, independent, expected):
+    if any(
+        author[k] != independent[k] for k in ("head", "profile_sha256", "data_sha256")
+    ):
+        raise ValueError("qualification source/profile/data mismatch")
     a, score_a = validate(author, expected)
     b, score_b = validate(independent, expected)
     helper = dependency("gsm8k_compare.py")
@@ -232,3 +246,32 @@ def qualify(author, independent, expected):
         "repeatability": "NOT_REJECTED" if established else "UNESTABLISHED",
         "interpretation": "Nonsignificance does not establish equivalence; the independent score never replaces A0.",
     }
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data", type=Path, required=True)
+    parser.add_argument("--select", type=Path)
+    parser.add_argument("--qualify", type=Path, nargs=2)
+    args = parser.parse_args()
+    expected = json.loads(args.data.read_text())
+    if args.select:
+        result = first_valid(json.loads(args.select.read_text()), expected)
+    elif args.qualify:
+        statuses = [json.loads(p.read_text()) for p in args.qualify]
+        if any(
+            s["outcome"] != "COMPLETE" or not s["cleanup"]["released"] for s in statuses
+        ):
+            raise ValueError("qualification requires two complete released attempts")
+        result = qualify(*(s["evidence"] for s in statuses), expected)
+    else:
+        parser.error(
+            "use --select REGISTRY or --qualify AUTHOR_STATUS INDEPENDENT_STATUS"
+        )
+    print(json.dumps(result, indent=2))
+
+
+if __name__ == "__main__":
+    main()

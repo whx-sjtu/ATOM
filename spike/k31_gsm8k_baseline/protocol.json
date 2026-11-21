@@ -27,7 +27,8 @@
   "ports": {
     "server": 8670,
     "cache": 5590,
-    "cache_http": 8690
+    "cache_http": 8690,
+    "engine": 29710
   },
   "bounds": {
     "startup": 900,
@@ -93,7 +94,8 @@
       24
     ],
     "--method": "dspark",
-    "--num-speculative-tokens": 3
+    "--num-speculative-tokens": 3,
+    "--port": 29710
   },
   "cache_flags": {
     "--host": "127.0.0.1",
@@ -139,5 +141,32 @@
     "LMCACHE_CHUNK_SIZE": "512",
     "ATOM_ENABLE_RELAXED_MTP": "0",
     "ATOM_SPEC_LOSSLESS_SAMPLING": "0"
+  },
+  "preparation_inputs": {
+    "cache_receipt": {
+      "path": "/app/k31-agent-team-private/task-6/runtime-ready.json",
+      "sha256": "2e754c9dc4569ea41db712c2f89fcd09f7b2f444a9c74b0681474128a1ffa346"
+    },
+    "asm_witness": {
+      "path": "/share_nfs/whx/work/k31_perf_opt/.opt-team/agent-team/evidence/task-6-warmup-observer-7b17d835/asm-source-witness.json",
+      "sha256": "b7bfd100616e1d474f4ea2e6104381ecd56125c89334726eb6ecf81dbdc42158"
+    },
+    "asm_qualification": {
+      "path": "/share_nfs/whx/work/k31_perf_opt/.opt-team/agent-team/evidence/task-6-warmup-observer-independent-preflight/7b17d835/qualification.json",
+      "sha256": "db9c4908edca16f76b2d546851aa7530d75c67344dc21e04f374ff4e9829f10b"
+    },
+    "model_pins": {
+      "path": "/share_nfs/whx/work/k31_perf_opt/.opt-team/refs/prev-team/comparison-model-pins.json",
+      "sha256": "3a5937130081502003d5a20c4599e10eb128c82cbcb5343e1d45d0f589ada66b"
+    }
+  },
+  "aiter_source": "/app/k31-agent-team-private/task-6/aiter-572232d",
+  "ck_source": "/app/k31-agent-team-private/task-4-aiter-572232d/src/3rdparty/composable_kernel",
+  "ck_sha": "f93c029e09f67c983696eecac8e0e0350f3dbb54",
+  "arrow_seed": "/app/k31-opt-cache/CX-main-mono-gsm8k/B0/hf/datasets/openai___gsm8k/main/0.0.0/740312add88f781978c0658806c59bc2815b9866",
+  "arrow_sha256": {
+    "gsm8k-test.arrow": "45965b000311d1550e5619b60b5bf31cf76edebfd8b8eddc62a876fbf8c9be95",
+    "gsm8k-train.arrow": "6146bca074f4c6c5e07de7e96cc968adab3833dbdafeda21830f27558eea3d9b",
+    "dataset_info.json": "9f7fae0b392512aba022201d3c01513ace3c88e3cfb9f25c851bd1fef7618ba1"
   }
 }

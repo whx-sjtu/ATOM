@@ -4,19 +4,29 @@ import argparse
 import ast
 import concurrent.futures
 import json
+import logging
 import os
 import signal
 import subprocess
-import sys
 import time
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-from verify import HERE, P, bind_results, dependency, first_valid, prepare_data, sha
+from verify import (
+    HERE,
+    P,
+    bind_results,
+    dependency,
+    digest,
+    first_valid,
+    prepare_data,
+    sha,
+)
 
 ROOT = HERE.parents[1]
 PRIVATE = Path(P["private_root"])
 STOP = (signal.SIGTERM, signal.SIGINT, signal.SIGALRM)
+logger = logging.getLogger(__name__)
 PAUSE = Path("/share_nfs/whx/work/k31_perf_opt/.opt-team/lead/GPU_PAUSE")
 
 
@@ -60,7 +70,7 @@ def owned_type():
         "time": time,
         "P": json.loads(Path(protocol["path"]).read_text()),
     }
-    exec(
+    exec(  # noqa: S102 - only the hash-verified Owned class declaration
         compile(ast.Module(body=[node], type_ignores=[]), record["path"], "exec"), scope
     )
     return scope["Owned"]
@@ -159,12 +169,220 @@ def commands(attempt):
     return {"server": server, "cache": cache, "client": client}
 
 
+def archive(source, ref, destination):
+    import tarfile
+
+    destination.mkdir(parents=True, exist_ok=True)
+    with subprocess.Popen(
+        ["git", "-C", source, "archive", ref], stdout=subprocess.PIPE
+    ) as process:
+        with tarfile.open(fileobj=process.stdout, mode="r|") as contents:
+            contents.extractall(destination, filter="data")
+        if process.wait() != 0:
+            raise RuntimeError("source archive failed")
+
+
+def check_cache_toolchain(cache):
+    import importlib.metadata
+    import re
+
+    site = Path("/opt/venv/lib/python3.12/site-packages")
+    toolchain = cache["identity"]["toolchain"]
+    key = toolchain["compiler_key"]
+    if not key.startswith("flydsl:" + importlib.metadata.version("flydsl") + "-"):
+        raise ValueError("cache compiler version changed")
+    matches = re.findall(r"(?:^|-)([^:]+\.py):([0-9a-f]{64})(?=-|$)", key)
+    if not matches or any(
+        sha(site / "flydsl" / name) != expected for name, expected in matches
+    ):
+        raise ValueError("cache compiler source changed")
+    version = ast.parse((site / "torch/version.py").read_text())
+    constants = {}
+    for node in version.body:
+        target = (
+            node.target
+            if isinstance(node, ast.AnnAssign)
+            else node.targets[0] if isinstance(node, ast.Assign) else None
+        )
+        if isinstance(target, ast.Name) and isinstance(node.value, ast.Constant):
+            constants[target.id] = ast.literal_eval(node.value)
+    if (
+        constants["__version__"] != toolchain["torch_version"]
+        or constants["hip"] != toolchain["torch_hip"]
+    ):
+        raise ValueError("cache Torch/ROCm identity changed")
+    if any(
+        P["environment"].get(k, "") != value
+        for k, value in toolchain["key_environment"]
+    ):
+        raise ValueError("cache compiler environment changed")
+
+
+def prepare(attempt):
+    import importlib.metadata
+    import re
+    import shutil
+
+    if not re.fullmatch(r"(author|independent)-[0-9]{3}", attempt):
+        raise ValueError("invalid attempt name")
+    namespace = PRIVATE / "namespaces" / attempt
+    namespace.mkdir(parents=True, exist_ok=False)
+    files, provenance = {}, {}
+    for record in P["preparation_inputs"].values():
+        if sha(record["path"]) != record["sha256"]:
+            raise ValueError("preparation input changed")
+        files[record["path"]] = record["sha256"]
+    cache = json.loads(
+        Path(P["preparation_inputs"]["cache_receipt"]["path"]).read_text()
+    )
+    check_cache_toolchain(cache)
+    if cache["atom_source"] != P["atom_base"]:
+        raise ValueError("cache source is not the production base")
+    for relative, expected in cache["identity"]["production_sha256"].items():
+        if sha(ROOT / relative) != expected:
+            raise ValueError(f"cache/source mismatch: {relative}")
+        files[str(ROOT / relative)] = expected
+    archive(P["aiter_source"], P["aiter_sha"], namespace / "aiter")
+    archive(P["ck_source"], P["ck_sha"], namespace / "aiter/3rdparty/composable_kernel")
+    for source, expected in cache["artifacts"].items():
+        relative = Path(source).relative_to(Path(P["aiter_source"]).parent)
+        if relative.parts[0] == "aiter-572232d":
+            relative = Path("aiter", *relative.parts[1:])
+        destination = namespace / relative
+        if sha(source) != expected:
+            raise ValueError(f"cache artifact changed: {source}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+        provenance[str(destination)] = {"source": source, "sha256": expected}
+    for source in (namespace / "aiter").rglob("*"):
+        if source.is_file():
+            files[str(source)] = sha(source)
+    for destination, record in provenance.items():
+        files[destination] = record["sha256"]
+    env = environment(attempt)
+    for key, value in env.items():
+        if key != "PYTHONPATH" and value.startswith(str(namespace)):
+            Path(value).mkdir(parents=True, exist_ok=True)
+    seed = Path(P["arrow_seed"])
+    target = Path(env["HF_DATASETS_CACHE"]) / seed.relative_to(seed.parents[3])
+    target.mkdir(parents=True, exist_ok=True)
+    for filename, expected in P["arrow_sha256"].items():
+        if sha(seed / filename) != expected:
+            raise ValueError("Arrow seed changed")
+        shutil.copyfile(seed / filename, target / filename)
+        files[str(target / filename)] = expected
+    pins = json.loads(Path(P["model_pins"]).read_text())
+    for root, filename, expected in (
+        (P["model"], "config.json", pins["target"]["config_sha256"]),
+        (P["model"], "model.safetensors.index.json", pins["target"]["index_sha256"]),
+        (P["draft"], "config.json", pins["draft"]["config_sha256"]),
+    ):
+        if sha(Path(root) / filename) != expected:
+            raise ValueError("selected model identity changed")
+    selected = {}
+    for model in (P["model"], P["draft"]):
+        for item in Path(model).iterdir():
+            if item.is_file() and (
+                item.suffix in (".json", ".py") or item.name == "tiktoken.model"
+            ):
+                files[str(item)] = selected[str(item)] = sha(item)
+    site = Path("/opt/venv/lib/python3.12/site-packages")
+    for package in (
+        "lm_eval",
+        "lmcache",
+        "transformers",
+        "datasets",
+        "torch",
+        "flydsl",
+    ):
+        for item in (site / package).rglob("*"):
+            if item.is_file() and item.suffix in (".py", ".yaml", ".so"):
+                files[str(item)] = sha(item)
+    # The CPU guard is propagated only for preparation, never into a frozen GPU child.
+    cpu_env = dict(
+        env,
+        **{
+            k: os.environ[k] for k in ("LD_PRELOAD", "KFD_GUARD_LOG") if k in os.environ
+        },
+    )
+    data = PRIVATE / "preparation" / f"{attempt}-data.json"
+    data.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [P["python"], str(HERE / "run.py"), "--data", str(data)],
+        cwd=ROOT,
+        env=cpu_env,
+        check=True,
+        timeout=180,
+    )
+    files[str(data)] = sha(data)
+    for item in Path(env["HF_MODULES_CACHE"]).rglob("*.py"):
+        files[str(item)] = sha(item)
+    receipt = {
+        "files": files,
+        "data": {"path": str(data), "sha256": sha(data)},
+        "cache_provenance": provenance,
+        "aiter_ref": P["aiter_sha"],
+        "ck_ref": P["ck_sha"],
+        "recorded_model_identity": json.loads(Path(P["model_pins"]).read_text()),
+        "new_selected_model_hashes": selected,
+        "versions": {
+            name: importlib.metadata.version(name)
+            for name in (
+                "lm_eval",
+                "torch",
+                "transformers",
+                "datasets",
+                "lmcache",
+                "flydsl",
+            )
+        },
+    }
+    for key in ("native_receipt", "assets_receipt", "runtime_imports", "consumer_plan"):
+        reference = cache["identity"][key]
+        if sha(reference["path"]) != reference["sha256"]:
+            raise ValueError("cache provenance receipt changed")
+        receipt["files"][reference["path"]] = reference["sha256"]
+    for name in receipt["versions"]:
+        distribution = importlib.metadata.distribution(name)
+        for item in distribution.files or []:
+            if str(item).endswith((".dist-info/METADATA", ".dist-info/RECORD")):
+                source = distribution.locate_file(item)
+                receipt["files"][str(source)] = sha(source)
+    for source in (P["python"], "/opt/venv/bin/lm_eval", "/opt/venv/bin/lmcache"):
+        receipt["files"][source] = sha(source)
+    receipt["cache_compatibility"] = {
+        key: cache["identity"]["toolchain"][key]
+        for key in (
+            "compiler_key_sha256",
+            "torch_version",
+            "torch_hip",
+            "target",
+            "polling_cache_tag",
+        )
+    }
+    save(PRIVATE / "preparation" / f"{attempt}.json", receipt)
+    return {
+        "attempt": attempt,
+        "data_sha256": sha(data),
+        "verified_seed_files": len(provenance),
+    }
+
+
 def make_plan(attempt):
     import re
 
     if not re.fullmatch(r"(author|independent)-[0-9]{3}", attempt):
         raise ValueError("invalid attempt name")
-    allowed = {str(p.relative_to(ROOT)) for p in HERE.iterdir() if p.is_file()}
+    allowed = {
+        str((HERE / name).relative_to(ROOT))
+        for name in (
+            "run.py",
+            "verify.py",
+            "protocol.json",
+            "test_contract.py",
+            "README.md",
+        )
+    }
     if (
         git("status", "--porcelain")
         or set(git("diff", "--name-only", P["atom_base"], "HEAD").splitlines())
@@ -173,6 +391,9 @@ def make_plan(attempt):
         raise ValueError("commit only the declared spike before freezing")
     receipt_path = PRIVATE / "preparation" / f"{attempt}.json"
     preparation = json.loads(receipt_path.read_text())
+    check_cache_toolchain(
+        json.loads(Path(P["preparation_inputs"]["cache_receipt"]["path"]).read_text())
+    )
     for filename, expected in preparation["files"].items():
         if sha(filename) != expected:
             raise ValueError(f"preparation artifact changed: {filename}")
@@ -250,20 +471,56 @@ def launch(owned, resources, command, env, out, name, fd):
         signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
+def seal_registry(state, out):
+    if state.get("registered"):
+        registry_path = PRIVATE / "attempts.json"
+        registry = json.loads(registry_path.read_text())
+        entry = next(row for row in registry if row["attempt"] == state["attempt"])
+        entry["status_sha256"] = sha(out / "controller.json")
+        save(registry_path, registry)
+
+
 def finish(owned, resources, fd, out, state):
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, STOP)
     signal.setitimer(signal.ITIMER_REAL, 0)
     for sig in STOP:
         signal.signal(sig, signal.SIG_IGN)
+    signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
     try:
         owned.stop()
     except Exception as error:
-        state["stop_error"] = repr(error)
+        logger.exception("Owned termination failed; retaining release responsibility")
+        state.update(outcome="EXECUTION_INVALID", stop_error=repr(error))
     release_end = time.monotonic() + P["bounds"]["release"]
+    try:
+        state["cache_after"] = cache_inventory(state["attempt"])
+        state["new_artifacts"] = {
+            path: {
+                "sha256": value,
+                "head": state.get("head"),
+                "aiter": P["aiter_sha"],
+                "plan_sha256": state.get("plan_sha256"),
+            }
+            for path, value in state["cache_after"].items()
+            if state.get("cache_before", {}).get(path) != value
+        }
+        state["artifacts"] = {
+            str(p): sha(p)
+            for p in out.rglob("*")
+            if p.is_file() and p.name != "controller.json" and p.suffix != ".tmp"
+        }
+    except Exception as error:
+        logger.exception("Artifact inventory failed; continuing owned cleanup")
+        state.update(outcome="EXECUTION_INVALID", inventory_error=repr(error))
     while True:
         try:
             alive = [proc.pid for proc in owned.live()]
             released, snapshot = resources.wait_gpus_released(
-                timeout=min(5, max(0, release_end - time.monotonic()))
+                timeout=(
+                    min(5, release_end - time.monotonic())
+                    if time.monotonic() < release_end
+                    else 5
+                )
             )
             released = bool(
                 released
@@ -281,9 +538,11 @@ def finish(owned, resources, fd, out, state):
             }
             save(out / "controller.json", state)
             if released:
+                seal_registry(state, out)
                 os.close(fd)
                 return
         except Exception as error:
+            logger.exception("Cleanup proof failed; retaining lock")
             state.update(outcome="EXECUTION_INVALID", cleanup_error=repr(error))
             print(f"Cleanup evidence/release failed: {error!r}", flush=True)
         print(
@@ -297,12 +556,127 @@ def finish(owned, resources, fd, out, state):
         time.sleep(5)
 
 
+def parsed_server_args(command):
+    from atom.model_engine.arg_utils import EngineArgs
+    from atom.utils.arg_parser import FlexibleArgumentParser
+
+    parser = FlexibleArgumentParser()
+    EngineArgs.add_cli_args(parser)
+    args, extra = parser.parse_known_args(command[3:])
+    expected = [
+        "--host",
+        "127.0.0.1",
+        "--server-port",
+        str(P["ports"]["server"]),
+        "--request-log",
+        command[command.index("--request-log") + 1],
+    ]
+    if extra != expected:
+        raise ValueError("unexpected server arguments")
+    result = EngineArgs.from_cli_args(args)
+    if (
+        result.spec_decode_acceptance_length is not None
+        or result.spec_decode_acceptance_rate is not None
+    ):
+        raise ValueError("forced speculative acceptance")
+    return result
+
+
+def resolved_policy(command):
+    import dataclasses
+
+    from atom.entrypoints.openai.protocol import CompletionRequest
+    from atom.sampling_params import SamplingParams
+
+    engine = parsed_server_args(command)._get_engine_kwargs()
+    spec = engine["speculative_config"]
+    if (
+        spec.synthetic_acceptance_length is not None
+        or spec.synthetic_acceptance_rate is not None
+    ):
+        raise ValueError("forced speculative acceptance")
+    request_model = CompletionRequest(
+        model="kimi-k3.1-pro",
+        prompt="policy receipt",
+        max_tokens=256,
+        temperature=0,
+        stop=["Question:", "</s>", "<|im_end|>"],
+    )
+    sampling = SamplingParams(
+        temperature=request_model.temperature,
+        max_tokens=request_model.get_max_tokens(),
+        stop_strings=request_model.stop,
+        ignore_eos=request_model.ignore_eos,
+    )
+    return json.loads(
+        json.dumps(
+            {"engine": engine, "sampling": vars(sampling)},
+            default=lambda v: (
+                dataclasses.asdict(v) if dataclasses.is_dataclass(v) else str(v)
+            ),
+        )
+    )
+
+
+def cache_inventory(attempt):
+    root = PRIVATE / "namespaces" / attempt
+    return {
+        str(p): sha(p)
+        for directory in (
+            root / "cache",
+            root / "home",
+            root / "hf",
+            root / "aiter/hsa",
+            root / "aiter/csrc/opus_gemm/gen_co",
+        )
+        for p in directory.rglob("*")
+        if p.is_file()
+    }
+
+
+def process_receipt(owned, plan):
+    rows = []
+    private = PRIVATE / "namespaces" / plan["attempt"]
+    for proc in owned.live():
+        env = proc.environ()
+        if "SPEC_DECODE_ACCEPTANCE_LENGTH" in env or any(
+            env.get(k) != value for k, value in plan["environment"].items()
+        ):
+            raise ValueError(
+                "owned child environment differs from the frozen allowlist"
+            )
+        modules = sorted(
+            {
+                m.path
+                for m in proc.memory_maps(grouped=False)
+                if "/module_" in m.path and m.path.endswith(".so")
+            }
+        )
+        if any(not Path(name).is_relative_to(private) for name in modules):
+            raise ValueError("a worker loaded a shared native module")
+        rows.append(
+            {
+                "pid": proc.pid,
+                "birth": proc.create_time(),
+                "argv": proc.cmdline(),
+                "environment": {k: env.get(k) for k in plan["environment"]},
+                "native_modules": {name: sha(name) for name in modules},
+            }
+        )
+    return rows
+
+
 def runtime_check(path):
+    import sys
+
+    if "sitecustomize" in sys.modules:
+        raise ValueError("an unqualified Python startup hook is active")
     plan = load_plan(path, grant=True)
-    import atom
     import aiter
     import aiter_worker_limits
     import torch
+
+    import atom
 
     source = Path(plan["environment"]["AITER_META_DIR"])
     modules = {
@@ -324,6 +698,7 @@ def runtime_check(path):
     if len(devices) != 8 or any(d != expected for d in devices):
         raise ValueError("hardware identity changed")
     receipt = {
+        "resolved_policy": resolved_policy(plan["commands"]["server"]),
         "imports": modules,
         "devices": devices,
         "torch": torch.__version__,
@@ -339,6 +714,10 @@ def runtime_check(path):
 
 
 def execute(path):
+    start = time.monotonic()
+    started_unix = time.time()
+    whole = start + P["bounds"]["whole"]
+    startup = start + P["bounds"]["startup"]
     plan = load_plan(path, grant=True)
     if (
         os.environ.get("KFD_GUARD_LOG")
@@ -362,7 +741,7 @@ def execute(path):
         "phase": "admission",
         "start_unix": time.time(),
     }
-    fd = resources.GpuLock().acquire()
+    fd = None
 
     def interrupt(signum, frame):
         raise KeyboardInterrupt(f"signal {signum}")
@@ -391,12 +770,33 @@ def execute(path):
                 }
             )
             save(registry_path, registry)
+            state["registered"] = True
+        if plan["attempt"].startswith("independent-"):
+            canonical = first_valid(
+                json.loads((PRIVATE / "attempts.json").read_text()), expected
+            )
+            required = {
+                "head": plan["head"],
+                "profile_sha256": digest(plan["protocol"]),
+                "data_sha256": plan["data"]["sha256"],
+            }
+            if canonical is None or any(
+                canonical["evidence"][key] != value for key, value in required.items()
+            ):
+                raise ValueError(
+                    "independent qualification requires matching A0 source/profile/data"
+                )
+        state["cache_before"] = cache_inventory(plan["attempt"])
+        fd = resources.GpuLock().acquire()
+        if PAUSE.exists():
+            raise RuntimeError("GPU work paused before admission")
+        state["lock_acquired_monotonic"] = time.monotonic()
         state["before"] = resources.assert_gpus_idle()
         resources.assert_ports_free(P["ports"].values())
-        start = time.monotonic()
-        whole = start + P["bounds"]["whole"]
-        startup = start + P["bounds"]["startup"]
-        signal.setitimer(signal.ITIMER_REAL, P["bounds"]["startup"])
+        state.update(launch_monotonic=start, launch_unix=started_unix)
+        if time.monotonic() >= startup:
+            raise TimeoutError("startup deadline before child launch")
+        signal.setitimer(signal.ITIMER_REAL, startup - time.monotonic())
         env = dict(
             plan["environment"],
             K31_TASK10_GPU_GRANT=plan["head"],
@@ -411,7 +811,12 @@ def execute(path):
             "runtime",
             fd,
         )
-        if metadata.wait(timeout=max(0.01, startup - time.monotonic())) != 0:
+        while metadata.poll() is None:
+            owned.live()
+            if time.monotonic() >= startup:
+                raise TimeoutError("runtime import/hardware deadline")
+            time.sleep(0.1)
+        if metadata.returncode != 0:
             raise RuntimeError("runtime import/hardware check failed")
         owned.roots.remove(metadata)
         for role in ("cache", "server"):
@@ -457,6 +862,7 @@ def execute(path):
             v["used_gib"] < 2 for v in snapshot["cards"].values()
         ):
             raise ValueError("eight-card service residency not established")
+        state["processes_at_startup"] = process_receipt(owned, plan)
         state["startup"] = {
             "smoke": replies,
             "requested_concurrency": 8,
@@ -470,7 +876,8 @@ def execute(path):
         client = launch(
             owned, resources, plan["commands"]["client"], env, out, "client", fd
         )
-        client_end = min(whole, time.monotonic() + P["bounds"]["client"])
+        state["client_start_monotonic"] = time.monotonic()
+        client_end = min(whole, state["client_start_monotonic"] + P["bounds"]["client"])
         while client.poll() is None:
             owned.live()
             if time.monotonic() >= client_end or any(
@@ -478,28 +885,50 @@ def execute(path):
             ):
                 raise RuntimeError("client deadline or service failure")
             time.sleep(0.25)
+        state["client_end_monotonic"] = time.monotonic()
         state["client_rc"] = client.returncode
+        if any(
+            child.poll() is not None for child in owned.roots if child is not client
+        ):
+            raise RuntimeError("owned service exited before the final receipt")
         if client.returncode != 0:
             raise RuntimeError("scored client failed; partial evidence retained")
         state["evidence"] = bind_results(out, expected)
+        state["processes_after_scoring"] = process_receipt(owned, plan)
+        state["execution_elapsed_s"] = time.monotonic() - start
+        if time.monotonic() >= whole:
+            raise TimeoutError("whole execution deadline")
         state.update(outcome="COMPLETE", phase="cleanup")
     except BaseException as error:
+        logger.exception("Baseline attempt failed; preserving outputs")
         state["error"] = repr(error)
         print(f"EXECUTION_INVALID: {error!r}", flush=True)
     finally:
-        finish(owned, resources, fd, out, state)
+        if fd is None:
+            state["cleanup"] = {
+                "released": True,
+                "no_owned_gpu_work_started": True,
+                "utc_unix": time.time(),
+            }
+            save(out / "controller.json", state)
+            seal_registry(state, out)
+        else:
+            finish(owned, resources, fd, out, state)
     print(json.dumps(state))
     return 0 if state["outcome"] == "COMPLETE" else 1
 
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--prepare")
     parser.add_argument("--freeze")
     parser.add_argument("--run", type=Path)
     parser.add_argument("--runtime-check", type=Path)
     parser.add_argument("--data", type=Path)
     args = parser.parse_args()
-    if args.data:
+    if args.prepare:
+        print(json.dumps(prepare(args.prepare)))
+    elif args.data:
         save(args.data, prepare_data())
     elif args.freeze:
         path = PRIVATE / "plans" / f"{args.freeze}.json"

@@ -32,6 +32,21 @@ Wrong, empty and cap-limited answers remain evidence. Canonical A0 is the first
 complete protocol-valid author attempt, including a low score. Independent paired
 qualification never replaces it. Nonsignificance is not evidence of equivalence.
 
-The initial implementation is not yet CPU-qualified or execution-ready. Cache/source
-preparation, actual CLI consumption and fault-injection checks must pass before the
-frozen packet is independently reviewed. No GPU result is established here.
+CPU preparation uses the absolute host guard and the private CPU environment.
+`run.py --prepare author-001` archives the pinned sources, verifies individual cache
+artifacts and creates the offline data/identity receipt. Run `pytest -q
+spike/k31_gsm8k_baseline/test_contract.py` before freezing the committed head.
+Set `K31_TASK10_CPU_ATTEMPT=independent-001` when checking the independent private
+namespace. The full speculative configuration resolves only during the authorized runtime
+check; CPU contracts consume EngineArgs and the actual lm_eval/API client.
+
+Execution uses `K31_TASK10_GPU_GRANT=<head>` and `K31_TASK10_PLAN_SHA=<plan sha256>`
+with `run.py --run <frozen plan>`, on normal-priority CPU0-111. These fields bind a
+root grant; they do not grant a lease by themselves. Independent qualification
+prepares `independent-001` and freezes that attempt at the same experimental head.
+
+Use `verify.py --data <data receipt> --select <attempts.json>` for canonical A0,
+and `--qualify <author controller.json> <independent controller.json>` for paired
+qualification. Startup hardware, imports, full runtime configuration and graphs
+remain checks of the separately authorized model execution. CPU fixtures establish
+no GPU result or quality score.
