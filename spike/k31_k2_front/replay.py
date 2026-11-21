@@ -198,17 +198,23 @@ def binding_check():
     from tempfile import TemporaryDirectory
 
     with TemporaryDirectory() as directory:
-        path = Path(directory) / "runtime.py"
-        path.write_text("initial runtime bytes")
-        binding = {"files": {str(path): file_identity(path)}, "models": {}}
-        verify_binding(binding)
-        path.write_text("changed runtime bytes")
-        try:
+        for name in (
+            "runtime.py",
+            "hf-modules/tokenization_kimi.py",
+            "tiktoken/encoding",
+        ):
+            path = Path(directory) / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("initial runtime bytes")
+            binding = {"files": {str(path): file_identity(path)}, "models": {}}
             verify_binding(binding)
-        except RuntimeError as error:
-            assert "binding changed" in str(error)
-        else:
-            raise AssertionError("modified runtime was accepted")
+            path.write_text("changed runtime bytes")
+            try:
+                verify_binding(binding)
+            except RuntimeError as error:
+                assert "binding changed" in str(error)
+            else:
+                raise AssertionError("modified runtime was accepted")
     return True
 
 
@@ -735,6 +741,8 @@ def make_plan(mode, out, snapshot=None, ready=None):
         PYTHONPATH=f"{HERE}:{ROOT}:{PRIVATE / 'aiter-572232d'}",
         CX_FRONT_FLOOR_EXPECT_ATOM_ROOT=str(ROOT),
         ATOM_MONO_COMPILE_INDEX=str(PRIVATE / "cache/mono-index"),
+        HF_MODULES_CACHE=str(PRIVATE / "cache/hf-modules"),
+        TIKTOKEN_CACHE_DIR=str(PRIVATE / "cache/tiktoken"),
         K31_K2_FRONT_WORKER_GRANT=head,
     )
     for key in list(env):
