@@ -214,10 +214,10 @@ def make_plan(mode, output, path, snapshot=None):
         },
         "sources": sources,
         "execution": execution,
-        "hip_runtime": str(
-            Path(
-                "/opt/venv/lib/python3.12/site-packages/torch/lib/libamdhip64.so"
-            ).resolve(strict=True)
+        "hip_runtime": next(
+            name
+            for name in LEGACY.runtime_files()
+            if Path(name).name.startswith("libamdhip64.so")
         ),
         "command": [
             "taskset",
