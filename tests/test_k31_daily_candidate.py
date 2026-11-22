@@ -315,3 +315,82 @@ def test_changed_evidence_refused(candidate, request_spec, tmp_path):
             tmp_path / "result",
             candidate.harness(request_spec["harness"]),
         )
+
+
+@pytest.mark.parametrize("change", ["changed", "missing"])
+def test_ready_revalidates_recipe_bytes(candidate, request_spec, tmp_path, change):
+    recipe = tmp_path / "recipe.json"
+    recipe.write_text('{"duration_s": 3600}')
+    request_spec["recipe"] = {
+        "reference": ref(recipe),
+        "qualification": "qualified",
+        "fingerprint": candidate.fingerprint({"duration_s": 3600}),
+    }
+    request_spec["recipe"]["review"] = {
+        "status": "passed",
+        "subject": request_spec["recipe"]["fingerprint"],
+        "reference": ref(tmp_path / "evidence.json"),
+    }
+    inspect = candidate.harness(request_spec["harness"])
+    directory = tmp_path / "candidate"
+    first = candidate.compose(request_spec, directory, inspect)
+    for key in ("source_review", "numerical", "smoke"):
+        request_spec["evidence"][key] = {
+            "status": "passed",
+            "subject": first["candidate_id"],
+            "reference": ref(tmp_path / "evidence.json"),
+        }
+    manifest = candidate.freeze(request_spec, directory, inspect)
+    candidate.require_measurable(manifest)
+    if change == "changed":
+        recipe.write_text('{"duration_s": 3601}')
+    else:
+        recipe.unlink()
+    with pytest.raises((ValueError, FileNotFoundError)):
+        candidate.require_measurable(manifest)
+
+
+@pytest.mark.parametrize("dependency", ["HEAD", "short", "missing"])
+def test_requires_exact_available_commit(candidate, request_spec, tmp_path, dependency):
+    item = component(request_spec, "aiter", "exact-dependency")
+    revision = request_spec["sources"]["atom"]["base"]
+    values = {"HEAD": "HEAD", "short": revision[:8], "missing": "0" * 40}
+    item["requires"] = {**request_spec["dependencies"], "atom": values[dependency]}
+    request_spec["components"] = [item]
+    with pytest.raises(ValueError):
+        candidate.compose(
+            request_spec,
+            tmp_path / "candidate",
+            candidate.harness(request_spec["harness"]),
+        )
+
+
+@pytest.mark.parametrize("action", ["compose", "reproduce"])
+def test_source_subdirectory_refused_before_output(
+    candidate, request_spec, tmp_path, action
+):
+    inspect = candidate.harness(request_spec["harness"])
+    original = Path(request_spec["sources"]["atom"]["root"])
+    before = git(original, "worktree", "list", "--porcelain")
+    if action == "reproduce":
+        manifest = candidate.compose(request_spec, tmp_path / "valid", inspect)
+        request_spec = copy.deepcopy(manifest["request"])
+        before = git(original, "worktree", "list", "--porcelain")
+    request_spec["sources"]["atom"]["root"] = str(original / "atom")
+    destination = original / "nested-candidate"
+    with pytest.raises(ValueError):
+        if action == "compose":
+            candidate.compose(request_spec, destination, inspect)
+        else:
+            manifest["request"] = request_spec
+            manifest["bundle_fingerprint"] = candidate.fingerprint(
+                {
+                    key: value
+                    for key, value in manifest.items()
+                    if key != "bundle_fingerprint"
+                }
+            )
+            candidate.reproduce(manifest, destination, inspect)
+    assert not destination.exists()
+    assert git(original, "status", "--porcelain", "--untracked-files=all") == ""
+    assert git(original, "worktree", "list", "--porcelain") == before

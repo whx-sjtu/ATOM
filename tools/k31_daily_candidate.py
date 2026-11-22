@@ -197,6 +197,8 @@ def inputs(request, inspect):
     info = {}
     for name, source in request["sources"].items():
         root = Path(source["root"]).resolve()
+        if root != Path(git(root, "rev-parse", "--show-toplevel")).resolve():
+            raise ValueError("source root must be the Git worktree toplevel")
         remote = git(root, "remote", "get-url", "origin").removesuffix(".git")
         expected = "ATOM" if name == "atom" else "aiter"
         if remote not in (
@@ -310,6 +312,7 @@ def freeze(request, directory, inspect):
     for item in chosen:
         for name, expected in item["requires"].items():
             if name in results:
+                commit(directory / name, expected)
                 git(
                     directory / name,
                     "merge-base",
@@ -414,6 +417,7 @@ def reproduce(manifest, destination, inspect):
 def require_measurable(manifest):
     verify_manifest(manifest)
     recipe = manifest["recipe"]
+    reference(recipe["reference"])
     if recipe["qualification"] != "qualified" or not re.fullmatch(
         "[0-9a-f]{64}", recipe.get("fingerprint") or ""
     ):
