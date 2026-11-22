@@ -230,3 +230,21 @@ def test_completed_aggregation_arms_the_next_batch_before_returning():
     assert manager._pending_kv_aggregation is not None
     assert manager._pending_kv_aggregation is not first_pending
     assert manager._pending_kv_aggregation.worker_outputs == [None, None]
+
+
+def test_poll_timestamp_precedes_enqueue_and_ignores_worker_clocks(monkeypatch):
+    import time
+
+    now = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    manager = _manager(world_size=8)
+
+    def broadcast(_message):
+        for rank, output in enumerate(manager.kv_outputs_queues):
+            output.put(KVConnectorOutput(poll_started_at=9000.0 + rank))
+        now[0] += 2.0  # a worker can already have replied before enqueue returns
+
+    manager.rpc_broadcast_mq.enqueue.side_effect = broadcast
+    result = _poll(manager)
+    assert result.poll_started_at == 1000.0
+    assert manager._pending_kv_aggregation.started_at == 1002.0

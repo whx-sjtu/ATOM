@@ -1355,3 +1355,142 @@ def test_the_shell_forwards_a_taken_back_admission_to_the_scheduler(monkeypatch)
     )
     connector.cancel_preadmission("seq")
     assert taken_back == ["seq"]
+
+
+@pytest.mark.parametrize(
+    "completion_case", ["terminal", "pending", "generation", "request", "missing"]
+)
+def test_pipelined_snapshot_after_long_forward_uses_poll_time(
+    monkeypatch, completion_case
+):
+    import threading
+    from collections import deque
+    from copy import copy
+    from dataclasses import replace
+
+    from test_kv_aggregation_timeout import _manager, _poll
+
+    from atom.kv_transfer.offload.mp.native_state_worker import (
+        NativeStateLMCacheMPConnector,
+        _NativePending,
+    )
+    from atom.kv_transfer.offload.mp.token_shipping import WorkerTokens
+
+    now = [1000.0]
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
+    scheduler, checkpoints, _ = make_scheduler(monkeypatch)
+    seq = sequence(request_id=13)
+    checkpoint(scheduler, checkpoints, seq, 16)
+    scheduler.update_state_after_alloc(seq)
+    scheduler._save_nonce = 145
+    [request] = scheduler.build_connector_meta().requests
+    assert request.save_operation == SaveOperationId(13, 145)
+    ready = [False] * 8
+    workers = []
+    for rank in range(8):
+        worker = NativeStateLMCacheMPConnector.__new__(NativeStateLMCacheMPConnector)
+        worker._adapter = None
+        worker._lock = threading.Lock()
+        worker_request = copy(request)
+        worker._tokens = WorkerTokens()
+        worker._tokens.resolve(SimpleNamespace(requests=[worker_request]))
+        worker._native_saves = {
+            "save:13:145": _NativePending(
+                worker_request,
+                SimpleNamespace(
+                    query=lambda rank=rank: ready[rank], result=lambda timeout: True
+                ),
+                started_at=now[0],
+            )
+        }
+        worker._native_loads = {}
+        worker._transfer_deadline_s = 30.0
+        worker.chunk_size = 8
+        worker._completed_save_operations = set()
+        worker._completed_save_operation_order = deque()
+        workers.append(worker)
+    manager = _manager(world_size=8)
+
+    def poll_workers(_message):
+        for rank, (worker, output) in enumerate(
+            zip(workers, manager.kv_outputs_queues)
+        ):
+            report = worker.get_finished()
+            if rank == 7 and completion_case in ("generation", "request", "missing"):
+                completions = set()
+                for item in report.connector_completions:
+                    if item.channel == NATIVE_STATE_MP_STORE_CHANNEL:
+                        if completion_case == "missing":
+                            continue
+                        wrong = (
+                            SaveOperationId(13, 146)
+                            if completion_case == "generation"
+                            else SaveOperationId(14, 145)
+                        )
+                        item = replace(item, operation_id=wrong)
+                    completions.add(item)
+                report.connector_completions = completions
+            output.put(report)
+        now[0] += 0.001  # distinct queries have distinct controller timestamps
+
+    manager.rpc_broadcast_mq.enqueue.side_effect = poll_workers
+    scheduler.process_completions(_poll(manager))
+    assert checkpoints.has_offload_pins()
+    # The already-issued query sampled pending futures. During a long forward
+    # all device futures become terminal, but its old empty replies stay queued.
+    started_at = scheduler._transfer_seen_at[request.save_operation]
+    ready[:] = [completion_case != "pending" or rank != 7 for rank in range(8)]
+    now[0] += 152
+    if completion_case == "pending":
+        with pytest.raises(transfer.LMCacheTransferUnprovable, match="save:13:145"):
+            _poll(manager)
+        assert checkpoints.has_offload_pins()
+        return
+    old_snapshot = _poll(manager)
+    assert old_snapshot.is_empty()
+    assert all(not worker._native_saves for worker in workers)
+    assert all(not output.empty() for output in manager.kv_outputs_queues)
+    scheduler.process_completions(old_snapshot)
+    assert checkpoints.has_offload_pins()  # stale absence cannot free memory
+    assert scheduler._transfer_seen_at[request.save_operation] == started_at
+    if completion_case != "terminal":
+        with pytest.raises(transfer.LMCacheTransferUnprovable, match="generation=145"):
+            scheduler.process_completions(_poll(manager))
+        assert checkpoints.has_offload_pins()
+        assert scheduler._transfer_seen_at[request.save_operation] == started_at
+    else:
+        scheduler.process_completions(_poll(manager))
+        assert not checkpoints.has_offload_pins()
+        assert scheduler._transfer_seen_at == {}
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    [None, "absent", 999.0, 1000.0, 1001.0, float("nan"), float("inf"), -1.0, 1153.0],
+)
+def test_bad_or_replayed_poll_time_cannot_keep_overdue_native_pins(
+    monkeypatch, timestamp
+):
+    now = [1000.0]
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
+    scheduler, checkpoints, _ = make_scheduler(monkeypatch)
+    seq = sequence()
+    checkpoint(scheduler, checkpoints, seq, 16)
+    scheduler.update_state_after_alloc(seq)
+    scheduler.build_connector_meta()
+    scheduler.process_completions(KVConnectorOutput(poll_started_at=999.5))
+    now[0] += 152
+    scheduler.process_completions(KVConnectorOutput(poll_started_at=1000.0))
+    assert checkpoints.has_offload_pins()
+    output = KVConnectorOutput(poll_started_at=timestamp)
+    if timestamp == "absent":
+        output = SimpleNamespace(
+            **{
+                key: value
+                for key, value in vars(output).items()
+                if key != "poll_started_at"
+            }
+        )
+    with pytest.raises(transfer.LMCacheTransferUnprovable):
+        scheduler.process_completions(output)
+    assert checkpoints.has_offload_pins()

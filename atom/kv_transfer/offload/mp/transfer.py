@@ -81,11 +81,15 @@ def _transfer_deadline_s(config: Any) -> float:
 
 
 def _enforce_transfer_deadline(
-    operation: Any, started_at: float, deadline_s: float
+    operation: Any,
+    started_at: float,
+    deadline_s: float,
+    *,
+    observed_at: float | None = None,
 ) -> None:
-    """Raise ``LMCacheTransferUnprovable`` once a transfer outlives the bound."""
+    """Bound non-terminal evidence at its poll time, not delayed consumption."""
 
-    elapsed = time.monotonic() - started_at
+    elapsed = (time.monotonic() if observed_at is None else observed_at) - started_at
     if elapsed < deadline_s:
         return
     message = (

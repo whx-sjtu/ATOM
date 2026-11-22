@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import math
 import threading
 import time
 from typing import Any
@@ -356,7 +357,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         live.update(operation for _, operation in self._active_load_operations.values())
         return live
 
-    def _enforce_transfer_deadlines(self) -> None:
+    def _enforce_transfer_deadlines(self, observed_at: float | None = None) -> None:
         """Fail-stop when a dispatched transfer never reports.
 
         The worker bounds what it submitted; this catches what it cannot see,
@@ -367,14 +368,41 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         for operation in [op for op in seen if op not in live]:
             del seen[operation]
         now = time.monotonic()
+        last = self.__dict__.get("_last_poll_started_at")
+        refresh_after = self.__dict__.get("_deadline_refresh_after")
+        if observed_at is not None:
+            if (
+                type(observed_at) in (int, float)
+                and math.isfinite(observed_at)
+                and 0 <= observed_at <= now
+                and (last is None or observed_at > last)
+                and (refresh_after is None or observed_at >= refresh_after)
+            ):
+                self._last_poll_started_at = observed_at
+            else:
+                observed_at = None  # missing or untrustworthy evidence: fail closed
+        refresh = False
         for operation in live:
+            started_at = seen.setdefault(operation, now)
             _enforce_transfer_deadline(
-                operation, seen.setdefault(operation, now), self._scheduler_deadline_s
+                operation,
+                started_at,
+                self._scheduler_deadline_s,
+                observed_at=observed_at,
             )
+            if (
+                observed_at is not None
+                and now - started_at >= self._scheduler_deadline_s
+            ):
+                refresh = True
+        if refresh:
+            # One delayed snapshot may precede a long forward. Another stale
+            # snapshot cannot keep an overdue transfer alive indefinitely.
+            self._deadline_refresh_after = now
 
     def process_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
         output = super().process_completions(output)
-        self._enforce_transfer_deadlines()
+        self._enforce_transfer_deadlines(getattr(output, "poll_started_at", None))
         return output
 
     def request_finished(self, seq: Any) -> None:
