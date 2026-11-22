@@ -733,6 +733,15 @@ def stage_router_parts(c, token):
 
 
 @traced
+def router_logit(c, expert):
+    """The same ordered FP32 reduction used by the original router part 0."""
+    value = fx.ptr_load(c["vals"] + expert)
+    for part in range_constexpr(1, R_PARTS):
+        value = value + fx.ptr_load(c["vals"] + part * E + expert)
+    return value
+
+
+@traced
 def stage_route(c, t):
     """Token t (wave 0): 896 logits, 14 a lane (expert lane + 64 i) -> sigmoid
     (v_rcp) + bias -> the top-16 ranked by score, descending, equal scores the
@@ -764,10 +773,7 @@ def stage_route(c, t):
         keys, sigs = [], []
         for i in range_constexpr(per):
             if const_expr(rlog_parts):
-                expert = lane + 64 * i
-                lg = fx.ptr_load(c["vals"] + expert)
-                for part in range_constexpr(1, R_PARTS):
-                    lg = lg + fx.ptr_load(c["vals"] + part * E + expert)
+                lg = router_logit(c, lane + 64 * i)
             else:
                 lg = f32_of(got[i][0])
             sg = hw_rcp(fx.Float32(1.0) + hw_exp2(lg * fx.Float32(-LOG2E)))
