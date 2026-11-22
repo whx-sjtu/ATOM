@@ -22,6 +22,7 @@ from atom.kv_transfer.offload.mp.deployment import _mp_session_id, transfer_spec
 from atom.kv_transfer.offload.mp.metadata import MPReqMeta
 from atom.kv_transfer.offload.mp.token_shipping import token_list
 from atom.kv_transfer.offload.mp.transfer import (
+    LMCacheTransferUnprovable,
     _chunk_ranges,
     _enforce_transfer_deadline,
     _remember_operation_tombstone,
@@ -36,6 +37,25 @@ from atom.utils import envs
 
 logger = logging.getLogger("atom")
 NATIVE_STATE_MP_STORE_CHANNEL = "native_state_mp_store"
+
+
+def _fatal_future_fields(future: Any) -> dict[str, Any]:
+    kind = f"{type(future).__module__}.{type(future).__qualname__}"
+    fields = {
+        "future_type": kind,
+        "python_object_id": id(future),
+        "last_query_terminal": False,
+        "raw_response_processed": None,
+        "imported_event_present": None,
+    }
+    if kind == "lmcache.v1.multiprocess.futures.DeviceMessagingFuture":
+        values = vars(future)
+        processed = values.get("_raw_response_processed")
+        if type(processed) is bool:
+            fields["raw_response_processed"] = processed
+        if "event_" in values:
+            fields["imported_event_present"] = values["event_"] is not None
+    return fields
 
 
 def restore_slot_count(max_pending_saves: int) -> int:
@@ -285,11 +305,24 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         if pending.immediate_success:
             terminal, result = True, True
         else:
-            terminal, result = _terminal_future_result(pending.future)
+            polled_future = pending.future
+            terminal, result = _terminal_future_result(polled_future)
         if not terminal:
-            _enforce_transfer_deadline(
-                operation_id, pending.started_at, self._transfer_deadline_s
-            )
+            try:
+                _enforce_transfer_deadline(
+                    operation_id, pending.started_at, self._transfer_deadline_s
+                )
+            except LMCacheTransferUnprovable:
+                try:
+                    logger.error(
+                        "Native save fatal post-query witness (not atomic): operation=%s fields=%s future_replaced=%s",
+                        operation_id,
+                        _fatal_future_fields(polled_future),
+                        pending.future is not polled_future,
+                    )
+                except Exception:  # noqa: BLE001, S110 - preserve the fatal error
+                    pass
+                raise
             return
         save_spec = pending.request.save_spec
         start = 0 if save_spec is None else int(save_spec.skip_leading_tokens)

@@ -872,3 +872,91 @@ def test_native_transfers_are_submitted_and_polled_on_the_step_thread():
     instance.get_finished()
     assert query and all(query)
     assert threading.active_count() == threads
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["rpc", "event", "unknown", "replaced", "advanced", "invalid", "diagnostic_error"],
+)
+def test_native_save_fatal_witness_keeps_polled_future_and_exception(
+    worker, monkeypatch, caplog, case
+):
+    from atom.kv_transfer.offload.mp import native_state_worker as native
+    from atom.kv_transfer.offload.mp.transfer import LMCacheTransferUnprovable
+
+    cls = type(
+        "DeviceMessagingFuture",
+        (Future,),
+        {"__module__": "lmcache.v1.multiprocess.futures"},
+    )
+    future = Future() if case == "unknown" else cls()
+    future._raw_response_processed = case == "event"
+    future.event_ = object() if case == "event" else None
+    if case == "invalid":
+        future._raw_response_processed = "ambiguous"
+        del future.event_
+    worker.future = future
+    worker._submit_save(request(), object())
+    pending = worker._native_saves["save:7:1"]
+    queried = []
+    future.query = lambda: queried.append(future) or False
+    error = LMCacheTransferUnprovable("controlled existing fatal")
+
+    def expire(operation, started, deadline):
+        assert operation == "save:7:1" and deadline == 30
+        if case == "replaced":
+            pending.future = Future(ready=True)
+        if case == "advanced":
+            future._raw_response_processed, future.event_ = True, object()
+        raise error
+
+    def diagnostic_error(_future):
+        raise AssertionError("diagnostic unavailable")
+
+    monkeypatch.setattr(native, "_enforce_transfer_deadline", expire)
+    if case == "diagnostic_error":
+        monkeypatch.setattr(
+            native, "_fatal_future_fields", diagnostic_error, raising=False
+        )
+    with pytest.raises(LMCacheTransferUnprovable) as caught:
+        worker.get_finished()
+    assert caught.value is error
+    assert worker._native_saves["save:7:1"] is pending
+    assert queried == [future]
+    notes = [
+        r
+        for r in caplog.records
+        if str(r.msg).startswith("Native save fatal post-query witness")
+    ]
+    assert len(notes) == (0 if case == "diagnostic_error" else 1)
+    if notes:
+        operation, fields, replaced = notes[0].args
+        assert operation == "save:7:1" and fields["python_object_id"] == id(future)
+        assert replaced == (case == "replaced")
+        assert fields["last_query_terminal"] is False
+        assert "not atomic" in notes[0].msg and "phase" not in fields
+        if case in ("unknown", "invalid"):
+            assert fields["raw_response_processed"] is None
+            assert fields["imported_event_present"] is None
+        else:
+            assert fields["raw_response_processed"] == (case in ("event", "advanced"))
+            assert fields["imported_event_present"] == (case in ("event", "advanced"))
+
+
+def test_native_save_witness_is_absent_without_fatal(worker, monkeypatch):
+    from atom.kv_transfer.offload.mp import native_state_worker as native
+
+    observed = []
+    monkeypatch.setattr(
+        native,
+        "_fatal_future_fields",
+        lambda future: observed.append(future),
+        raising=False,
+    )
+    worker._submit_save(request(), object())
+    assert worker.get_finished().is_empty()
+    pending = worker._native_saves["save:7:1"]
+    pending.started_at -= 143
+    worker.future.ready = True
+    assert worker.get_finished().connector_completions
+    assert worker._native_saves == {} and observed == []
