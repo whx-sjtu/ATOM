@@ -32,6 +32,11 @@ _LOGIT_BYTES = 4  # fp32
 _ROW_TILE = 128
 
 
+def _logits_cap_bytes(budget_mb: int) -> int:
+    cap = _BUFFER_DESCRIPTOR_LIMIT_BYTES
+    return min(budget_mb * 1024 * 1024, cap) if budget_mb > 0 else cap
+
+
 def sparse_indexer_row_chunk(total_rows: int, row_width: int, budget_mb: int) -> int:
     """Rows to score per ``fp8_mqa_logits`` call for a ``[rows, row_width]`` buffer.
 
@@ -47,10 +52,7 @@ def sparse_indexer_row_chunk(total_rows: int, row_width: int, budget_mb: int) ->
     if total_rows <= 0 or row_width <= 0:
         return max(total_rows, 1)
 
-    budget_bytes = budget_mb * 1024 * 1024
-    cap_bytes = _BUFFER_DESCRIPTOR_LIMIT_BYTES
-    if budget_bytes > 0:
-        cap_bytes = min(budget_bytes, cap_bytes)
+    cap_bytes = _logits_cap_bytes(budget_mb)
 
     # Exclusive bound: the kernel needs bytes < cap, not <=.
     max_rows = (cap_bytes - 1) // (row_width * _LOGIT_BYTES)
@@ -86,6 +88,22 @@ def plane_capacity(rows, width):
     """fp32 elements of one `width`-column band: up to `rows` query rows, as
     many as the logits budget allows. Scoring runs in bands of it."""
     return logits_rows(rows, width) * width
+
+
+def prefill_workspace_capacity(rows: int, max_width: int) -> int:
+    """Elements covering every existing band up to these prefill bounds.
+
+    ``plane_capacity(rows, max_width)`` rounds the widest shape's row count
+    down and can underfill a narrower shape's existing band. Reserve the
+    byte ceiling instead, retaining the original band selector unchanged.
+    A soft budget smaller than one maximum-width row cannot do that: keep
+    dynamic allocation, whose existing rule still permits at least one row.
+    """
+    if rows <= 0 or max_width <= 0:
+        return 0
+    cap = _logits_cap_bytes(envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB)
+    capacity = min(rows * max_width, (cap - 1) // _LOGIT_BYTES)
+    return capacity if capacity >= max_width else 0
 
 
 def capped_logits_rows(rows, width, capacity, min_rows=1):

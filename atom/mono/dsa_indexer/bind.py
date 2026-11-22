@@ -91,9 +91,11 @@ class IndexerBinding:
 
 
 def logits_plane(metadata_builder):
-    """The production indexer's decode logits plane, flat fp32: a replicated
-    step's ILOG (no DCP: the plane exists exactly then, ``LogitsWorkspace``),
-    free while the mono launch stands in for that indexer. None under DCP."""
+    """The production indexer's logits workspace, flat fp32, when present.
+
+    Replicated decode borrows it while replacing the indexer. Under DCP an
+    opt-in prefill plane may exist, but ``launch_args`` still passes ILOG=0.
+    """
     workspace = getattr(metadata_builder, "index_logits_workspace", None)
     if workspace is None:
         return None

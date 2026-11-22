@@ -78,6 +78,7 @@ from atom.model_ops.indexer import (
     fp8_rows,
     packed_concat_rows,
 )
+from atom.model_ops.indexer.layout import MFMA
 from atom.model_ops.indexer.schedule import any_layer_skips_index_topk
 from atom.model_ops.indexer.workspace import (
     ConcatKeyWorkspace,
@@ -87,7 +88,11 @@ from atom.model_ops.indexer.workspace import (
     concat_passes,
     dcp_gather_index,
 )
-from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace, plane_capacity
+from atom.model_ops.sparse_indexer_chunk import (
+    LogitsWorkspace,
+    plane_capacity,
+    prefill_workspace_capacity,
+)
 from atom.model_ops.sparse_indexer_fp4 import (
     fp4_index_scale_rows,
     sparse_indexer_fp4_enabled,
@@ -954,9 +959,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         if self.is_sparse:
             sfc = config.compilation_config.static_forward_context
-            # One logits plane for every indexer layer, allocated before the memory
-            # profile: decode rows (not DCP's) are cut to it, FP8 prefill rows packed.
-            capacity = 0
+            # One plane shared by sequential indexer layers, held before profiling
+            # so existing current/peak accounting charges it once in the KV budget.
+            capacity = self._dcp_fp4_prefill_workspace_capacity()
             if self._publishes_decode_index_rows():
                 capacity = plane_capacity(
                     self.max_bs * max_seqlen_qo, self._index_decode_width()
@@ -996,6 +1001,24 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         if config.enable_tbo:
             self._allocate_ubatch_buffers(max_seqlen_qo)
+
+    def _dcp_fp4_prefill_workspace_capacity(self) -> int:
+        config = self.model_runner.config
+        if not (
+            envs.ATOM_DCP_FP4_PREFILL_LOGITS_WORKSPACE
+            and self._indexer_fp4
+            and config.index_cache_layout == MFMA
+            and self.dcp_world_size == 8
+            and config.pipeline_parallel_size == 1
+            and config.prefill_context_parallel_size == 1
+            and not config.enable_tbo
+            and not config.enable_tbo_decode
+        ):
+            return 0
+        # PP1/no TBO: prefill scorers and immediate top-k share the forward's
+        # current stream. Other topologies retain their existing allocation.
+        local_rows = -(-self.max_num_batched_tokens // self.dcp_world_size)
+        return prefill_workspace_capacity(local_rows, config.max_model_len)
 
     def h2d_group_members(self) -> dict[str, tuple[str, ...]]:
         # Ready together before `kv_indices_generate_triton`, the step's first

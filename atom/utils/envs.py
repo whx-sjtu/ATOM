@@ -570,6 +570,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB": lambda: int(
         os.getenv("ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB", "2048")
     ),
+    # Reserve DCP FP4 prefill logits before profiling; unsupported paths stay dynamic.
+    "ATOM_DCP_FP4_PREFILL_LOGITS_WORKSPACE": lambda: os.getenv(
+        "ATOM_DCP_FP4_PREFILL_LOGITS_WORKSPACE", "0"
+    )
+    == "1",
     # DeepSeek-V4 prefill indexer under plain TP: each TP rank scores and
     # top-ks only every TP-th query row (each against the full key set) and the
     # [rows, topk] results are all-gathered back over TP. The indexer is
