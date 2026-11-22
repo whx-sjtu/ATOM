@@ -112,7 +112,8 @@ def _dcp_stage_indexer_fp4_prefill(
             context = get_forward_context()
             if (
                 not _FP4_COMBINED_REPORTED
-                and not context.is_dummy_run
+                and context.context is not None
+                and not context.context.is_dummy_run
                 and not context.in_hipgraph
             ):
                 logging.getLogger("atom").info(
