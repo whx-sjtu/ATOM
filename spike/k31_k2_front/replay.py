@@ -1307,7 +1307,7 @@ def clock_trace_logs(path, allowed_outputs=(), live=False):
         ):
             raise RuntimeError("profiler loss/repair diagnostic: " + line)
         if re.match(r"[WEF][0-9]{4,8}\s", line) or re.search(
-            r"(?<![A-Za-z])(?:WARNING|ERROR|FATAL)(?:\s|:)", line
+            r"(?<![A-Za-z])(?:WARNING|ERROR|FATAL)(?![A-Za-z])", line, re.IGNORECASE
         ):
             if re.match(
                 r"E[0-9]{4,8} .*output_stream\.cpp:[0-9]+\] Opened result file: ", line
@@ -2430,6 +2430,8 @@ def clock_trace_check():
             "Dropped 1 record",
             "swapping the values",
             "cannot offload buffer",
+            "[rocprofiler-sdk] [warning] visible diagnostic",
+            "error: unrelated domain",
         ):
             path.write_text(text + "\n")
             try:
