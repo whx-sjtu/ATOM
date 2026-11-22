@@ -9,7 +9,9 @@ error. AITER is imported inside the test so the module still collects where it
 is absent.
 """
 
+import gc
 import types
+import weakref
 
 import pytest
 import torch
@@ -281,29 +283,121 @@ def test_bf16_latent_projection_refuses_a_malformed_layout():
         _mxfp4_to_bf16(fp8, "w_up", (HIDDEN, LATENT))
 
 
-def test_bind_moe_binds_a_bf16_latent_checkpoint_without_dequantizing(monkeypatch):
-    """A bf16 checkpoint has no `weight_scale` on either latent projection. The
-    real `_mxfp4_to_bf16` runs here (only `_experts` is stubbed): the down
-    projection is bound as is and the up band is a copy that owns its storage."""
+@pytest.mark.parametrize("parameter", [False, True], ids=["tensor", "parameter"])
+def test_bind_moe_binds_a_bf16_latent_checkpoint_without_dequantizing(
+    monkeypatch, parameter
+):
+    """Native bands share the model's weight, through the real conversion path."""
     from atom.models.kimi_k3.mono import weights as w
 
     dims = Dims(8)
-    rank = 1
     torch.manual_seed(0)
     up = _lin(HIDDEN, LATENT)
     up.weight = torch.randn(HIDDEN, LATENT, dtype=torch.bfloat16)
+    if parameter:
+        up.weight = torch.nn.Parameter(up.weight, requires_grad=False)
     down = _lin(LATENT, HIDDEN)
     down.weight = torch.randn(LATENT, HIDDEN, dtype=torch.bfloat16)
     stub = torch.zeros(1, dtype=torch.uint8)
     monkeypatch.setattr(w, "_experts", lambda *a: (stub, stub, stub, stub))
     layer = _moe_layer(dims, up)
     layer.block_sparse_moe.routed_expert_down_proj = down
+    weight_ref = weakref.ref(up.weight)
+    bands = []
+    x = torch.randn(2, LATENT, dtype=torch.bfloat16)
 
+    for rank in range(dims.tp):
+        bound = w.bind_moe(layer, 1, dims, rank)
+        band = up.weight[rank * dims.up_n : (rank + 1) * dims.up_n]
+        assert bound.w_ld.is_set_to(down.weight)
+        assert torch.equal(bound.w_up, band)
+        assert bound.w_up.is_set_to(band)
+        assert bound.w_up.shape == (dims.up_n, LATENT)
+        assert bound.w_up.stride() == (LATENT, 1)
+        assert bound.w_up.is_contiguous()
+        assert bound.w_up.storage_offset() == (
+            up.weight.storage_offset() + rank * dims.up_n * LATENT
+        )
+        assert (
+            bound.w_up.data_ptr()
+            == up.weight.data_ptr() + rank * dims.up_n * LATENT * 2
+        )
+        assert bound.w_up.untyped_storage().nbytes() == HIDDEN * LATENT * 2
+        assert torch.equal(x @ bound.w_up.T, x @ band.clone().T)
+        bands.append(bound.w_up)
+
+    expected = bands[-1].clone()
+    del up, band, bound
+    gc.collect()
+    # The model still owns its parameter after the helper's reference is gone.
+    assert weight_ref() is layer.block_sparse_moe.routed_expert_up_proj.weight
+    del layer
+    gc.collect()
+    # Even after that owner goes away, the bound views keep their storage alive.
+    assert weight_ref() is None
+    assert torch.equal(bands[-1], expected)
+
+
+@pytest.mark.parametrize("conversion", ["copy", "shifted", "fp4"])
+def test_bind_moe_copies_converted_up_band_and_releases_full_plane(
+    monkeypatch, conversion
+):
+    from atom.models.kimi_k3.mono import weights as w
+
+    dims = Dims(8)
+    rank = 7
+    if conversion == "fp4":
+        up = _mxfp4_module(
+            torch.full((HIDDEN, LATENT // 2), 0x22, dtype=torch.uint8),
+            torch.full((HIDDEN, LATENT // 32), 127, dtype=torch.uint8),
+            shuffled=False,
+        )
+    else:
+        # One spare row lets a conversion return a same-storage, shifted plane.
+        up = types.SimpleNamespace(
+            weight=torch.ones(HIDDEN + 1, LATENT, dtype=torch.bfloat16)[:-1]
+        )
+    layer = _moe_layer(dims, up)
+    layer.block_sparse_moe.routed_expert_down_proj = _lin(LATENT, HIDDEN)
+    stub = torch.zeros(1, dtype=torch.uint8)
+    monkeypatch.setattr(w, "_experts", lambda *a: (stub, stub, stub, stub))
+    real_convert = w._mxfp4_to_bf16
+    converted = []
+
+    def convert(module, name, shape):
+        full = real_convert(module, name, shape)
+        if module is up:
+            if conversion == "copy":
+                full = full.clone()
+            elif conversion == "shifted":
+                full = full.as_strided(full.shape, full.stride(), LATENT)
+            converted.append(weakref.ref(full))
+        return full
+
+    monkeypatch.setattr(w, "_mxfp4_to_bf16", convert)
     bound = w.bind_moe(layer, 1, dims, rank)
+    gc.collect()
 
-    assert bound.w_ld.data_ptr() == down.weight.data_ptr()
-    assert torch.equal(bound.w_ld, down.weight)
-    band = up.weight[rank * dims.up_n : (rank + 1) * dims.up_n]
-    assert torch.equal(bound.w_up, band)
-    assert bound.w_up.data_ptr() != band.data_ptr()
+    assert len(converted) == 1 and converted[0]() is None
+    assert bound.w_up.shape == (dims.up_n, LATENT)
+    assert bound.w_up.stride() == (LATENT, 1)
+    assert bound.w_up.storage_offset() == 0
     assert bound.w_up.untyped_storage().nbytes() == dims.up_n * LATENT * 2
+    assert torch.equal(bound.w_up, torch.ones_like(bound.w_up))
+
+
+@pytest.mark.parametrize("layout", ["noncontiguous", "output_padded"])
+def test_bind_moe_keeps_native_up_layout_refusals(monkeypatch, layout):
+    from atom.models.kimi_k3.mono import weights as w
+
+    dims = Dims(8)
+    up = _lin(HIDDEN, LATENT)
+    if layout == "noncontiguous":
+        up.weight = _bf16(LATENT, HIDDEN).T
+    else:
+        up.is_output_padded = True
+    layer = _moe_layer(dims, up)
+    stub = torch.zeros(1, dtype=torch.uint8)
+    monkeypatch.setattr(w, "_experts", lambda *a: (stub, stub, stub, stub))
+    with pytest.raises(MonoUnsupported, match="not contiguous|output padded"):
+        w.bind_moe(layer, 1, dims, 0)

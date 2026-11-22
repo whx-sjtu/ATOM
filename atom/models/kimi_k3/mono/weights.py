@@ -17,8 +17,8 @@ Three groups are the exception, and each says why:
   here (``layouts`` undoes AITER's two shuffles first). This is the port's whole
   weight budget: ~58 MB a mono layer, ~4 GB a rank over K3's KDA layers. A
   deployment that cannot spare it has to turn mono off, not run it degraded. A
-  bf16 checkpoint has no scale: its down-projection is bound as is, and only the
-  up-projection's rank band is copied (that is the whole cost there).
+  bf16 checkpoint has no scale: its down-projection and the up-projection's
+  rank band share the model's existing storage.
 * the fused KDA in-projection, which must be unquantized. ATOM's online quant
   turns it into preshuffled per-token FP8 padded to 6400 rows; the kernels read
   bf16. It is refused rather than dequantized, because at 90 MB a layer that
@@ -353,15 +353,20 @@ def bind_moe(layer, layer_id: int, dims: Dims, rank: int) -> MoeLayer:
     # this rank's row band of it and the ranks' bands are summed into the
     # layer's output, so only the band is bound.
     #
-    # `.clone()`, not `.contiguous()`: a row `narrow` of a row-major tensor is
-    # already contiguous, so `contiguous()` hands back the SAME view and the
-    # whole dequantized 7168x3584 plane stays referenced by it -- 49 MiB held
-    # per layer per rank to keep the 6.1 MiB band, which is memory the lazy
-    # bind does not have and so turns mono off. `_mxfp4_to_bf16` returns a
-    # fresh contiguous tensor, so cloning the band copies once and frees it.
-    w_up = _mxfp4_to_bf16(
-        moe.routed_expert_up_proj, f"{name} routed_expert_up_proj", (HIDDEN, LATENT)
+    # Native BF16 is already model-owned; a converted plane must be released
+    # after copying its band, rather than keeping all 49 MiB behind a view.
+    up_proj = moe.routed_expert_up_proj
+    w_up = _mxfp4_to_bf16(up_proj, f"{name} routed_expert_up_proj", (HIDDEN, LATENT))
+    source_up = getattr(up_proj, "weight", None)
+    native_up = (
+        source_up is not None
+        and source_up.dtype == BF16
+        and getattr(up_proj, "weight_scale", None) is None
+        and w_up.is_set_to(source_up)
     )
+    w_up = w_up.narrow(0, rank * dims.up_n, dims.up_n)
+    if not native_up:
+        w_up = w_up.clone()
     return MoeLayer(
         layer_id=layer_id,
         blocks=layer_block(layer_id)[0],
@@ -376,7 +381,7 @@ def bind_moe(layer, layer_id: int, dims: Dims, rank: int) -> MoeLayer:
             (LATENT, HIDDEN),
         ),
         ln_w=_vec(moe.routed_expert_norm.weight, LATENT, f"{name} routed_expert_norm"),
-        w_up=w_up.narrow(0, rank * dims.up_n, dims.up_n).clone(),
+        w_up=w_up,
         w_sgu=_plain_bf16(
             moe.shared_experts.gate_up_proj,
             f"{name} shared gate_up_proj",
