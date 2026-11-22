@@ -81,7 +81,7 @@ TL_POINTS = 18  # + 14 route's logits polled, 15 lnorm's latent sums in, 16 down
 
 assert E0 + k2b.R_TASKS + k2b.L_TASKS <= BLOCKS and k2b.G_TASKS <= E0 - O0
 
-REGIONS = ("part", "wgt", "msq", "xrdy", "ar", "dg") + k2b.REGIONS
+REGIONS = ("part", "wgt", "msq", "xrdy", "ar", "dg") + k2b.REGIONS + ("rlogp",)
 
 _STREAM = fx.Stream(None)
 
@@ -97,6 +97,7 @@ class K2Build:
     ln_eps: float = 1e-5  # the latent RMSNorm
     # the final reduce here (else the next layer's K1)
     reduce: bool = field(default=True, metadata={"sym": "r"})
+    rlog_parts: bool = field(default=False, metadata={"sym": "rp"})
     diag: bool = field(default=False, metadata={"sym": "g"})
     timeline: bool = field(default=False, metadata={"sym": "t"})
 
@@ -139,14 +140,16 @@ ABI = KernelAbi(
 )
 
 
-def peer_layout(s):
+def peer_layout(s, rlog_parts=False):
     """K2a's AR and DG regions, then K2b's: name -> (byte offset, bytes)."""
     pairs = {"ar": k2a.ar_pairs(s), "dg": k2a.dg_pairs(s), **k2b.peer_pairs(s)}
+    if rlog_parts:
+        pairs["rlogp"] = k2b.R_PARTS * s * k2b.E
     return pair_layout(pairs.items())
 
 
-def peer_bytes(s):
-    lay = peer_layout(s)
+def peer_bytes(s, rlog_parts=False):
+    lay = peer_layout(s, rlog_parts)
     return max(o + n for o, n in lay.values())
 
 
@@ -236,14 +239,23 @@ def stage_attnres_far(c, bid, on, tls):
 def stage_routes(c, bid):
     """CTA bid (< NA) after the AttnRes seam: route tokens bid, bid + 56, .."""
     s = c["S"]
+    rlog_parts = c.get("rlog_parts", False)
     enter_stage("k2.route")
     for i in range_constexpr(-(-s // NA)):
         if bid + NA * i < s:
+            if const_expr(rlog_parts):
+                k2b.stage_router_parts(c, bid + NA * i)
             k2b.stage_route(c, bid + NA * i)
     stamp(c["tl_on"], c["tls"], c["tid"], 10)
 
 
 _BUILDS: dict = {}
+
+
+def rlogp_supported(key: K2Build):
+    # Reuse AttnLds.vals only after AttnRes; shallow/narrow builds keep RLOG.
+    words = min(key.tokens, TG) * (key.nblocks + 1) * COLS
+    return key.rlog_parts and words >= k2b.R_PARTS * k2b.E
 
 
 def build(key: K2Build):
@@ -264,7 +276,11 @@ def build(key: K2Build):
     assert s * (k2b.SI + gemv.LDS_PAD) <= sg * (xcols + gemv.LDS_PAD)
     lay = scratch_layout(key)
     plain_lay = plain_layout(key)
-    play = peer_layout(s)
+    rlog_parts = rlogp_supported(key)
+    play = peer_layout(s, key.rlog_parts)
+    peer_regions = k2b.PEER_REGIONS + ("ar", "dg")
+    if rlog_parts:
+        peer_regions += ("rlogp",)
     RouteLds = k2b.route_lds(s)
 
     @fx.struct
@@ -344,7 +360,7 @@ def build(key: K2Build):
         bases = peer_bases(peers, TP_)
         own = load_ptr64(peers, rank)
         peer = {}
-        for region in k2b.PEER_REGIONS + ("ar", "dg"):
+        for region in peer_regions:
             off = play[region][0]
             peer[region] = [preg(b, off, region) for b in bases]
             peer[region + "_own"] = preg(own, off, region)
@@ -371,6 +387,7 @@ def build(key: K2Build):
             "queue": queue,
             "red": lds.red.ptr,
             "peer": peer,
+            "rlog_parts": rlog_parts,
             "ar_peer": peer["ar"],
             "ar_own": peer["ar_own"],
             "dg_peer": peer["dg"],

@@ -441,6 +441,14 @@ def early_out(c, kind, i, q, red, t0=0):
             v0 = bf16_round(row_sum(red, 2 * rp, t))
             v1 = bf16_round(row_sum(red, 2 * rp + 1, t))
             c["put_bf"](c["sgu"], (t0 + t) * 2 * SI + i * ROWS + 2 * rp, [v0, v1])
+    elif const_expr((kind == 0) and c.get("rlog_parts", False)):
+        if tid < ROWS * sg:
+            r = tid % ROWS
+            t = t0 + tid // ROWS
+            value = row_sum(red, r, tid // ROWS)
+            index = router_part_index(s, c["rank"], q, t, i * ROWS + r)
+            for peer in range_constexpr(TP):
+                c["put"](c["peer"]["rlogp"][peer], index, value)
     else:
         if tid < ROWS * sg:
             r = tid % ROWS
@@ -700,6 +708,30 @@ def stage_early(c, bid):
 
 
 # ---------------------------------------------------------------- route
+# RLOGP handoff reference: Inferact/amd-kernels PR10, 33a9374cf,
+# moe/layer_tail_k2_h7168_ranks8; this uses ATOM's existing tagged mailbox.
+def router_part_index(rows, rank, part, token, expert_row):
+    return (((rank * R_PARTS + part) * rows + token) * (E // TP)) + expert_row
+
+
+@traced
+def stage_router_parts(c, token):
+    """Each wave reads one K part; the route reads all parts after the barrier."""
+    lane, part = c["lane"], c["wave"]
+    if part < R_PARTS:
+        requests = []
+        for i in range_constexpr(E // 64):
+            expert = lane + 64 * i
+            index = router_part_index(
+                c["S"], expert // (E // TP), part, token, expert % (E // TP)
+            )
+            requests.append((c["peer"]["rlogp_own"], index, 1))
+        values = c["poll"](requests)
+        for i in range_constexpr(E // 64):
+            fx.ptr_store(f32_of(values[i][0]), c["vals"] + part * E + lane + 64 * i)
+    gpu.barrier()
+
+
 @traced
 def stage_route(c, t):
     """Token t (wave 0): 896 logits, 14 a lane (expert lane + 64 i) -> sigmoid
@@ -713,6 +745,7 @@ def stage_route(c, t):
     search over all 896 keys (``wave_kth``), with the same order."""
     lane, wave, red = c["lane"], c["wave"], c["red"]
     a = c["args"]
+    rlog_parts = c.get("rlog_parts", False)
     if wave == 0:
         s = c["S"]
         per = E // 64
@@ -725,11 +758,18 @@ def stage_route(c, t):
             )
         # the bias does not depend on the logits: in flight under the poll
         bias = [ld_f32(a["bias"], lane + 64 * i) for i in range(per)]
-        got = c["poll"](specs)
+        if const_expr(not rlog_parts):
+            got = c["poll"](specs)
         stamp(c["tl_on"], c["tls"], c["tid"], 14)
         keys, sigs = [], []
         for i in range_constexpr(per):
-            lg = f32_of(got[i][0])
+            if const_expr(rlog_parts):
+                expert = lane + 64 * i
+                lg = fx.ptr_load(c["vals"] + expert)
+                for part in range_constexpr(1, R_PARTS):
+                    lg = lg + fx.ptr_load(c["vals"] + part * E + expert)
+            else:
+                lg = f32_of(got[i][0])
             sg = hw_rcp(fx.Float32(1.0) + hw_exp2(lg * fx.Float32(-LOG2E)))
             sc = sg + bias[i]
             # a NaN logit (a warmup's garbage row) ranks last

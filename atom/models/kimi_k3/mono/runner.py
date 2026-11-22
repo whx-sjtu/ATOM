@@ -45,6 +45,7 @@ from aiter.dist.parallel_state import (
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
+from atom.distributed.group_agreement import group_agree
 from atom.models.kimi_k3.mono.config import (
     MAX_ROWS,
     Dims,
@@ -116,12 +117,21 @@ class WidthBuild:
         )
 
 
-def ix_peer_offset(max_rows: int) -> int:
+def ix_peer_offset(max_rows: int, rlog_parts: bool = False) -> int:
     """Where the DSA indexer's regions start in the peer buffer it shares with
     K2: past every K2 width's (up to ``max_rows``). A rank already in the next
     layer's K2 (its AR pushes from offset 0) then cannot land on hist pairs a
     peer's indexer is still polling; at a shared 0 they overlapped from 2 rows."""
-    return -(-k2.peer_bytes(max_rows) // 256) * 256
+    return -(-k2.peer_bytes(max_rows, rlog_parts) // 256) * 256
+
+
+def _agree_rlogp(group) -> bool:
+    requested = envs.ATOM_MONO_K2_RLOGP
+    enabled = group_agree(requested, group)
+    disabled = group_agree(not requested, group)
+    if not (enabled or disabled):
+        raise RuntimeError("ATOM_MONO_K2_RLOGP differs across TP ranks")
+    return enabled
 
 
 def _lean_width(built: WidthBuild, spilled: list) -> WidthBuild | None:
@@ -153,11 +163,13 @@ class K3MonoDecodeRunner:
     refusal every rank agrees on before anything collective."""
 
     max_rows = MAX_ROWS
+    rlog_parts = False
 
     def __init__(self, model, drafter=None, metadata_builder=None) -> None:
         group = get_tp_group().cpu_group
+        self.rlog_parts = _agree_rlogp(group)
         bind_agreed(lambda: self._bind(model, drafter, metadata_builder), group)
-        peer_bytes = k2.peer_bytes(self.max_rows)
+        peer_bytes = k2.peer_bytes(self.max_rows, self.rlog_parts)
         if self.ix is not None:
             peer_bytes = max(peer_bytes, self.ix.peer_bytes)
         self.peers, self._finalizer = owned_peer_buffer(
@@ -212,7 +224,7 @@ class K3MonoDecodeRunner:
             self.ix = IndexerRunner(
                 self.inner,
                 metadata_builder,
-                peer_offset=ix_peer_offset(self.max_rows),
+                peer_offset=ix_peer_offset(self.max_rows, self.rlog_parts),
                 max_rows=self.max_rows,
             )
         except MonoUnsupported as why:
@@ -416,6 +428,7 @@ class K3MonoDecodeRunner:
                 eps=p.moe.seam.eps,
                 out_eps=p.moe.seam.out_eps,
                 ln_eps=p.moe.ln_eps,
+                rlog_parts=self.rlog_parts,
                 diag=self.debug,
             )
             for p in self.plans
