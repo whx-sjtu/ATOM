@@ -90,3 +90,36 @@ The prospective runtime binding treats only the exact empty, regular COMGR
 path/device/inode/size/mode/content remain bound. Compiled cache entries and
 model/code bindings stay strict. The installed COMGR revision and source proof
 are bound with the plan; observed marker drift is not writer attribution.
+
+
+The finite native event-setup diagnostic preserves the historical author ADVANCE
+and independent INCONCLUSIVE_AA_NOISE. It is not another donor comparison or a
+replacement timer. Five windows run F/P, P/F, F/P, P/F, F/P; each setting has
+one A/A pair with the original even/odd label order. Both labels use the native
+graph. Each of the twenty timed replays per rank has one graph warmup, device
+synchronization and the default Gloo barrier, followed by128 captured tail calls.
+
+F creates fresh timing events after that barrier. P creates one pair, records
+both events on the measured stream and synchronizes before the first diagnostic
+warmup/barrier. P is reused only after completed measurements. Event flags are
+explicit; priming adds no native/mailbox call. The same buffered CLOCK_MONOTONIC
+entry/return observer covers actual host calls in both settings. P's initial
+setup is separate. No new collective or file output is inserted in a window;
+the existing duration gather carries raw batch milliseconds and the unchanged
+per-call division. Host observations are published afterward, including partial
+records on handled failures. They are not GPU starts, peer-wait or clock data.
+
+Preparation uses only the pinned native call and native mailbox: two eager calls,
+one graph of128 nodes, and four graph replays for reference, last-row-empty,
+all-empty and restored-reference checks. Input materialization has its separately
+identified event pair. Twenty warmups and twenty timed graph replays follow;
+post-diagnostic reference/input checks add no graph replay. No between-sample
+workspace reset occurs. Exact preparation/order/host identity, event policy and
+all preserved outcome/range evidence are bound in the diagnostic plan.
+
+The original2% flags remain on all ten pairs, even noisy ones; the fixed set
+finishes without replacement. Results can indicate setup sensitivity only when
+the setting difference accompanies the corresponding host issuance component.
+Nonrecurrence or mixed observations remain unresolved. No overhead subtraction,
+physical-cause claim, old-result repair, method adoption or automatic follow-up
+is authorized. The180-second work/validation and owned release rules remain.

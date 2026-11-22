@@ -559,19 +559,27 @@ def check_plan(plan, path, worker=False):
     assert plan["head"] == LEGACY.git("rev-parse", "HEAD") and not LEGACY.git(
         "status", "--porcelain"
     )
-    assert plan["mode"] in ("capture", "replay") and plan["rows"] == [capture.ROWS]
+    assert plan["mode"] in ("capture", "replay", "native_setup") and plan["rows"] == [
+        capture.ROWS
+    ]
     assert plan["max_job_seconds"] == (900 if plan["mode"] == "capture" else 180)
     assert Path(plan["output"]).resolve().is_relative_to(PRIVATE / "runs")
     assert plan["selected_bdfs"] == list(LEGACY.SELECTED_BDFS)
     assert plan["validation_command"] == validation_command(path)
-    assert plan["protocol"] == {
-        "pairs": 5,
-        "aa_pairs": 5,
-        "calls": 128,
-        "input_sets": 1,
-        "noise_fraction": 0.02,
-        "reproduction": "fixed_author_observed_min_max",
-    }
+    assert plan["protocol"] == (
+        setup_protocol()
+        if plan["mode"] == "native_setup"
+        else {
+            "pairs": 5,
+            "aa_pairs": 5,
+            "calls": 128,
+            "input_sets": 1,
+            "noise_fraction": 0.02,
+            "reproduction": "fixed_author_observed_min_max",
+        }
+    )
+    if plan["mode"] == "native_setup":
+        assert plan["host_clock"] == host_clock_identity() and "recovery_record" in plan
     binding_functions()["verify_binding"](plan["execution"])
     marker_policy = plan["execution"]["cache_pruning_marker"]
     assert (
@@ -579,7 +587,7 @@ def check_plan(plan, path, worker=False):
         and marker_policy["mutable_field"] == "mtime_ns"
     )
     if "recovery_record" in plan:
-        assert plan["mode"] == "replay" and "snapshot" not in plan
+        assert plan["mode"] in ("replay", "native_setup") and "snapshot" not in plan
         check_recovery(plan["recovery_record"])
     for name, expected in plan["sources"].items():
         assert sha(name) == expected, name
@@ -727,11 +735,13 @@ def make_plan(mode, output, path, snapshot=None, recovery=None):
         "gpu_authorized_by_plan": False,
     }
     if recovery is not None:
-        assert mode == "replay" and snapshot is None
+        assert mode in ("replay", "native_setup") and snapshot is None
         record = check_recovery(recovery)
         plan["recovery_record"] = str(recovery.resolve())
         plan["sources"].update(record["bindings"])
         plan["sources"][str(recovery.resolve())] = sha(recovery)
+    elif mode == "native_setup":
+        raise ValueError("native setup diagnostic requires the exact recovery record")
     elif mode == "replay":
         if snapshot is None:
             raise ValueError("MISSING_NATIVE_INPUT: complete all-rank capture required")
@@ -760,7 +770,486 @@ def make_plan(mode, output, path, snapshot=None, recovery=None):
                 for r in range(8)
             }
         )
+    if mode == "native_setup":
+        plan["protocol"] = setup_protocol()
+        plan["host_clock"] = host_clock_identity()
+        for name, digest in SETUP_EVIDENCE.items():
+            assert sha(name) == digest, name
+        plan["sources"].update(SETUP_EVIDENCE)
+        plan["treatment"] = (
+            "Finite native-only F/P event-setup diagnostic; old ADVANCE/INCONCLUSIVE and ranges unchanged; no performance acceptance or timer adoption"
+        )
     return plan
+
+
+SETUP_EVIDENCE = {
+    "/share_nfs/whx/work/k31_perf_opt/.opt-team/agent-team/work/root-19-noise-published-copy-7073444630/ruling.md": "3b2607c55a1eeef1334bf1f98f9077bd90a0db47477a36fa54dafc8c051579b3",
+    "/share_nfs/whx/work/k31_perf_opt/.opt-team/agent-team/evidence/task-19-author-replay-661bbb29-01/reproduction-intervals.json": "1fcb193fa6b0fbbec1b58decfb9379f500eabb64e0adcb175a66b0cb5e74249c",
+    "/share_nfs/whx/work/k31_perf_opt/.opt-team/agent-team/evidence/review-19-reproduction-outcome-661bbb29-01/verdict.json": "c20f2bf8ac10b2a5a0139eb7e1a1a5accec54358ace8826b014e2301a6a387f5",
+}
+
+EVENT_FLAGS = {
+    "enable_timing": True,
+    "blocking": False,
+    "interprocess": False,
+    "external": False,
+}
+
+
+def host_clock_identity():
+    import socket
+
+    return {
+        "hostname": socket.gethostname(),
+        "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+        "time_namespace": os.readlink("/proc/self/ns/time"),
+        "clock": "CLOCK_MONOTONIC",
+    }
+
+
+def setup_protocol():
+    return {
+        "kind": "native_only_event_setup_diagnostic",
+        "calls": 128,
+        "windows": [["F", "P"], ["P", "F"], ["F", "P"], ["P", "F"], ["F", "P"]],
+        "labels_even": ["native", "donor"],
+        "labels_odd": ["donor", "native"],
+        "label_targets": {"native": "native", "donor": "native"},
+        "timed_replays_per_rank": 20,
+        "warmups_per_timed_replay": 1,
+        "event_flags": EVENT_FLAGS,
+        "stream": "one dedicated per-rank measured stream for both settings",
+        "duration_gather": "one existing default-Gloo all_gather per observation, after final sync; raw batch_ms and batch_ms*1000/128",
+        "publishing": "buffer locally; write after the fixed set or a handled failure, never inside a timing window",
+        "P_pairs": 1,
+        "P_priming": "two records and device sync before first diagnostic warmup/barrier",
+        "F_pairs": 10,
+        "F_setup": "fresh pair after warmup/device sync/default Gloo barrier",
+        "observer": "buffered CLOCK_MONOTONIC call entry/return; no GPU-start or peer-wait inference",
+        "noise_fraction": 0.02,
+        "interruption": "SIGTERM/SIGINT raise and save buffered partial records outside normal timing; incomplete returns remain absent; parent ownership/release unchanged",
+        "preparation": {
+            "materialization_event_pairs": 1,
+            "native_eager_calls": 2,
+            "native_capture_nodes": 128,
+            "control_graph_replays": 4,
+            "diagnostic_warmups": 20,
+            "diagnostic_timed_replays": 20,
+            "post_diagnostic_graph_replays": 0,
+            "between_sample_workspace_resets": 0,
+        },
+        "interpretation": "setup sensitivity only when setting differences have corresponding host components; nonrecurrence/mixed results unresolved; no old-result repair or timer adoption",
+    }
+
+
+def setup_order():
+    return [
+        (window, setting, label)
+        for window, settings in enumerate(setup_protocol()["windows"])
+        for setting in settings
+        for label in (("native", "donor") if window % 2 == 0 else ("donor", "native"))
+    ]
+
+
+def observe_call(spans, name, function, *args, **kwargs):
+    span = [None, None]
+    spans[name] = span
+    span[0] = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+    value = function(*args, **kwargs)
+    span[1] = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+    return value
+
+
+def setup_measure(graph, stream, result):
+    import torch
+    import torch.distributed as dist
+
+    def events():
+        return torch.cuda.Event(**EVENT_FLAGS), torch.cuda.Event(**EVENT_FLAGS)
+
+    priming = result["P_initial"] = {
+        "phase": "before_first_diagnostic_warmup",
+        "spans": {},
+        "pair": "P0",
+    }
+    primed = observe_call(priming["spans"], "create", events)
+    observe_call(priming["spans"], "start_record", primed[0].record, stream)
+    observe_call(priming["spans"], "end_record", primed[1].record, stream)
+    observe_call(priming["spans"], "synchronize", torch.cuda.synchronize)
+    result["samples"], result["pairs"] = [], []
+    fresh = 0
+    for ordinal, (window, setting, label) in enumerate(setup_order(), 1):
+        sample = {
+            "ordinal": ordinal,
+            "window": window,
+            "setting": setting,
+            "label": label,
+            "spans": {},
+            "complete": False,
+        }
+        result["samples"].append(sample)
+        spans = sample["spans"]
+        observe_call(spans, "warmup_submit", graph.replay)
+        observe_call(spans, "warmup_synchronize", torch.cuda.synchronize)
+        observe_call(spans, "barrier", dist.barrier)
+        if setting == "F":
+            pair = observe_call(spans, "create", events)
+            fresh += 1
+            sample["pair"] = "F" + str(fresh)
+        else:
+            pair = primed
+            sample["pair"] = "P0"
+        observe_call(spans, "start_record", pair[0].record, stream)
+        observe_call(spans, "graph_submit", graph.replay)
+        observe_call(spans, "end_record", pair[1].record, stream)
+        observe_call(spans, "final_synchronize", torch.cuda.synchronize)
+        batch_ms = pair[0].elapsed_time(pair[1])
+        local = torch.tensor(
+            [batch_ms, batch_ms * 1000 / 128], dtype=torch.float64, device="cpu"
+        )
+        gathered = [torch.empty_like(local) for _ in range(8)]
+        dist.all_gather(gathered, local)
+        batch_times, durations = zip(
+            *(entry.tolist() for entry in gathered), strict=True
+        )
+        assert all(0 < v < float("inf") for v in durations)
+        sample.update(
+            batch_ms=list(batch_times),
+            ranks_us=list(durations),
+            max_us=max(durations),
+            duration_spread_us=max(durations) - min(durations),
+            complete=True,
+        )
+    for window, settings in enumerate(setup_protocol()["windows"]):
+        for setting in settings:
+            pair = {
+                s["label"]: s
+                for s in result["samples"]
+                if s["window"] == window and s["setting"] == setting
+            }
+            ratio = pair["native"]["max_us"] / pair["donor"]["max_us"]
+            result["pairs"].append(
+                {
+                    "window": window,
+                    "setting": setting,
+                    "ratio": ratio,
+                    "within_2pct": abs(ratio - 1) <= 0.02,
+                }
+            )
+    return result
+
+
+def validate_setup_observations(result):
+    def ordered(spans, names):
+        assert set(spans) == set(names)
+        previous = 0
+        for name in names:
+            entry, returned = spans[name]
+            assert (
+                type(entry) is int
+                and type(returned) is int
+                and previous <= entry <= returned
+            )
+            previous = returned
+        return previous
+
+    initial = result["P_initial"]
+    assert (
+        initial["phase"] == "before_first_diagnostic_warmup" and initial["pair"] == "P0"
+    )
+    primed_at = ordered(
+        initial["spans"], ("create", "start_record", "end_record", "synchronize")
+    )
+    assert len(result["samples"]) == 20 and len(result["pairs"]) == 10
+    previous, fresh = primed_at, 0
+    for ordinal, (sample, expected) in enumerate(
+        zip(result["samples"], setup_order(), strict=True), 1
+    ):
+        assert (
+            sample["window"],
+            sample["setting"],
+            sample["label"],
+        ) == expected and sample["ordinal"] == ordinal
+        assert sample["complete"] and previous <= sample["spans"]["warmup_submit"][0]
+        names = ["warmup_submit", "warmup_synchronize", "barrier"]
+        if sample["setting"] == "F":
+            fresh += 1
+            assert sample["pair"] == "F" + str(fresh)
+            names.append("create")
+        else:
+            assert sample["pair"] == "P0"
+        names += ["start_record", "graph_submit", "end_record", "final_synchronize"]
+        previous = ordered(sample["spans"], names)
+        assert len(sample["batch_ms"]) == len(sample["ranks_us"]) == 8
+        assert all(0 < value < float("inf") for value in sample["batch_ms"])
+        assert [value * 1000 / 128 for value in sample["batch_ms"]] == sample[
+            "ranks_us"
+        ]
+        assert sample["max_us"] == max(sample["ranks_us"])
+        assert sample["duration_spread_us"] == max(sample["ranks_us"]) - min(
+            sample["ranks_us"]
+        )
+    expected_pairs = [
+        (w, s)
+        for w, settings in enumerate(setup_protocol()["windows"])
+        for s in settings
+    ]
+    for pair, key in zip(result["pairs"], expected_pairs, strict=True):
+        assert (pair["window"], pair["setting"]) == key
+        samples = {
+            s["label"]: s
+            for s in result["samples"]
+            if (s["window"], s["setting"]) == key
+        }
+        ratio = samples["native"]["max_us"] / samples["donor"]["max_us"]
+        assert pair["ratio"] == ratio and pair["within_2pct"] == (
+            abs(ratio - 1) <= 0.02
+        )
+    return True
+
+
+def setup_host_summary(ranks):
+    def joined(spans):
+        result = {}
+        assert all(set(s) == set(spans[0]) for s in spans)
+        for name in spans[0]:
+            entries = [s[name][0] for s in spans]
+            returns = [s[name][1] for s in spans]
+            result[name] = {
+                "entry_spread_ns": max(entries) - min(entries),
+                "return_spread_ns": max(returns) - min(returns),
+                "call_duration_ns_per_rank": [
+                    end - start for start, end in zip(entries, returns, strict=True)
+                ],
+            }
+        return result
+
+    samples = []
+    for ordinal in range(20):
+        peers = [row["samples"][ordinal] for row in ranks]
+        record = {
+            name: peers[0][name]
+            for name in (
+                "ordinal",
+                "window",
+                "setting",
+                "label",
+                "max_us",
+                "duration_spread_us",
+            )
+        }
+        record["host_calls"] = joined([p["spans"] for p in peers])
+        record["host_gaps_ns_per_rank"] = {
+            "barrier_return_to_start_record_entry": [
+                p["spans"]["start_record"][0] - p["spans"]["barrier"][1] for p in peers
+            ],
+            "start_record_return_to_graph_submit_entry": [
+                p["spans"]["graph_submit"][0] - p["spans"]["start_record"][1]
+                for p in peers
+            ],
+            "graph_submit_return_to_end_record_entry": [
+                p["spans"]["end_record"][0] - p["spans"]["graph_submit"][1]
+                for p in peers
+            ],
+        }
+        samples.append(record)
+    return {
+        "state": "SETUP_DIAGNOSTIC_OBSERVATIONS_ONLY",
+        "host": ranks[0]["host"],
+        "initial_P_host_calls": joined([r["P_initial"]["spans"] for r in ranks]),
+        "samples": samples,
+        "pairs": ranks[0]["pairs"],
+        "noise_counts": {
+            s: sum(not p["within_2pct"] for p in ranks[0]["pairs"] if p["setting"] == s)
+            for s in ("F", "P")
+        },
+        "scope": "Host call entry/return and duration envelopes only; not GPU starts, peer waiting or clock evidence. No overhead subtraction, old-verdict repair, timer adoption or next job.",
+    }
+
+
+def native_diagnostic_graph(group, rank, device, item, stream, capacity):
+    import torch
+    import torch.distributed as dist
+
+    from atom.model_ops import dcp_ops
+    from atom.model_ops.attention_mla import MLAAttention, is_rocm_aiter_fp4bmm_enabled
+    from atom.model_ops.triton_fused_sigmoid_mul_quant import (
+        fused_sigmoid_mul_maybe_quant,
+    )
+
+    assert not is_rocm_aiter_fp4bmm_enabled()
+    tail = TAIL.Tail.__new__(TAIL.Tail)
+    tail.torch, tail.ops, tail.gate = torch, dcp_ops, fused_sigmoid_mul_maybe_quant
+    tail.rank, tail.device, tail.group = rank, device, group
+    tail.native = MLAAttention.__new__(MLAAttention)
+    torch.nn.Module.__init__(tail.native)
+    for key, value in {
+        "pbm_enabled": True,
+        "dcp_world_size": 8,
+        "num_heads": 12,
+        "v_head_dim": 128,
+        "kv_lora_rank": 512,
+        "W_V_scale": None,
+        "W_V_dcp_scale": None,
+        "dcp_comm_backend": "mailbox",
+        "dcp_group": group,
+        "o_proj": torch.nn.Identity(),
+    }.items():
+        setattr(tail.native, key, value)
+    assert dcp_ops.prepare_dcp_mailbox(group, 12, 128, capacity)
+    tail.key = dcp_ops._mailbox_key(group, 12, 128)
+    before = tail.calls()
+    for _ in range(2):
+        tail.native_call(item)
+    assert tail.calls() == before
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        for _ in range(128):
+            tail.native_call(item)
+    assert tail.calls() - before == 128
+    dcp_ops.check_dcp_mailbox_launches()
+    return tail, graph
+
+
+def setup_worker(rank, plan, snapshot, input_path, device, stream, group, hardware):
+    import torch
+    import torch.distributed as dist
+    from aiter.ops.flydsl.dcp_mailbox.common import token_tile
+
+    host = host_clock_identity()
+    assert host == plan["host_clock"]
+    result = {
+        "rank": rank,
+        "hardware": hardware,
+        "host": host,
+        "stream": int(stream.cuda_stream),
+        "input_sha256": sha(input_path),
+        "protocol": setup_protocol(),
+        "complete": False,
+        "old_author_and_independent_results_unchanged": True,
+        "diagnostic_not_method_adoption": True,
+    }
+
+    def interrupted(sig, frame):
+        result["stop_signal"] = sig
+        raise InterruptedError("native setup diagnostic interrupted")
+
+    handlers = {
+        sig: signal.signal(sig, interrupted) for sig in (signal.SIGTERM, signal.SIGINT)
+    }
+    try:
+        with torch.cuda.stream(stream):
+            load_start, load_end = torch.cuda.Event(**EVENT_FLAGS), torch.cuda.Event(
+                **EVENT_FLAGS
+            )
+            load_start.record(stream)
+            tensors = capture.SNAP.restore_tensors(snapshot, device)
+            load_end.record(stream)
+            torch.cuda.synchronize()
+            result["materialization_us"] = load_start.elapsed_time(load_end) * 1000
+            result["copy_bytes"] = sum(v.numel() for v in snapshot["arenas"].values())
+            item = {
+                "x": tensors["raw"],
+                "lse": tensors["lse"],
+                "owned": tensors["owned"],
+                "weight": tensors["w_v"],
+                "gate": tensors["gate"],
+            }
+            saved = {k: value.clone() for k, value in item.items()}
+            tail, graph = native_diagnostic_graph(
+                group,
+                rank,
+                device,
+                item,
+                stream,
+                snapshot["meta"]["key"]["workspace_capacity"],
+            )
+            workspace = capture.workspace_info(tail.ops._MAILBOX_WORKSPACES[tail.key])
+            assert token_tile(capture.ROWS) == snapshot["meta"]["key"]["token_tile"]
+            assert {
+                k: v for k, v in workspace.items() if k not in ("base", "state_base")
+            } == {
+                k: v
+                for k, v in snapshot["meta"]["workspace"].items()
+                if k not in ("base", "state_base")
+            }
+            result["workspace"], result["capture_key"] = (
+                workspace,
+                snapshot["meta"]["key"],
+            )
+            result["graph_proof"] = {
+                "decode": True,
+                "captured_native_nodes": 128,
+                "eager_mailbox_calls": 0,
+                "donor_graphs_or_calls": 0,
+            }
+            graph.replay()
+            torch.cuda.synchronize()
+            result["native_before"] = compare_global(
+                item["native_out"], tensors["reference"]
+            )
+            empty = []
+            for case in ("last_row", "all_rows"):
+                item["owned"].copy_(saved["owned"])
+                item["x"].copy_(saved["x"])
+                rows = slice(-1, None) if case == "last_row" else slice(None)
+                item["owned"][rows] = 0
+                item["x"][rows] = float("nan")
+                graph.replay()
+                torch.cuda.synchronize()
+                empty.append(
+                    {
+                        "case": case,
+                        "passed": bool(
+                            (item["native_out"][rows] == 0).all()
+                            and torch.isfinite(item["native_out"]).all()
+                        ),
+                    }
+                )
+            for key, value in saved.items():
+                item[key].copy_(value)
+            graph.replay()
+            torch.cuda.synchronize()
+            result["native_restored"] = compare_global(
+                item["native_out"], tensors["reference"]
+            )
+            statuses = [None] * 8
+            dist.all_gather_object(
+                statuses,
+                result["native_before"]["passed"]
+                and result["native_restored"]["passed"]
+                and all(e["passed"] for e in empty),
+            )
+            result["empty_controls"] = empty
+            assert all(statuses), "native preparation correctness failed"
+            setup_measure(graph, stream, result)
+            result["native_after"] = compare_global(
+                item["native_out"], tensors["reference"]
+            )
+            readonly = all(
+                torch.equal(item[key], value) for key, value in saved.items()
+            )
+            dist.all_gather_object(
+                statuses, readonly and result["native_after"]["passed"]
+            )
+            result["inputs_unchanged"] = readonly
+            assert all(statuses), "native diagnostic correctness/lifetime failed"
+            validate_setup_observations(result)
+            result["complete"] = True
+            result["verdict"] = "SETUP_DIAGNOSTIC_OBSERVATIONS_ONLY"
+        torch.cuda.synchronize()
+        dist.barrier()
+        dist.destroy_process_group()
+    except BaseException as error:
+        result["error"] = repr(error)
+        result["complete"] = False
+        raise
+    finally:
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
+        save(Path(plan["output"]) / f"rank{rank}.json", result)
 
 
 def measure(graphs, stream):
@@ -951,6 +1440,10 @@ def rank_worker(rank, plan):
         device_group=dist.new_group(backend="nccl"),
     )
     device, stream = torch.device("cuda", rank), torch.cuda.Stream()
+    if plan["mode"] == "native_setup":
+        return setup_worker(
+            rank, plan, snapshot, input_path, device, stream, group, hardware
+        )
     with torch.cuda.stream(stream):
         load_start, load_end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
             enable_timing=True
@@ -1067,8 +1560,56 @@ def validate_results(plan):
         ]
         assert {r["rank"] for r in ranks} == set(range(8))
         assert {r["hardware"]["bdf"] for r in ranks} == set(plan["selected_bdfs"])
-        assert all(r["all_ranks_pass"] for r in ranks)
-        assert all(len(r["pairs"]) == len(r["aa_pairs"]) == 5 for r in ranks)
+        if plan["mode"] == "native_setup":
+            admitted = json.loads(Path(plan["recovery_record"]).read_text())
+            for row in ranks:
+                expected = admitted["ranks"][row["rank"]]
+                assert (
+                    row["input_sha256"] == expected["sha256"]
+                    and row["capture_key"] == expected["key"]
+                )
+                assert {
+                    k: v
+                    for k, v in row["workspace"].items()
+                    if k not in ("base", "state_base")
+                } == {
+                    k: v
+                    for k, v in expected["workspace"].items()
+                    if k not in ("base", "state_base")
+                }
+                assert (
+                    row["complete"] and "error" not in row and row["inputs_unchanged"]
+                )
+                assert (
+                    row["host"] == plan["host_clock"]
+                    and row["protocol"] == setup_protocol()
+                )
+                assert all(
+                    row[name]["passed"]
+                    for name in ("native_before", "native_restored", "native_after")
+                )
+                assert len(row["empty_controls"]) == 2 and all(
+                    c["passed"] for c in row["empty_controls"]
+                )
+                assert row["graph_proof"] == {
+                    "decode": True,
+                    "captured_native_nodes": 128,
+                    "eager_mailbox_calls": 0,
+                    "donor_graphs_or_calls": 0,
+                }
+                validate_setup_observations(row)
+            common = lambda row: [
+                {k: v for k, v in sample.items() if k != "spans"}
+                for sample in row["samples"]
+            ]
+            assert all(
+                common(row) == common(ranks[0]) and row["pairs"] == ranks[0]["pairs"]
+                for row in ranks
+            )
+            save(output / "setup-summary.json", setup_host_summary(ranks))
+        else:
+            assert all(r["all_ranks_pass"] for r in ranks)
+            assert all(len(r["pairs"]) == len(r["aa_pairs"]) == 5 for r in ranks)
     return True
 
 
@@ -1122,7 +1663,7 @@ def supervise(plan, path):
                 "--plan",
                 str(path),
             ]
-            if plan["mode"] == "replay":
+            if plan["mode"] != "capture":
                 command += ["--rank", str(rank)]
             child = common.spawn(
                 command,
@@ -1374,6 +1915,340 @@ def deadline_checks():
         and records[2]["reported_elapsed_s"] < records[2]["declared_bound_s"]
     ), records
     return records
+
+
+def setup_cpu_checks():
+    import copy
+    from unittest.mock import patch
+
+    import torch
+    import torch.distributed as dist
+
+    helpers()
+    seen, events = [], []
+    state = {
+        "inside": False,
+        "barriers": 0,
+        "graphs": 0,
+        "syncs": 0,
+        "elapsed": 0,
+        "gathers": 0,
+        "clock": 1_000_000,
+    }
+    stream = object()
+
+    def now(clock):
+        assert clock == time.CLOCK_MONOTONIC
+        state["clock"] += 10
+        return state["clock"]
+
+    class Event:
+        def __init__(self, **flags):
+            assert flags == EVENT_FLAGS and not state["inside"]
+            self.index, self.created_after_barrier = len(events), state["barriers"]
+            self.ready, self.recorded = False, False
+            events.append(self)
+            seen.append("create")
+
+        def record(self, given_stream):
+            assert given_stream is stream and (not self.recorded or self.ready)
+            self.ready, self.recorded = False, True
+            state["inside"] = self.index % 2 == 0
+            seen.append("start_record" if self.index % 2 == 0 else "end_record")
+
+        def elapsed_time(self, other):
+            assert self.ready and other.ready and not state["inside"]
+            value = 0.3072 if state["elapsed"] == 0 else 0.256
+            state["elapsed"] += 1
+            seen.append("elapsed")
+            return value
+
+    class Graph:
+        def replay(self):
+            if state["graphs"] == 0:
+                assert len(events) == 2 and all(
+                    event.ready and event.recorded for event in events
+                ), "P was not primed before first warmup"
+            state["graphs"] += 1
+            seen.append("timed_graph" if state["inside"] else "warmup_graph")
+
+    def synchronize():
+        assert not state["inside"]
+        for event in events:
+            if event.recorded:
+                event.ready = True
+        state["syncs"] += 1
+        seen.append("synchronize")
+
+    def barrier():
+        assert not state["inside"]
+        state["barriers"] += 1
+        seen.append("barrier")
+
+    def gather(receivers, value):
+        assert not state["inside"] and len(receivers) == 8
+        for rank, receiver in enumerate(receivers):
+            ms = value[0].item() + rank * 0.00001
+            receiver.copy_(torch.tensor([ms, ms * 1000 / 128], dtype=torch.float64))
+        state["gathers"] += 1
+        seen.append("gather")
+
+    with (
+        patch.object(torch.cuda, "Event", Event),
+        patch.object(torch.cuda, "synchronize", synchronize),
+        patch.object(dist, "barrier", barrier),
+        patch.object(dist, "all_gather", gather),
+        patch.object(time, "clock_gettime_ns", now),
+    ):
+        result = setup_measure(Graph(), stream, {})
+    assert validate_setup_observations(result)
+    assert EVENT_FLAGS == {
+        "enable_timing": True,
+        "blocking": False,
+        "interprocess": False,
+        "external": False,
+    }
+    assert [
+        [pair["setting"] for pair in result["pairs"] if pair["window"] == window]
+        for window in range(5)
+    ] == [["F", "P"], ["P", "F"], ["F", "P"], ["P", "F"], ["F", "P"]]
+    for setting in ("F", "P"):
+        assert [
+            sample["label"]
+            for sample in result["samples"]
+            if sample["setting"] == setting
+        ] == [
+            "native",
+            "donor",
+            "donor",
+            "native",
+            "native",
+            "donor",
+            "donor",
+            "native",
+            "native",
+            "donor",
+        ]
+    assert seen[:5] == ["create", "create", "start_record", "end_record", "synchronize"]
+    assert len(events) == 22 and state["graphs"] == 40 and state["syncs"] == 41
+    assert state["barriers"] == state["gathers"] == state["elapsed"] == 20
+    assert sum(not pair["within_2pct"] for pair in result["pairs"]) == 1
+    fresh_ordinals = [
+        i for i, (_, setting, _) in enumerate(setup_order(), 1) if setting == "F"
+    ]
+    assert [event.created_after_barrier for event in events[2::2]] == fresh_ordinals
+    expected_trace = list(seen[:5])
+    for _, setting, _ in setup_order():
+        expected_trace += ["warmup_graph", "synchronize", "barrier"]
+        if setting == "F":
+            expected_trace += ["create", "create"]
+        expected_trace += [
+            "start_record",
+            "timed_graph",
+            "end_record",
+            "synchronize",
+            "elapsed",
+            "gather",
+        ]
+    assert seen == expected_trace
+    failures = []
+    for name, edit in (
+        ("missing_observation", lambda r: r["samples"].pop()),
+        ("wrong_setting", lambda r: r["samples"][0].update(setting="P")),
+        (
+            "late_P_prime",
+            lambda r: r["P_initial"]["spans"]["synchronize"].__setitem__(
+                1, r["samples"][0]["spans"]["warmup_submit"][0] + 1
+            ),
+        ),
+        ("missing_F_setup", lambda r: r["samples"][0]["spans"].pop("create")),
+        ("invented_P_setup", lambda r: r["samples"][2]["spans"].update(create=[1, 2])),
+        (
+            "raw_batch_conversion",
+            lambda r: r["samples"][0]["ranks_us"].__setitem__(0, 99),
+        ),
+        ("noise_relabel", lambda r: r["pairs"][0].update(within_2pct=True)),
+        (
+            "incomplete_call",
+            lambda r: r["samples"][0]["spans"]["graph_submit"].__setitem__(1, None),
+        ),
+    ):
+        bad = copy.deepcopy(result)
+        edit(bad)
+        try:
+            validate_setup_observations(bad)
+        except (AssertionError, KeyError, TypeError, ValueError):
+            failures.append(name)
+        else:
+            raise AssertionError("diagnostic evidence mutation accepted: " + name)
+    from tempfile import TemporaryDirectory
+
+    with TemporaryDirectory() as directory:
+        out = Path(directory)
+        host = host_clock_identity()
+        admitted = {
+            "ranks": [
+                {
+                    "sha256": f"controlled-{rank}",
+                    "key": {"capacity": 96},
+                    "workspace": {"bytes": 4792352},
+                }
+                for rank in range(8)
+            ]
+        }
+        save(out / "admission.json", admitted)
+        plan = {
+            "mode": "native_setup",
+            "output": directory,
+            "selected_bdfs": list(LEGACY.SELECTED_BDFS),
+            "host_clock": host,
+            "recovery_record": str(out / "admission.json"),
+        }
+        for rank in range(8):
+            row = copy.deepcopy(result)
+            row.update(
+                rank=rank,
+                hardware={"bdf": LEGACY.SELECTED_BDFS[rank], "rank": rank},
+                stream=rank + 1,
+                host=host,
+                protocol=setup_protocol(),
+                complete=True,
+                inputs_unchanged=True,
+                input_sha256=admitted["ranks"][rank]["sha256"],
+                capture_key={"capacity": 96},
+                workspace={"bytes": 4792352},
+                native_before={"passed": True},
+                native_restored={"passed": True},
+                native_after={"passed": True},
+                empty_controls=[{"passed": True}, {"passed": True}],
+                graph_proof={
+                    "decode": True,
+                    "captured_native_nodes": 128,
+                    "eager_mailbox_calls": 0,
+                    "donor_graphs_or_calls": 0,
+                },
+            )
+            for spans in [
+                row["P_initial"]["spans"],
+                *[sample["spans"] for sample in row["samples"]],
+            ]:
+                for span in spans.values():
+                    span[0] += rank * 100
+                    span[1] += rank * 100
+            save(out / f"rank{rank}.json", row)
+        assert validate_results(plan)
+        joined = json.loads((out / "setup-summary.json").read_text())
+        assert (
+            joined["samples"][0]["host_calls"]["graph_submit"]["entry_spread_ns"] == 700
+        )
+        assert (
+            joined["samples"][0]["host_calls"]["graph_submit"][
+                "call_duration_ns_per_rank"
+            ]
+            == [10] * 8
+        )
+        assert joined["noise_counts"] == {"F": 1, "P": 0}
+        original = json.loads((out / "rank0.json").read_text())
+        for name, edit in (
+            ("failed_native_before", lambda r: r["native_before"].update(passed=False)),
+            ("failed_native_after", lambda r: r["native_after"].update(passed=False)),
+            ("changed_inputs", lambda r: r.update(inputs_unchanged=False)),
+            (
+                "failed_empty_zero",
+                lambda r: r["empty_controls"][0].update(passed=False),
+            ),
+            ("wrong_clock_domain", lambda r: r["host"].update(boot_id="wrong")),
+            ("wrong_input_hash", lambda r: r.update(input_sha256="wrong")),
+            ("wrong_workspace", lambda r: r["workspace"].update(bytes=1)),
+        ):
+            bad = copy.deepcopy(original)
+            edit(bad)
+            save(out / "rank0.json", bad)
+            try:
+                validate_results(plan)
+            except AssertionError:
+                failures.append(name)
+            else:
+                raise AssertionError("diagnostic result mutation accepted: " + name)
+        save(out / "rank0.json", original)
+        assert validate_results(plan)
+    events.clear()
+    seen.clear()
+    state.update(
+        inside=False,
+        barriers=0,
+        graphs=0,
+        syncs=0,
+        elapsed=0,
+        gathers=0,
+        clock=1_000_000,
+    )
+    original_replay = Graph.replay
+
+    def fail_submission(graph):
+        original_replay(graph)
+        if state["graphs"] == 4:
+            raise RuntimeError("controlled submission failure")
+
+    partial = {}
+    with (
+        patch.object(torch.cuda, "Event", Event),
+        patch.object(torch.cuda, "synchronize", synchronize),
+        patch.object(dist, "barrier", barrier),
+        patch.object(dist, "all_gather", gather),
+        patch.object(time, "clock_gettime_ns", now),
+        patch.object(Graph, "replay", fail_submission),
+    ):
+        try:
+            setup_measure(Graph(), stream, partial)
+        except RuntimeError as error:
+            assert str(error) == "controlled submission failure"
+        else:
+            raise AssertionError("hard submission failure did not stop")
+    assert len(partial["samples"]) == 2 and partial["samples"][0]["complete"]
+    assert (
+        not partial["samples"][1]["complete"]
+        and partial["samples"][1]["spans"]["graph_submit"][1] is None
+    )
+    assert state["graphs"] == 4 and state["gathers"] == 1
+    old = ast.parse((PRIVATE / "deps/task14/adapter.py").read_text())
+    new = ast.parse(Path(__file__).read_text())
+
+    def native_fields(tree):
+        return next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Dict)
+            and any(
+                isinstance(key, ast.Constant) and key.value == "pbm_enabled"
+                for key in n.keys
+            )
+        )
+
+    assert ast.dump(native_fields(old), include_attributes=False) == ast.dump(
+        native_fields(
+            next(
+                n
+                for n in new.body
+                if isinstance(n, ast.FunctionDef)
+                and n.name == "native_diagnostic_graph"
+            )
+        ),
+        include_attributes=False,
+    )
+    assert not torch.cuda.is_initialized()
+    return {
+        "controlled_cpu_only": True,
+        "timed_observations": 20,
+        "warmups": 20,
+        "primed_event_pairs": 1,
+        "fresh_event_pairs": 10,
+        "noise_retained_without_repeat": True,
+        "hard_failure_preserves_partial_and_stops": True,
+        "native_constructor_fields_match_pinned_adapter": True,
+        "refusals": failures,
+        "event_order": "F/P,P/F,F/P,P/F,F/P; original within-pair alternation",
+    }
 
 
 def cache_marker_checks():
@@ -1647,9 +2522,10 @@ def cpu_checks():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--write-plan", choices=("capture", "replay"))
+    parser.add_argument("--write-plan", choices=("capture", "replay", "native_setup"))
     parser.add_argument("--plan", type=Path)
     parser.add_argument("--selfcheck", action="store_true")
+    parser.add_argument("--check-native-setup", action="store_true")
     parser.add_argument("--qualify-preserved", action="store_true")
     parser.add_argument("--root-receipts", type=Path)
     parser.add_argument("--ownership-fixture", type=Path)
@@ -1661,7 +2537,9 @@ if __name__ == "__main__":
     parser.add_argument("--validate-results", action="store_true")
     parser.add_argument("--rank", type=int, choices=range(8))
     args = parser.parse_args()
-    if args.selfcheck:
+    if args.check_native_setup:
+        print(json.dumps(setup_cpu_checks(), indent=2))
+    elif args.selfcheck:
         print(json.dumps(cpu_checks(), indent=2))
     elif args.qualify_preserved:
         print(
