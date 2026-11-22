@@ -20,6 +20,7 @@ from atom.model_ops.sparse_indexer_chunk import (
     flat_view,
     indexer_qsplit_world,
     plane_rows,
+    prefill_workspace_capacity,
     sparse_indexer_row_chunk,
 )
 from atom.utils import envs
@@ -237,3 +238,25 @@ def test_qsplit_off_on_a_pd_decode_instance():
 
 def test_qsplit_off_with_the_flag():
     assert indexer_qsplit_world(8, **{**_GATE, "enabled": False}) == 1
+
+
+@pytest.mark.parametrize("budget_mb", [0, 2048, 4096])
+def test_prefill_workspace_covers_the_band_between_max_width_tiles(budget, budget_mb):
+    budget(budget_mb)
+    capacity = prefill_workspace_capacity(1024, 1 << 20)
+    assert capacity == (2 * 1024**3 - 1) // 4
+    # The max-context plane is only 384 rows; this narrower original band is 1024.
+    assert decode_band_rows(1024, 507904, 1, capacity // 507904) == 1024
+
+
+@pytest.mark.parametrize("budget_mb", [1, 4])
+def test_prefill_workspace_refuses_a_cap_below_one_legacy_row(budget, budget_mb):
+    budget(budget_mb)
+    assert decode_band_rows(1024, 1 << 20, 1) == 1
+    assert prefill_workspace_capacity(1024, 1 << 20) == 0
+
+
+def test_prefill_workspace_small_and_empty_bounds(budget):
+    assert prefill_workspace_capacity(3, 17) == 51
+    assert prefill_workspace_capacity(0, 17) == 0
+    assert prefill_workspace_capacity(3, 0) == 0
