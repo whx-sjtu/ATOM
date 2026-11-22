@@ -81,6 +81,7 @@ from atom.mono.device.ops import (
     hw_rsq,
     kernel_symbol,
     ld_f32,
+    ld_i32,
     load_ptr64,
     popcount,
     row_sum,
@@ -821,6 +822,15 @@ def pick_expert(rt, p):
     return fx.max(fx.min(fx.ptr_load(rt["route"] + (t * 2 * TOPK + k)), E - 1), 0)
 
 
+def token_live(c, token):
+    """State slots describe global request padding; slot zero is a live slot."""
+    if c.get("skip_padding", False):
+        request = token // c["qlen"]
+        # Lane-dependent: a down-fold wave can straddle live/padded requests.
+        return ld_i32(c["args"]["st_idx"], request * c["args"]["st_stride"]) >= 0
+    return fx.Boolean(True)
+
+
 @traced
 def load_route(c):
     """ROUTE -> LDS (ids, weights); the union U (ascending): expert[slot],
@@ -849,8 +859,9 @@ def load_route(c):
     gpu.barrier()
     for i in range_constexpr(passes(s * TOPK)):
         p = tid + THREADS * i
-        if p < s * TOPK:
-            route.mark_token(rt["mask"], mw, pick_expert(rt, p), p // TOPK)
+        if p < s * TOPK:  # noqa: SIM102 - bound the slot read before the predicate
+            if token_live(c, p // TOPK):
+                route.mark_token(rt["mask"], mw, pick_expert(rt, p), p // TOPK)
     gpu.barrier()
     # two experts a thread: their pick counts; slots and first picks by scans
     ea, eb = fx.min(2 * tid, E - 1), fx.min(2 * tid + 1, E - 1)
@@ -880,11 +891,12 @@ def load_route(c):
         p = tid + THREADS * i
         if p < s * TOPK:
             t = p // TOPK
-            e = pick_expert(rt, p)
-            # the tokens below t that picked e: the picks before p in its slot
-            rank = route.tokens_below(rt["mask"], mw, e, t)
-            slot = fx.ptr_load(rt["slot"] + e)
-            fx.ptr_store(p, rt["order"] + (fx.ptr_load(rt["first"] + slot) + rank))
+            if token_live(c, t):
+                e = pick_expert(rt, p)
+                # The active picks keep their original token/top-k order.
+                rank = route.tokens_below(rt["mask"], mw, e, t)
+                slot = fx.ptr_load(rt["slot"] + e)
+                fx.ptr_store(p, rt["order"] + (fx.ptr_load(rt["first"] + slot) + rank))
     gpu.barrier()
     return uniform(tot)
 
@@ -1219,7 +1231,7 @@ def stage_down(c, rgd, nu, ops0):
     a batch waits only for its own slots' ug tasks) -> bf16(w acc) a (token,
     k) in LDS -> folded in top-k order with a bf16 rounding an add -> every
     rank's LATR."""
-    s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
+    s, lane, wave = c["S"], c["lane"], c["wave"]
     rt = c["rt"]
     b0 = wave
     ops = ops0
@@ -1268,19 +1280,32 @@ def stage_down(c, rgd, nu, ops0):
                     j0 = j0 + TG
         b0 = nb
         ops = ops_n
+    publish_down(c, rgd)
+
+
+@traced
+def publish_down(c, rgd, contributions=True):
+    """Publish every row's LATR, including zero routed contributions for padding."""
+    s, tid = c["S"], c["tid"]
     gpu.barrier()
     if tid < (ROWS // 2) * s:
         rp = tid % (ROWS // 2)
         tt = tid // (ROWS // 2)
         y0 = fx.Float32(0.0)
         y1 = fx.Float32(0.0)
-        for k in range_constexpr(TOPK):
-            y0 = bf16_round(
-                y0 + fx.ptr_load(c["contrib"] + ((tt * TOPK + k) * ROWS + 2 * rp))
-            )
-            y1 = bf16_round(
-                y1 + fx.ptr_load(c["contrib"] + ((tt * TOPK + k) * ROWS + 2 * rp + 1))
-            )
+        if const_expr(contributions):  # noqa: SIM102 - compile-time then lane predicate
+            if token_live(c, tt):
+                for k in range_constexpr(TOPK):
+                    y0 = bf16_round(
+                        y0
+                        + fx.ptr_load(c["contrib"] + ((tt * TOPK + k) * ROWS + 2 * rp))
+                    )
+                    y1 = bf16_round(
+                        y1
+                        + fx.ptr_load(
+                            c["contrib"] + ((tt * TOPK + k) * ROWS + 2 * rp + 1)
+                        )
+                    )
         # to the owner of these columns' lnorm task alone (``lat_owner``)
         task = rgd // (128 // ROWS)
         for p in range_constexpr(TP):
