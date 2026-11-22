@@ -7,10 +7,12 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import yaml
 from atomesh_workflow_helpers import github_expressions
@@ -34,6 +36,14 @@ class SpurDispatchTest(unittest.TestCase):
         (scripts / "setup_mesh.sh").write_text("echo /fake/atomesh\n")
         self.bin_dir = self.root / "bin"
         self.bin_dir.mkdir()
+        self.kfd_dir = self.root / "kfd"
+        self.kfd_dir.mkdir()
+        self.write_tool(
+            "amd-smi",
+            'print("GPU XCP VRAM_USED VRAM_FREE VRAM_TOTAL VRAM%")\n'
+            'print("0 0 0 MB 294592 MB 294592 MB 0.00 %")',
+        )
+        self.write_tool("rocm-smi", 'print("GPU[0] : GPU Memory Allocated (VRAM%): 0")')
         self.write_tool(
             "ip",
             """
@@ -135,6 +145,7 @@ class SpurDispatchTest(unittest.TestCase):
         self.env = {
             "PATH": f"{self.bin_dir}:{os.environ['PATH']}",
             "TEST_ROOT": str(self.root),
+            "ATOMESH_KFD_PROC_DIR": str(self.kfd_dir),
             "GITHUB_WORKSPACE": str(scripts.parents[2]),
             "LOG_ROOT": str(self.root / "logs"),
             "SLURM_JOB_ID": "42",
@@ -157,15 +168,40 @@ class SpurDispatchTest(unittest.TestCase):
         }
         self.run_dir = self.root / "logs/slurm_job-42"
 
-    def write_tool(self, name, body):
-        tool = self.bin_dir / name
-        tool.write_text("#!/usr/bin/env python3\n" + textwrap.dedent(body))
+    def write_tool(self, name, body, directory=None):
+        tool = (directory or self.bin_dir) / name
+        receipt = """
+            import json, os
+            from pathlib import Path
+            with (Path(os.environ["TEST_ROOT"]) / "child-env.jsonl").open("a") as stream:
+                stream.write(json.dumps({
+                    "tool": __file__,
+                    "rank": os.environ.get("SPUR_TASK_OFFSET"),
+                    "guard": {key: os.environ[key] for key in ("LD_PRELOAD", "KFD_GUARD_LOG")
+                              if key in os.environ},
+                    "parent_only": os.environ.get("SPUR_PARENT_SENTINEL")
+                }) + "\\n")
+        """
+        tool.write_text(
+            "#!/usr/bin/env python3\n"
+            + textwrap.dedent(receipt)
+            + textwrap.dedent(body)
+        )
         tool.chmod(0o755)
+
+    def child_env(self, **overrides):
+        env = {**self.env, **overrides}
+        for key in ("LD_PRELOAD", "KFD_GUARD_LOG"):
+            if key in os.environ:
+                env[key] = os.environ[key]
+            else:
+                env.pop(key, None)
+        return env
 
     def run_job(self, *args, expected_rc=0, **env):
         result = subprocess.run(
             ["bash", str(self.script), *args],
-            env={**self.env, **env},
+            env=self.child_env(**env),
             capture_output=True,
             text=True,
             timeout=15,
@@ -173,6 +209,148 @@ class SpurDispatchTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, expected_rc, result.stdout + result.stderr)
         return result
+
+    def probe_sandbox(self):
+        utilities, shadow = self.root / "utilities", self.root / "shadow"
+        utilities.mkdir()
+        shadow.mkdir()
+        for name in ("bash", "id", "mkdir", "chmod", "hostname", "head", "awk", "tail"):
+            (utilities / name).symlink_to(shutil.which(name))
+        (utilities / "python3").symlink_to(sys.executable)
+        for name in ("amd-smi", "rocm-smi"):
+            self.write_tool(
+                name,
+                'print("GPU XCP VRAM_USED VRAM_FREE VRAM_TOTAL VRAM%")\n'
+                'print("0 0 0 MB 294592 MB 294592 MB 0.00 %")',
+                directory=shadow,
+            )
+        empty_kfd = self.root / "probe-kfd"
+        empty_kfd.mkdir()
+        return shadow, {
+            "PATH": f"{self.bin_dir}:{shadow}:{utilities}",
+            "ATOMESH_KFD_PROC_DIR": str(empty_kfd),
+            "ATOMESH_KILL_GPU_HOLDERS": "0",
+        }
+
+    def test_default_kfd_discovery_is_private_and_empty(self):
+        print(
+            json.dumps(
+                {
+                    "default_kfd": self.env.get("ATOMESH_KFD_PROC_DIR"),
+                    "expected": str(self.root / "kfd"),
+                }
+            )
+        )
+        self.assertEqual(self.env.get("ATOMESH_KFD_PROC_DIR"), str(self.root / "kfd"))
+        self.assertEqual(list((self.root / "kfd").iterdir()), [])
+
+    def test_default_idle_probe_does_not_fall_through(self):
+        shadow, env = self.probe_sandbox()
+        self.run_job("--spur-preflight", **env)
+        receipts = [
+            json.loads(line)
+            for line in (self.root / "child-env.jsonl").read_text().splitlines()
+        ]
+        probes = [
+            Path(row["tool"])
+            for row in receipts
+            if Path(row["tool"]).name in ("amd-smi", "rocm-smi")
+        ]
+        print(
+            json.dumps(
+                {
+                    "probe_receipts": receipts,
+                    "controlled_kfd": env["ATOMESH_KFD_PROC_DIR"],
+                    "holder_kill": env["ATOMESH_KILL_GPU_HOLDERS"],
+                }
+            )
+        )
+        self.assertEqual(probes, [self.bin_dir / "amd-smi"])
+        self.assertFalse(any(path.parent == shadow for path in probes))
+
+    def test_rocm_fallback_uses_only_fixture_probe(self):
+        shadow, env = self.probe_sandbox()
+        (self.bin_dir / "amd-smi").unlink(missing_ok=True)
+        (shadow / "amd-smi").unlink()
+        self.run_job("--spur-preflight", **env)
+        receipts = [
+            json.loads(line)
+            for line in (self.root / "child-env.jsonl").read_text().splitlines()
+        ]
+        probes = [
+            Path(row["tool"])
+            for row in receipts
+            if Path(row["tool"]).name in ("amd-smi", "rocm-smi")
+        ]
+        print(
+            json.dumps(
+                {
+                    "fallback_receipts": receipts,
+                    "controlled_kfd": env["ATOMESH_KFD_PROC_DIR"],
+                    "holder_kill": env["ATOMESH_KILL_GPU_HOLDERS"],
+                }
+            )
+        )
+        self.assertEqual(probes, [self.bin_dir / "rocm-smi"])
+
+    def test_child_receipt_preserves_only_supplied_guard_through_overrides(self):
+        self.write_tool(
+            "guard-receipt",
+            "import json, os\n"
+            "print(json.dumps({key: os.environ[key] for key in "
+            '("LD_PRELOAD", "KFD_GUARD_LOG", "SPUR_PARENT_SENTINEL") if key in os.environ}))',
+        )
+        receipt_script = self.root / "guard-receipt.sh"
+        receipt_script.write_text("exec guard-receipt\n")
+        expected = {
+            key: os.environ[key]
+            for key in ("LD_PRELOAD", "KFD_GUARD_LOG")
+            if key in os.environ
+        }
+        with (
+            patch.dict(os.environ, {"SPUR_PARENT_SENTINEL": "not inherited"}),
+            patch.object(self, "script", receipt_script),
+        ):
+            result = self.run_job(LD_PRELOAD="", KFD_GUARD_LOG="discarded")
+        print(
+            json.dumps(
+                {"expected_guard": expected, "child_receipt": json.loads(result.stdout)}
+            )
+        )
+        self.assertEqual(json.loads(result.stdout), expected)
+
+    def test_batch_child_guard_receipts_match_parent(self):
+        expected = {
+            key: os.environ[key]
+            for key in ("LD_PRELOAD", "KFD_GUARD_LOG")
+            if key in os.environ
+        }
+        with patch.dict(os.environ, {"SPUR_PARENT_SENTINEL": "not inherited"}):
+            self.run_job(LD_PRELOAD="", KFD_GUARD_LOG="discarded")
+        receipts = [
+            json.loads(line)
+            for line in (self.root / "child-env.jsonl").read_text().splitlines()
+        ]
+        self.assertTrue({"0", "1"} <= {row["rank"] for row in receipts})
+        self.assertTrue(
+            {"srun", "docker", "amd-smi"}
+            <= {Path(row["tool"]).name for row in receipts}
+        )
+        for row in receipts:
+            self.assertEqual(row["guard"], expected)
+            self.assertIsNone(row["parent_only"])
+        print(json.dumps({"batch_child_receipts": receipts}))
+
+    def test_absent_parent_guard_is_not_invented_by_overrides(self):
+        with patch.dict(os.environ):
+            for key in ("LD_PRELOAD", "KFD_GUARD_LOG"):
+                os.environ.pop(key, None)
+            result = subprocess.CompletedProcess([], 0, "", "")
+            with patch("subprocess.run", return_value=result) as run:
+                self.run_job(LD_PRELOAD="not supplied", KFD_GUARD_LOG="not supplied")
+            child = run.call_args.kwargs["env"]
+            self.assertNotIn("LD_PRELOAD", child)
+            self.assertNotIn("KFD_GUARD_LOG", child)
 
     def docker_calls(self, rank):
         return [
@@ -308,11 +486,12 @@ class SpurDispatchTest(unittest.TestCase):
 
     def preflight_with_gpu_holder(self, squeue_jobs="", kill="1", **env):
         """Preflight on a host where one live process has the GPUs open."""
-        holder = subprocess.Popen(["sleep", "60"])
+        holder = subprocess.Popen(["sleep", "60"], env=self.child_env())
         self.addCleanup(holder.wait)
         self.addCleanup(holder.kill)
         kfd = self.root / "kfd"
         (kfd / str(holder.pid)).mkdir(parents=True)
+        print(json.dumps({"fixture_holder_pid": holder.pid, "fixture_kfd": str(kfd)}))
         self.write_tool(
             "squeue",
             """
