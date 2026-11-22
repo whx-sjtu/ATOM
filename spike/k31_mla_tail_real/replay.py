@@ -294,25 +294,42 @@ def recovery_record():
     )
     assert (
         bindings[str(capture_plan)]
+        == sha(capture_plan)
         == "78a5c221b2fc10f2c57e9ca4684db3518697b529225ef36bef1d23cb4fadfdcb"
     )
     original = json.loads(capture_plan.read_text())
     assert Path(original["output"]) == RECOVERY_RUN
-    for name, expected in original["sources"].items():
-        source = Path(name)
-        if source.is_relative_to(ROOT / "spike/k31_mla_tail_real"):
-            contents = subprocess.check_output(
-                [
-                    "git",
-                    "-C",
-                    str(ROOT),
-                    "show",
-                    original["head"] + ":" + str(source.relative_to(ROOT)),
-                ]
+    import io
+    import tarfile
+
+    original_root = Path(original["root"])
+    historical = {
+        str(Path(name).relative_to(original_root)): expected
+        for name, expected in original["sources"].items()
+        if Path(name).is_relative_to(original_root)
+    }
+    archive = subprocess.check_output(
+        [
+            "git",
+            "-C",
+            str(ROOT),
+            "archive",
+            "--format=tar",
+            original["head"],
+            *historical,
+        ]
+    )
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as sources:
+        for name, expected in historical.items():
+            member = sources.getmember(name)
+            assert member.isfile()
+            assert (
+                hashlib.sha256(sources.extractfile(member).read()).hexdigest()
+                == expected
             )
-            assert hashlib.sha256(contents).hexdigest() == expected
-        else:
-            assert sha(source) == expected, name
+    for name, expected in original["sources"].items():
+        if not Path(name).is_relative_to(original_root):
+            assert sha(name) == expected, name
     ranks = integrity["ranks"]
     assert len(ranks) == 8 and [r["rank"] for r in ranks] == list(range(8))
     for rank, item in enumerate(ranks):
@@ -396,6 +413,11 @@ def recovery_checks():
         original_sha = sha
         for target in (
             expected["ranks"][0]["path"],
+            next(
+                name
+                for name in expected["bindings"]
+                if name.endswith("capture-plan.json")
+            ),
             next(
                 name
                 for name in expected["bindings"]
