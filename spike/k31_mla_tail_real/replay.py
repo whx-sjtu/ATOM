@@ -3,11 +3,13 @@
 import argparse
 import ast
 import ctypes
+import functools
 import hashlib
 import importlib.util
 import json
 import os
 import signal
+import stat
 import statistics
 import subprocess
 import sys
@@ -23,6 +25,10 @@ RECIPE = (
 )
 sha = capture.sha
 LEGACY = TAIL = None
+COMGR_PROOF = (
+    WS / "agent-team/evidence/task-19-comgr-metadata-preflight-01/manifest.json"
+)
+COMGR_PROOF_SHA = "e0e376edae4ca94a3d0a47e3972440ee798f8f01f486edc8e0c1521fabc723d5"
 
 
 def helpers():
@@ -51,6 +57,44 @@ def helpers():
     }
 
 
+def pruning_marker_identity(original, path, *, content=True):
+    marker = PRIVATE / "cache/comgr/llvmcache.timestamp"
+    if Path(path) != marker:
+        return original(path, content=content)
+    before = marker.lstat()
+    assert content and stat.S_ISREG(before.st_mode) and not before.st_mode & 0o111
+    assert marker.resolve() == marker and marker.read_bytes() == b""
+    after = marker.lstat()
+    stable = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mode)
+    assert stable(before) == stable(after) and before.st_size == 0
+    return {
+        "resolved": str(marker),
+        "stat": [before.st_dev, before.st_ino, 0, None],
+        "sha256": hashlib.sha256(b"").hexdigest(),
+        "mode": stat.S_IMODE(before.st_mode),
+        "mtime_policy": "mutable COMGR pruning-interval marker only",
+    }
+
+
+def marker_policy_sources(execution):
+    assert sha(COMGR_PROOF) == COMGR_PROOF_SHA
+    files = {str(COMGR_PROOF): COMGR_PROOF_SHA}
+    files.update(
+        {
+            str(COMGR_PROOF.parent / name): digest
+            for name, digest in json.loads(COMGR_PROOF.read_text()).items()
+        }
+    )
+    for name, digest in files.items():
+        assert sha(name) == digest
+    proof = json.loads((COMGR_PROOF.parent / "source-bindings.json").read_text())
+    assert (
+        execution["files"]["/opt/rocm/lib/libamd_comgr.so"]["sha256"]
+        == proof["comgr_sha256"]
+    )
+    return files
+
+
 def binding_functions():
     path = PRIVATE / "deps/task15/replay.py"
     assert (
@@ -69,6 +113,9 @@ def binding_functions():
     scope = dict(globals())
     exec(  # noqa: S102 - pinned host-only identity functions
         compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), scope
+    )
+    scope["file_identity"] = functools.partial(
+        pruning_marker_identity, scope["file_identity"]
     )
     return scope
 
@@ -526,6 +573,11 @@ def check_plan(plan, path, worker=False):
         "reproduction": "fixed_author_observed_min_max",
     }
     binding_functions()["verify_binding"](plan["execution"])
+    marker_policy = plan["execution"]["cache_pruning_marker"]
+    assert (
+        marker_policy["path"] == str(PRIVATE / "cache/comgr/llvmcache.timestamp")
+        and marker_policy["mutable_field"] == "mtime_ns"
+    )
     if "recovery_record" in plan:
         assert plan["mode"] == "replay" and "snapshot" not in plan
         check_recovery(plan["recovery_record"])
@@ -607,6 +659,13 @@ def make_plan(mode, output, path, snapshot=None, recovery=None):
         ]
         if p.is_file()
     }
+    sources.update(marker_policy_sources(execution))
+    marker = PRIVATE / "cache/comgr/llvmcache.timestamp"
+    execution["cache_pruning_marker"] = {
+        "path": str(marker),
+        "observed_mtime_ns": marker.stat().st_mtime_ns,
+        "mutable_field": "mtime_ns",
+    }
     prompt = "Explain in plain language why the sky looks blue during the day."
     plan = {
         "head": LEGACY.git("rev-parse", "HEAD"),
@@ -639,7 +698,7 @@ def make_plan(mode, output, path, snapshot=None, recovery=None):
             "ignore_eos": True,
         },
         "treatment": "Fixed current Mono1/TP8/DCP8/K3/AL2.88 recipe; one actual request, not natural-quality/C12 evidence",
-        "cache_policy": "Private compatible native/FlyDSL/Inductor/Triton bytes; higher-level torch graph indexes with original absolute paths are retained inactive; fresh graph compilation stays private.",
+        "cache_policy": "Private compiled artifacts/code/models remain byte/stat bound. Only the exact empty regular COMGR pruning marker permits mtime drift; other identity fields remain bound. Higher-level graph indexes with old absolute paths stay inactive; new artifacts remain private.",
         "protocol": {
             "pairs": 5,
             "aa_pairs": 5,
@@ -1317,6 +1376,87 @@ def deadline_checks():
     return records
 
 
+def cache_marker_checks():
+    from tempfile import TemporaryDirectory
+    from unittest.mock import patch
+
+    failures = []
+    functions = binding_functions()
+    with (
+        TemporaryDirectory() as directory,
+        patch.dict(globals(), PRIVATE=Path(directory)),
+    ):
+        marker = PRIVATE / "cache/comgr/llvmcache.timestamp"
+        marker.parent.mkdir(parents=True)
+        marker.write_bytes(b"")
+        compiled = marker.with_name("llvmcache-compiled-control")
+        compiled.write_bytes(b"compiled bytes control")
+        binding = {
+            "files": {
+                str(p): functions["file_identity"](p) for p in (marker, compiled)
+            },
+            "models": {},
+        }
+
+        def touched():
+            info = marker.stat()
+            os.utime(marker, ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000))
+
+        def refuses(name):
+            try:
+                functions["verify_binding"](binding)
+            except (AssertionError, RuntimeError, FileNotFoundError):
+                failures.append(name)
+            else:
+                raise AssertionError("cache identity change accepted: " + name)
+
+        touched()
+        functions["verify_binding"](binding)
+        original_read = Path.read_bytes
+
+        def read_and_touch(path):
+            value = original_read(path)
+            if path == marker:
+                touched()
+            return value
+
+        with patch.object(Path, "read_bytes", read_and_touch):
+            functions["verify_binding"](binding)
+        compiled.write_bytes(b"changed compiled bytes")
+        refuses("compiled_bytes")
+        compiled.write_bytes(b"compiled bytes control")
+        os.utime(
+            compiled,
+            ns=(
+                compiled.stat().st_atime_ns,
+                binding["files"][str(compiled)]["stat"][3] + 2_000_000_000,
+            ),
+        )
+        refuses("compiled_mtime")
+        binding["files"][str(compiled)] = functions["file_identity"](compiled)
+        marker.write_bytes(b"not bookkeeping")
+        refuses("marker_content")
+        marker.write_bytes(b"")
+        os.chmod(marker, 0o600)
+        refuses("marker_mode")
+        os.chmod(marker, 0o755)
+        refuses("marker_executable")
+        os.chmod(marker, 0o644)
+        replacement = marker.with_name("replacement")
+        replacement.write_bytes(b"")
+        replacement.replace(marker)
+        refuses("marker_inode")
+        marker.unlink()
+        refuses("missing_marker")
+        marker.symlink_to(compiled)
+        refuses("marker_symlink")
+    return {
+        "marker_mtime_and_concurrent_touch_pass": True,
+        "refusals": failures,
+        "actual_cache_mutated": False,
+    }
+
+
 def cpu_checks():
     from tempfile import TemporaryDirectory
     from types import SimpleNamespace as NS
@@ -1501,6 +1641,7 @@ def cpu_checks():
     assert not torch.cuda.is_initialized()
     result["absolute_deadline"] = deadline_checks()
     result["recovered_input_admission"] = recovery_checks()
+    result["cache_pruning_marker"] = cache_marker_checks()
     return result
 
 

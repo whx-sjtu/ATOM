@@ -84,3 +84,9 @@ successful-producer admission remains unchanged. The record pins the unchanged
 eight invalid payloads, executed plan 78a5c221, qualified integrity report and
 reviewed completion/one-shot source proof. Original failure and missing evidence
 remain; recovery gives no GPU lease or numerical, timing or quality result.
+
+The prospective runtime binding treats only the exact empty, regular COMGR
+`llvmcache.timestamp` as pruning-interval metadata: its mtime may change, while
+path/device/inode/size/mode/content remain bound. Compiled cache entries and
+model/code bindings stay strict. The installed COMGR revision and source proof
+are bound with the plan; observed marker drift is not writer attribution.
