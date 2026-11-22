@@ -1546,6 +1546,9 @@ def clock_trace_logs(
                 re.IGNORECASE,
             ):
                 raise RuntimeError("profiler loss/repair diagnostic: " + line)
+            timer_candidate = (
+                "simple_timer" in line.lower() or "[rocprofv3]" in line.lower()
+            )
             normal = re.fullmatch(
                 r"W[0-9]{8} [0-2][0-9]:[0-5][0-9]:[0-5][0-9]\.[0-9]{6} ([1-9][0-9]*) simple_timer\.cpp:55\] (.+) :: ( *[0-9]+\.[0-9]{6}) sec",
                 raw,
@@ -1569,6 +1572,10 @@ def clock_trace_logs(
                         }
                     )
                     continue
+            if timer_candidate:
+                raise RuntimeError(
+                    "malformed/unqualified profiler timer diagnostic: " + line
+                )
             if re.match(r"[WEF][0-9]{4,8}\s", line) or re.search(
                 r"(?<![A-Za-z])(?:WARNING|ERROR|FATAL)(?![A-Za-z])", line, re.IGNORECASE
             ):
@@ -2007,13 +2014,23 @@ def clock_driver(plan, path):
             "state": "OBSERVATION_SET_COMPLETE",
             "rows": 64,
             "K2_executed": False,
-            "elapsed_seconds": (
+            "producer_elapsed_seconds": (
                 time.monotonic_ns() - int(os.environ["K31_CLOCK_STARTED_NS"])
             )
             / 1e9,
         },
     )
     clock_remaining()
+
+
+def clock_final_validation(plan):
+    directory = Path(plan["output"]) / "data/traced"
+    reports = [load_clock_json(directory / f"rank{rank}.json") for rank in range(TP)]
+    documents = validate_clock_trace(plan, reports, directory)
+    return {
+        "state": "FINAL_EXPORT_LOGS_CHECKED_AFTER_OWNED_EXIT",
+        "traced_workers": len(documents),
+    }
 
 
 def whole_node_idle(snapshot):
@@ -2131,6 +2148,7 @@ def ownership_boundary(common, namespace):
     proxy.spawn, proxy.stop_tree = spawn, stop
     proxy.assert_gpus_idle, proxy.wait_gpus_released = idle, released
     namespace["owned_remember"], namespace["signal_owned"] = remember, signal_owned
+    namespace["owned_group_unknown"] = unknown_group
     return proxy
 
 
@@ -2205,7 +2223,7 @@ def supervise(plan, path):
                 ):
                     changes["clock_end"] += 1
                     return [
-                        *ast.parse("check_absolute_clock()").body,
+                        *ast.parse("finish_clock_workload()").body,
                         self.generic_visit(node),
                     ]
             if isinstance(node.targets[0], ast.Name) and node.targets[0].id == "env":
@@ -2305,9 +2323,21 @@ def supervise(plan, path):
                 "absolute diagnostic bound exceeded; late completion is failure"
             )
 
+    def finish_clock_workload():
+        check_absolute_clock()
+        while namespace["owned_remember"]() or namespace["owned_group_unknown"]():
+            check_absolute_clock()
+            namespace["time"].sleep(0.05)
+        check_absolute_clock()
+        try:
+            namespace["state"]["clock_final_validation"] = clock_final_validation(plan)
+        finally:
+            check_absolute_clock()
+
     namespace.update(
         start_absolute_clock=start_absolute_clock,
         check_absolute_clock=check_absolute_clock,
+        finish_clock_workload=finish_clock_workload,
     )
     namespace["C"] = ownership_boundary(C, namespace)
     # Only the source-hash-bound local supervisor AST is executable here.
@@ -3017,6 +3047,18 @@ def clock_driver_check(document, report):
             )
             if case != "complete":
                 continue
+            assert clock_final_validation(plan)["traced_workers"] == TP
+            final_log = out / "data/traced/worker.log"
+            final_log.write_text(
+                "W20261122 00:41:29.331333 123 output.cpp:1] late flush warning\n"
+            )
+            try:
+                clock_final_validation(plan)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("late final profiler diagnostic accepted")
+            final_log.write_text("")
             released = {
                 "mode": CLOCK_MODE,
                 "head": "cpu",
@@ -3158,6 +3200,9 @@ def clock_log_check():
         refused = []
         for bad in (
             normal.replace("tool initialization", "tool detachment"),
+            normal[normal.index("[rocprofv3]") :],
+            normal.replace("W20261122", "W020261122"),
+            normal.replace("W20261122", "w20261122"),
             prefix + "[rocprofv3] 'unregistered command' ::     0.000000 sec",
             normal.replace("simple_timer.cpp:55", "other.cpp:55"),
             normal.replace("0.001101", "nan"),
@@ -3246,6 +3291,7 @@ def clock_log_check():
 
 def clock_marker_check():
     from tempfile import TemporaryDirectory
+    from types import SimpleNamespace
     from unittest.mock import patch
 
     assert (
@@ -3325,15 +3371,50 @@ def clock_marker_check():
                             replacement = marker.with_suffix(".replacement")
                             replacement.write_bytes(b"")
                             replacement.replace(marker)
-                        elif case == "read_ctime_race":
-                            marker.chmod(0o600)
                     return value
 
-                with patch.object(sys.modules[__name__], "sha", side_effect=racing_sha):
+                original_stat, identity_reads = Path.stat, [0]
+
+                def racing_stat(
+                    path,
+                    *args,
+                    case=case,
+                    marker=marker,
+                    original_stat=original_stat,
+                    identity_reads=identity_reads,
+                    **kwargs,
+                ):
+                    status = original_stat(path, *args, **kwargs)
+                    if (
+                        case == "read_ctime_race"
+                        and path == marker
+                        and sys._getframe(1).f_code is file_identity.__code__
+                    ):
+                        identity_reads[0] += 1
+                        fields = {
+                            key: getattr(status, key)
+                            for key in (
+                                "st_dev",
+                                "st_ino",
+                                "st_size",
+                                "st_mtime_ns",
+                                "st_ctime_ns",
+                            )
+                        }
+                        fields["st_ctime_ns"] += int(identity_reads[0] > 1)
+                        return SimpleNamespace(**fields)
+                    return status
+
+                with (
+                    patch.object(sys.modules[__name__], "sha", side_effect=racing_sha),
+                    patch.object(Path, "stat", new=racing_stat),
+                ):
                     try:
                         observed = verify_binding(binding, policy)
                     except (RuntimeError, FileNotFoundError):
                         assert case != "mtime_only"
+                        if case == "read_ctime_race":
+                            assert identity_reads[0] == 2
                         rejected.append(case)
                     else:
                         assert (
@@ -3481,9 +3562,14 @@ def clock_source_check():
     sys.path.insert(0, str(WS / "harness"))
     import common as original_common
 
-    outcomes = {}
+    outcomes, completion_outcomes = {}, {}
+    original_boundary = ownership_boundary
     for case in (
         "on_time",
+        "on_time_child",
+        "late_child",
+        "late_final_validation",
+        "late_diagnostic",
         "late_exit",
         "late_validation",
         "negative_without_new_gate",
@@ -3492,6 +3578,43 @@ def clock_source_check():
             out = Path(directory) / "result"
             fd = os.open(Path(directory) / "lock", os.O_CREAT | os.O_RDWR, 0o600)
             now = [0]
+            stage = {
+                "child_alive": case
+                in ("on_time_child", "late_child", "late_diagnostic"),
+                "validation_calls": 0,
+            }
+            child = SimpleNamespace(
+                pid=20,
+                create_time=lambda: 2.0,
+                children=lambda recursive: [],
+                status=lambda stage=stage: (
+                    "running" if stage["child_alive"] else "zombie"
+                ),
+                send_signal=lambda sig, stage=stage: stage.update(child_alive=False),
+            )
+
+            def boundary(common, namespace, stage=stage):
+                stage["namespace"] = namespace
+                return original_boundary(common, namespace)
+
+            def sleep(seconds, case=case, stage=stage, now=now, out=out):
+                assert stage["namespace"]["state"]["state"] != "COMPLETE"
+                now[0] = (181 if case == "late_child" else 179.5) * 10**9
+                stage["child_alive"] = False
+                if case == "late_diagnostic":
+                    (out / "late.log").write_text(
+                        "W20261122 00:41:29.331333 123 output.cpp:1] late diagnostic\n"
+                    )
+
+            def final_validation(plan, case=case, stage=stage, now=now, out=out):
+                assert not stage["child_alive"]
+                stage["validation_calls"] += 1
+                if case == "late_final_validation":
+                    now[0] = 181 * 10**9
+                if case == "late_diagnostic":
+                    clock_trace_logs(out / "late.log")
+                return {"state": "CONTROL_FINAL_VALIDATED"}
+
             process = SimpleNamespace(
                 pid=19,
                 create_time=lambda: 1.0,
@@ -3500,7 +3623,9 @@ def clock_source_check():
             )
             popen = SimpleNamespace(pid=19, returncode=0, poll=lambda: 0)
 
-            def spawn(*args, out=out, now=now, popen=popen, case=case, **kwargs):
+            def spawn(
+                *args, out=out, now=now, popen=popen, case=case, stage=stage, **kwargs
+            ):
                 (out / "data").mkdir()
                 for rank in range(8):
                     save(
@@ -3508,8 +3633,22 @@ def clock_source_check():
                         {"state": "COMPLETE", "rank": rank},
                     )
                 now[0] = (
-                    181 if case in ("late_exit", "negative_without_new_gate") else 10
+                    181
+                    if case in ("late_exit", "negative_without_new_gate")
+                    else (
+                        179
+                        if case
+                        in (
+                            "on_time_child",
+                            "late_child",
+                            "late_diagnostic",
+                            "late_final_validation",
+                        )
+                        else 10
+                    )
                 ) * 10**9
+                if stage["child_alive"]:
+                    stage["namespace"]["seen"][20] = 2.0
                 return popen
 
             original_loads = json.loads
@@ -3552,7 +3691,9 @@ def clock_source_check():
                 ),
             )
             psutil = SimpleNamespace(
-                Process=lambda pid, process=process: process,
+                Process=lambda pid, process=process, child=child: (
+                    child if pid == 20 else process
+                ),
                 process_iter=list,
                 NoSuchProcess=ProcessLookupError,
                 AccessDenied=PermissionError,
@@ -3583,6 +3724,17 @@ def clock_source_check():
                             else "clock_boundary"
                         ),
                     ),
+                    patch.object(
+                        sys.modules[__name__],
+                        "ownership_boundary",
+                        side_effect=boundary,
+                    ),
+                    patch.object(
+                        sys.modules[__name__],
+                        "clock_final_validation",
+                        side_effect=final_validation,
+                    ),
+                    patch("time.sleep", side_effect=sleep),
                     patch("json.loads", side_effect=loads),
                     patch("os.nice", return_value=0),
                     patch("signal.signal"),
@@ -3592,10 +3744,41 @@ def clock_source_check():
                     try:
                         save(Path(directory) / "plan.json", plan)
                         supervise(plan, Path(directory) / "plan.json")
-                    except TimeoutError:
+                    except (TimeoutError, RuntimeError) as error:
                         rejected = True
+                        if case == "late_diagnostic":
+                            assert "unqualified profiler diagnostic" in str(error)
+                        else:
+                            assert isinstance(error, TimeoutError)
                 state = json.loads((out / "contract.json").read_text())
-                assert rejected == (case in ("late_exit", "late_validation"))
+                assert rejected == (
+                    case
+                    in (
+                        "late_exit",
+                        "late_validation",
+                        "late_child",
+                        "late_final_validation",
+                        "late_diagnostic",
+                    )
+                )
+                if case in (
+                    "on_time_child",
+                    "late_child",
+                    "late_final_validation",
+                    "late_diagnostic",
+                ):
+                    assert stage["validation_calls"] == int(case != "late_child")
+                    assert state["workload_elapsed_seconds"] == (
+                        181
+                        if case in ("late_child", "late_final_validation")
+                        else 179.5
+                    )
+                    completion_outcomes[case] = {
+                        "state": state["state"],
+                        "elapsed": state["workload_elapsed_seconds"],
+                        "validation_calls": stage["validation_calls"],
+                        "error": state.get("error"),
+                    }
                 assert state["gpu_released"] and state["alive"] == []
                 outcomes[case] = state["state"]
             finally:
@@ -3612,6 +3795,7 @@ def clock_source_check():
         "timebase_and_loader_failures_checked": True,
         "static_loader_dependency_check": loader_check,
         "absolute_deadline_cases": outcomes,
+        "owned_profiled_completion_cases": completion_outcomes,
         "trace_schema_and_stops": clock_trace_check(),
         "GPU_executed": False,
     }

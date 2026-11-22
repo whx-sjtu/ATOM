@@ -99,6 +99,12 @@ spawn and covers both cohorts, workers, profiler exit/flush and in-run validatio
 Late exit or late validation fails even if the child returned zero. Owned cleanup
 uses bounded TERM/KILL and retains the lock when release is uncertain.
 
+Clock completion waits for owned descendants and unresolved process-group activity
+to end naturally, then rechecks final trace exports/logs under the same deadline.
+Only then may the supervisor record COMPLETE and final workload elapsed time.
+The driver's `producer_elapsed_seconds` is an earlier milestone. Timeout or a
+late diagnostic records FAILED before the unchanged owned cleanup begins.
+
 The fixed rocprofv3/SDK backend traces HIP and kernel records to JSON. Strict
 invalid-timestamp rejection is enabled and frequency scaling is disabled. Each
 leased worker requires a successful HSA timestamp-frequency query of 1 GHz before
@@ -117,7 +123,9 @@ domains. The new setup phase classifies only source-proven `simple_timer.cpp:55`
 normal summaries: tool initialization, output generation, finalization and exact
 qualified launched-command labels, with the pinned full-line format and finite
 nonnegative seconds. Detachment, unknown labels/origins, malformed/appended or
-adjacent diagnostics still fail. Preserve raw lines and classification results;
+adjacent diagnostics still fail. Recognizable SDK timer candidates with missing
+or malformed severity/date/origin prefixes are rejected rather than ignored.
+Preserve raw lines and classification results;
 these summaries are neither success nor flush acknowledgements. The existing
 exact expected-file `Opened result file` notice remains unchanged.
 
