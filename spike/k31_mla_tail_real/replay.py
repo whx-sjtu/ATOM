@@ -825,6 +825,8 @@ def setup_protocol():
         "P_priming": "two records and device sync before first diagnostic warmup/barrier",
         "F_pairs": 10,
         "F_setup": "fresh pair after warmup/device sync/default Gloo barrier",
+        "F_retirement": "clear each completed F pair after duration gather, observed separately before the next warmup",
+        "P_retirement": "retain through the entire fixed set; release at measurement-function exit",
         "observer": "buffered CLOCK_MONOTONIC call entry/return; no GPU-start or peer-wait inference",
         "noise_fraction": 0.02,
         "interruption": "SIGTERM/SIGINT raise and save buffered partial records outside normal timing; incomplete returns remain absent; parent ownership/release unchanged",
@@ -865,7 +867,7 @@ def setup_measure(graph, stream, result):
     import torch.distributed as dist
 
     def events():
-        return torch.cuda.Event(**EVENT_FLAGS), torch.cuda.Event(**EVENT_FLAGS)
+        return [torch.cuda.Event(**EVENT_FLAGS), torch.cuda.Event(**EVENT_FLAGS)]
 
     priming = result["P_initial"] = {
         "phase": "before_first_diagnostic_warmup",
@@ -903,23 +905,27 @@ def setup_measure(graph, stream, result):
         observe_call(spans, "graph_submit", graph.replay)
         observe_call(spans, "end_record", pair[1].record, stream)
         observe_call(spans, "final_synchronize", torch.cuda.synchronize)
-        batch_ms = pair[0].elapsed_time(pair[1])
+        sample["local_batch_ms"] = pair[0].elapsed_time(pair[1])
+        sample["local_us"] = sample["local_batch_ms"] * 1000 / 128
         local = torch.tensor(
-            [batch_ms, batch_ms * 1000 / 128], dtype=torch.float64, device="cpu"
+            [sample["local_batch_ms"], sample["local_us"]],
+            dtype=torch.float64,
+            device="cpu",
         )
         gathered = [torch.empty_like(local) for _ in range(8)]
         dist.all_gather(gathered, local)
         batch_times, durations = zip(
             *(entry.tolist() for entry in gathered), strict=True
         )
+        sample.update(batch_ms=list(batch_times), ranks_us=list(durations))
         assert all(0 < v < float("inf") for v in durations)
         sample.update(
-            batch_ms=list(batch_times),
-            ranks_us=list(durations),
             max_us=max(durations),
             duration_spread_us=max(durations) - min(durations),
-            complete=True,
         )
+        if setting == "F":
+            observe_call(spans, "retire", pair.clear)
+        sample["complete"] = True
     for window, settings in enumerate(setup_protocol()["windows"]):
         for setting in settings:
             pair = {
@@ -979,7 +985,11 @@ def validate_setup_observations(result):
         else:
             assert sample["pair"] == "P0"
         names += ["start_record", "graph_submit", "end_record", "final_synchronize"]
+        if sample["setting"] == "F":
+            names.append("retire")
         previous = ordered(sample["spans"], names)
+        assert 0 < sample["local_batch_ms"] < float("inf")
+        assert sample["local_us"] == sample["local_batch_ms"] * 1000 / 128
         assert len(sample["batch_ms"]) == len(sample["ranks_us"]) == 8
         assert all(0 < value < float("inf") for value in sample["batch_ms"])
         assert [value * 1000 / 128 for value in sample["batch_ms"]] == sample[
@@ -1056,6 +1066,10 @@ def setup_host_summary(ranks):
     return {
         "state": "SETUP_DIAGNOSTIC_OBSERVATIONS_ONLY",
         "host": ranks[0]["host"],
+        "rank_identities": [
+            {"rank": r["rank"], "hardware": r["hardware"], "stream": r["stream"]}
+            for r in ranks
+        ],
         "initial_P_host_calls": joined([r["P_initial"]["spans"] for r in ranks]),
         "samples": samples,
         "pairs": ranks[0]["pairs"],
@@ -1111,6 +1125,21 @@ def native_diagnostic_graph(group, rank, device, item, stream, capacity):
     assert tail.calls() - before == 128
     dcp_ops.check_dcp_mailbox_launches()
     return tail, graph
+
+
+def save_setup_result(path, result):
+    import math
+
+    def invalid_values(value):
+        if isinstance(value, float) and not math.isfinite(value):
+            return {"invalid_nonfinite_float": repr(value)}
+        if isinstance(value, dict):
+            return {key: invalid_values(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [invalid_values(item) for item in value]
+        return value
+
+    save(path, result if result["complete"] else invalid_values(result))
 
 
 def setup_worker(rank, plan, snapshot, input_path, device, stream, group, hardware):
@@ -1249,7 +1278,7 @@ def setup_worker(rank, plan, snapshot, input_path, device, stream, group, hardwa
     finally:
         for sig, handler in handlers.items():
             signal.signal(sig, handler)
-        save(Path(plan["output"]) / f"rank{rank}.json", result)
+        save_setup_result(Path(plan["output"]) / f"rank{rank}.json", result)
 
 
 def measure(graphs, stream):
@@ -1562,8 +1591,9 @@ def validate_results(plan):
         assert {r["hardware"]["bdf"] for r in ranks} == set(plan["selected_bdfs"])
         if plan["mode"] == "native_setup":
             admitted = json.loads(Path(plan["recovery_record"]).read_text())
-            for row in ranks:
-                expected = admitted["ranks"][row["rank"]]
+            for rank, row in enumerate(ranks):
+                assert row["rank"] == row["hardware"]["rank"] == rank
+                expected = admitted["ranks"][rank]
                 assert (
                     row["input_sha256"] == expected["sha256"]
                     and row["capture_key"] == expected["key"]
@@ -1598,8 +1628,15 @@ def validate_results(plan):
                     "donor_graphs_or_calls": 0,
                 }
                 validate_setup_observations(row)
+                for sample in row["samples"]:
+                    assert sample["local_batch_ms"] == sample["batch_ms"][rank]
+                    assert sample["local_us"] == sample["ranks_us"][rank]
             common = lambda row: [
-                {k: v for k, v in sample.items() if k != "spans"}
+                {
+                    k: v
+                    for k, v in sample.items()
+                    if k not in ("spans", "local_batch_ms", "local_us")
+                }
                 for sample in row["samples"]
             ]
             assert all(
@@ -1919,13 +1956,14 @@ def deadline_checks():
 
 def setup_cpu_checks():
     import copy
+    import weakref
     from unittest.mock import patch
 
     import torch
     import torch.distributed as dist
 
     helpers()
-    seen, events = [], []
+    seen, events, created_after_barriers = [], [], []
     state = {
         "inside": False,
         "barriers": 0,
@@ -1945,10 +1983,14 @@ def setup_cpu_checks():
     class Event:
         def __init__(self, **flags):
             assert flags == EVENT_FLAGS and not state["inside"]
-            self.index, self.created_after_barrier = len(events), state["barriers"]
+            self.index = len(events)
             self.ready, self.recorded = False, False
-            events.append(self)
+            events.append(weakref.ref(self))
+            created_after_barriers.append(state["barriers"])
             seen.append("create")
+
+        def __del__(self):
+            seen.append("destroy")
 
         def record(self, given_stream):
             assert given_stream is stream and (not self.recorded or self.ready)
@@ -1967,15 +2009,16 @@ def setup_cpu_checks():
         def replay(self):
             if state["graphs"] == 0:
                 assert len(events) == 2 and all(
-                    event.ready and event.recorded for event in events
+                    ref().ready and ref().recorded for ref in events
                 ), "P was not primed before first warmup"
             state["graphs"] += 1
             seen.append("timed_graph" if state["inside"] else "warmup_graph")
 
     def synchronize():
         assert not state["inside"]
-        for event in events:
-            if event.recorded:
+        for ref in events:
+            event = ref()
+            if event is not None and event.recorded:
                 event.ready = True
         state["syncs"] += 1
         seen.append("synchronize")
@@ -2001,7 +2044,6 @@ def setup_cpu_checks():
         patch.object(time, "clock_gettime_ns", now),
     ):
         result = setup_measure(Graph(), stream, {})
-    assert validate_setup_observations(result)
     assert EVENT_FLAGS == {
         "enable_timing": True,
         "blocking": False,
@@ -2036,7 +2078,7 @@ def setup_cpu_checks():
     fresh_ordinals = [
         i for i, (_, setting, _) in enumerate(setup_order(), 1) if setting == "F"
     ]
-    assert [event.created_after_barrier for event in events[2::2]] == fresh_ordinals
+    assert created_after_barriers[2::2] == fresh_ordinals
     expected_trace = list(seen[:5])
     for _, setting, _ in setup_order():
         expected_trace += ["warmup_graph", "synchronize", "barrier"]
@@ -2050,7 +2092,14 @@ def setup_cpu_checks():
             "elapsed",
             "gather",
         ]
-    assert seen == expected_trace
+        if setting == "F":
+            expected_trace += ["destroy", "destroy"]
+    expected_trace += ["destroy", "destroy"]
+    assert (
+        seen == expected_trace
+    ), "F retirement was not after its gather and before the next warmup"
+    assert all(ref() is None for ref in events), "event references retained"
+    assert validate_setup_observations(result)
     failures = []
     for name, edit in (
         ("missing_observation", lambda r: r["samples"].pop()),
@@ -2063,6 +2112,8 @@ def setup_cpu_checks():
         ),
         ("missing_F_setup", lambda r: r["samples"][0]["spans"].pop("create")),
         ("invented_P_setup", lambda r: r["samples"][2]["spans"].update(create=[1, 2])),
+        ("missing_F_retirement", lambda r: r["samples"][0]["spans"].pop("retire")),
+        ("local_conversion", lambda r: r["samples"][0].update(local_us=99)),
         (
             "raw_batch_conversion",
             lambda r: r["samples"][0]["ranks_us"].__setitem__(0, 99),
@@ -2135,6 +2186,9 @@ def setup_cpu_checks():
                 for span in spans.values():
                     span[0] += rank * 100
                     span[1] += rank * 100
+            for sample in row["samples"]:
+                sample["local_batch_ms"] = sample["batch_ms"][rank]
+                sample["local_us"] = sample["ranks_us"][rank]
             save(out / f"rank{rank}.json", row)
         assert validate_results(plan)
         joined = json.loads((out / "setup-summary.json").read_text())
@@ -2148,6 +2202,7 @@ def setup_cpu_checks():
             == [10] * 8
         )
         assert joined["noise_counts"] == {"F": 1, "P": 0}
+        assert [r["rank"] for r in joined["rank_identities"]] == list(range(8))
         original = json.loads((out / "rank0.json").read_text())
         for name, edit in (
             ("failed_native_before", lambda r: r["native_before"].update(passed=False)),
@@ -2160,6 +2215,15 @@ def setup_cpu_checks():
             ("wrong_clock_domain", lambda r: r["host"].update(boot_id="wrong")),
             ("wrong_input_hash", lambda r: r.update(input_sha256="wrong")),
             ("wrong_workspace", lambda r: r["workspace"].update(bytes=1)),
+            ("wrong_hardware_rank", lambda r: r["hardware"].update(rank=1)),
+            ("wrong_hardware_bdf", lambda r: r["hardware"].update(bdf="wrong")),
+            (
+                "wrong_local_rank_value",
+                lambda r: r["samples"][0].update(
+                    local_batch_ms=r["samples"][0]["batch_ms"][1],
+                    local_us=r["samples"][0]["ranks_us"][1],
+                ),
+            ),
         ):
             bad = copy.deepcopy(original)
             edit(bad)
@@ -2171,6 +2235,17 @@ def setup_cpu_checks():
             else:
                 raise AssertionError("diagnostic result mutation accepted: " + name)
         save(out / "rank0.json", original)
+        peer = json.loads((out / "rank1.json").read_text())
+        save(out / "rank0.json", peer)
+        save(out / "rank1.json", original)
+        try:
+            validate_results(plan)
+        except AssertionError:
+            failures.append("swapped_rank_files")
+        else:
+            raise AssertionError("swapped rank files accepted")
+        save(out / "rank0.json", original)
+        save(out / "rank1.json", peer)
         assert validate_results(plan)
     events.clear()
     seen.clear()
@@ -2211,6 +2286,81 @@ def setup_cpu_checks():
         and partial["samples"][1]["spans"]["graph_submit"][1] is None
     )
     assert state["graphs"] == 4 and state["gathers"] == 1
+    for case in ("gather_failure", "gather_interruption", "invalid_gather"):
+        events.clear()
+        seen.clear()
+        state.update(
+            inside=False,
+            barriers=0,
+            graphs=0,
+            syncs=0,
+            elapsed=0,
+            gathers=0,
+            clock=1_000_000,
+        )
+        partial = {}
+
+        def failed_gather(receivers, value, case=case):
+            if case == "gather_failure":
+                raise RuntimeError(case)
+            if case == "gather_interruption":
+                raise InterruptedError(case)
+            gather(receivers, value)
+            for receiver, invalid in zip(
+                receivers[:3], (float("inf"), -float("inf"), float("nan")), strict=True
+            ):
+                receiver.fill_(invalid)
+
+        with (
+            patch.object(torch.cuda, "Event", Event),
+            patch.object(torch.cuda, "synchronize", synchronize),
+            patch.object(dist, "barrier", barrier),
+            patch.object(dist, "all_gather", failed_gather),
+            patch.object(time, "clock_gettime_ns", now),
+        ):
+            try:
+                setup_measure(Graph(), stream, partial)
+            except (RuntimeError, InterruptedError, AssertionError):
+                pass
+            else:
+                raise AssertionError("gather failure did not stop")
+        assert state["graphs"] == 2 and len(partial["samples"]) == 1
+        sample = partial["samples"][0]
+        assert (
+            sample["local_batch_ms"] == 0.3072 and sample["local_us"] == 2.4
+        ), "returned local timing lost"
+        assert not sample["complete"] and "max_us" not in sample
+        if case == "invalid_gather":
+            assert sample["batch_ms"][0] == sample["ranks_us"][0] == float("inf")
+        else:
+            assert "batch_ms" not in sample and "ranks_us" not in sample
+        partial["complete"] = False
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "rank0.json"
+            save_setup_result(path, partial)
+            restored = json.loads(path.read_text())
+            saved_sample = restored["samples"][0]
+            assert not restored["complete"] and not saved_sample["complete"]
+            assert saved_sample["local_batch_ms"] == 0.3072
+            assert saved_sample["local_us"] == 2.4
+            if case == "invalid_gather":
+                tags = [
+                    {"invalid_nonfinite_float": value}
+                    for value in ("inf", "-inf", "nan")
+                ]
+                assert (
+                    saved_sample["batch_ms"][:3] == saved_sample["ranks_us"][:3] == tags
+                )
+                partial["complete"] = True
+                try:
+                    save_setup_result(path, partial)
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError("complete nonfinite result was saved")
+            else:
+                assert restored == partial
+        failures.append(case)
     old = ast.parse((PRIVATE / "deps/task14/adapter.py").read_text())
     new = ast.parse(Path(__file__).read_text())
 
@@ -2245,6 +2395,10 @@ def setup_cpu_checks():
         "fresh_event_pairs": 10,
         "noise_retained_without_repeat": True,
         "hard_failure_preserves_partial_and_stops": True,
+        "F_retirement_before_next_warmup": True,
+        "returned_local_timing_preserved_on_gather_failure": True,
+        "partial_failure_json_write_readback": True,
+        "file_logical_hardware_rank_join_checked": True,
         "native_constructor_fields_match_pinned_adapter": True,
         "refusals": failures,
         "event_order": "F/P,P/F,F/P,P/F,F/P; original within-pair alternation",

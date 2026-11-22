@@ -101,13 +101,21 @@ synchronization and the default Gloo barrier, followed by128 captured tail calls
 
 F creates fresh timing events after that barrier. P creates one pair, records
 both events on the measured stream and synchronizes before the first diagnostic
-warmup/barrier. P is reused only after completed measurements. Event flags are
+warmup/barrier. P is reused only after completed measurements and retained until
+measurement-function exit. Each F pair is cleared after its duration gather,
+with a separate retirement span before the next warmup. Event flags are
 explicit; priming adds no native/mailbox call. The same buffered CLOCK_MONOTONIC
 entry/return observer covers actual host calls in both settings. P's initial
 setup is separate. No new collective or file output is inserted in a window;
 the existing duration gather carries raw batch milliseconds and the unchanged
 per-call division. Host observations are published afterward, including partial
-records on handled failures. They are not GPU starts, peer-wait or clock data.
+records on handled failures. Returned local durations are buffered before gather;
+global arrays exist only after gather returns, and invalid values remain evidence
+without completion. Failed records encode nonfinite floats as explicitly invalid
+JSON objects; complete records retain strict finite-number validation.
+File slots, logical rank and hardware rank must agree before
+host spans are joined; the summary carries that identity map. These observations
+are not GPU starts, peer-wait or clock data.
 
 Preparation uses only the pinned native call and native mailbox: two eager calls,
 one graph of128 nodes, and four graph replays for reference, last-row-empty,
