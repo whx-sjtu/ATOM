@@ -930,6 +930,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
 
         self.model_runner.forward_vars.update(mla_metadata)
+        self._allocate_dcp_fp4_prefill_buffers()
 
         # Chunked-context workspaces for the prefill has_cached path. Sized
         # to config.attn_prefill_chunk_size (defaults to max_num_batched_tokens)
@@ -1020,6 +1021,51 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         if config.enable_tbo:
             self._allocate_ubatch_buffers(max_seqlen_qo)
+
+    def _allocate_dcp_fp4_prefill_buffers(self):
+        config = self.model_runner.config
+        # shortcut: one base-prefix request, extend only with lifetime validation.
+        self._fp4_prefill_pinned = (
+            envs.ATOM_DCP_FP4_PREFILL_PINNED
+            and self._indexer_fp4
+            and self.dcp_world_size == 8
+            and self.cp_kv_cache_interleave_size == 1
+            and config.pipeline_parallel_size == 1
+            and config.prefill_context_parallel_size == 1
+            and not config.enable_tbo
+            and not config.enable_tbo_decode
+        )
+        if not self._fp4_prefill_pinned:
+            return
+        capacity = config.max_model_len
+        # Each pair costs 4 * (2*M + ceil(M/8)) bytes on BOTH host and device.
+        for name, size in (
+            ("dcp_fp4_prefill_gather", capacity),
+            ("dcp_fp4_prefill_slots", capacity + (capacity + 7) // 8),
+        ):
+            self.model_runner.forward_vars[name] = CpuGpuBuffer(
+                size, dtype=torch.int32, device=self.device, publication_group=name
+            )
+
+    def _dcp_fp4_prefill_buffer(self, name, count, bs, prefix):
+        if not getattr(self, "_fp4_prefill_pinned", False) or prefix != "" or bs != 1:
+            return None
+        runner = self.model_runner
+        groups = getattr(runner, "h2d_groups", None)
+        buffer = runner.forward_vars.get(name)
+        if groups is None or buffer is None or count > buffer.np.size:
+            return None
+        binding = buffer._publication
+        if binding is None:
+            return None
+        if binding.owner is not runner.h2d_owner:
+            from atom.utils.h2d import PublicationError
+
+            raise PublicationError(f"{name}: buffer belongs to another staging owner")
+        # These late singleton copies must stay outside prefill_metadata.
+        groups[name].check_writable()
+        buffer.acquire_write()
+        return buffer
 
     def h2d_group_members(self) -> dict[str, tuple[str, ...]]:
         # Ready together before `kv_indices_generate_triton`, the step's first
@@ -1984,7 +2030,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.dcp_indexer_local_total,
             attn_metadata.dcp_indexer_local_cu_seqlens,
             attn_metadata.dcp_indexer_gather_index,
-        ) = self._dcp_gathers([(0, bs)], cu_pad, g_cu)[0]
+        ) = self._dcp_gathers(
+            [(0, bs)], cu_pad, g_cu, fp4_prefix=prefix if self._indexer_fp4 else None
+        )[
+            0
+        ]
         if self._indexer_fp4:
             self._build_dcp_indexer_fp4_prefill_meta(
                 attn_metadata,
@@ -1994,10 +2044,19 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 g_cu,
                 g_lens,
                 var[f"{prefix}block_tables"].np[:bs],
+                prefix=prefix,
             )
 
     def _build_dcp_indexer_fp4_prefill_meta(
-        self, attn_metadata, bs: int, lpad, cu_pad, g_cu, g_lens, block_tables
+        self,
+        attn_metadata,
+        bs: int,
+        lpad,
+        cu_pad,
+        g_cu,
+        g_lens,
+        block_tables,
+        prefix="",
     ):
         """Where FP4 staging reads this rank's shard and where it lays the
         gathered keys out: each request's from a page of its own, so a
@@ -2022,9 +2081,20 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
         # Page / row / e8m0 row of both slot lists, built once per forward, not
         # per layer: one upload, one launch.
-        slots = upload_numpy(
-            np.concatenate([read, stage]).astype(np.int32), self.device
+        count = len(read) + len(stage)
+        buffer = (
+            self._dcp_fp4_prefill_buffer("dcp_fp4_prefill_slots", count, bs, prefix)
+            if getattr(self, "_fp4_prefill_pinned", False)
+            else None
         )
+        if buffer is None:
+            slots = upload_numpy(
+                np.concatenate([read, stage]).astype(np.int32), self.device
+            )
+        else:
+            buffer.np[: len(read)] = read
+            buffer.np[len(read) : count] = stage
+            slots = buffer.copy_to_gpu(count)
         lut = getattr(self, "_fp4_scale_row_lut", None)
         if lut is not None:
             parts = decompose_slots_triton(slots, 0, block, lut)[:3]
@@ -2881,17 +2951,34 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         g_cu, _, _, cu_pad = self._dcp_shard_lengths(attn_metadata, bs, prefix)
         return self._dcp_gathers([(p.first, p.end) for p in passes], cu_pad, g_cu)
 
-    def _dcp_gathers(self, ranges, cu_pad, g_cu):
-        """`dcp_gather_index` per request range, uploaded."""
+    def _dcp_gathers(self, ranges, cu_pad, g_cu, *, fp4_prefix=None):
+        """DCP gather indices per request range, uploaded."""
         W, S = self.dcp_world_size, self.cp_kv_cache_interleave_size
-        return [
-            DcpGather(
-                g.local_total,
-                upload_numpy(g.local_cu.astype(np.int32), self.device),
-                upload_numpy(g.gather_index.astype(np.int32), self.device),
+        gathers = []
+        for g in dcp_gather_index(ranges, g_cu, cu_pad, W, S):
+            buffer = None
+            if fp4_prefix is not None and len(ranges) == 1:
+                buffer = self._dcp_fp4_prefill_buffer(
+                    "dcp_fp4_prefill_gather",
+                    len(g.gather_index),
+                    ranges[0][1] - ranges[0][0],
+                    fp4_prefix,
+                )
+            if buffer is None:
+                gather_index = upload_numpy(
+                    g.gather_index.astype(np.int32), self.device
+                )
+            else:
+                buffer.np[: len(g.gather_index)] = g.gather_index
+                gather_index = buffer.copy_to_gpu(len(g.gather_index))
+            gathers.append(
+                DcpGather(
+                    g.local_total,
+                    upload_numpy(g.local_cu.astype(np.int32), self.device),
+                    gather_index,
+                )
             )
-            for g in dcp_gather_index(ranges, g_cu, cu_pad, W, S)
-        ]
+        return gathers
 
     def _publishes_decode_index_rows(self) -> bool:
         """Whether a decode step publishes its index rows (`IndexRows`): every

@@ -597,6 +597,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_DCP_FP4_PREFILL_COMBINED", "0"
     )
     == "1",
+    # Reuse fixed pinned metadata buffers for singleton FP4/DCP8 prefills.
+    "ATOM_DCP_FP4_PREFILL_PINNED": lambda: os.getenv("ATOM_DCP_FP4_PREFILL_PINNED", "0")
+    == "1",
     # DCP sparse prefill: use the non-persistent fp8 gqa64 MLA kernel, which
     # needs no work metadata. On by default; needs an aiter with ROCm/aiter#6132.
     "ATOM_DCP_SPARSE_PREFILL_NONPS": lambda: (
