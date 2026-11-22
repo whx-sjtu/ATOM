@@ -19,12 +19,14 @@ from aiter import (
 from atom.config import kv_cache_torch_dtype
 from atom.distributed.dcp_utils import (
     NONPS_MAX_Q_ROWS,
+    get_dcp_group,
     get_dcp_rank,
     get_dcp_world_size,
     mla_dcp_decode_is_persistent,
     mla_dcp_sparse_prefill_is_persistent,
     mla_dcp_sparse_prefill_uses_nonps,
 )
+from atom.distributed.group_agreement import group_agree
 from atom.distributed.pcp_utils import (
     get_pcp_rank,
     get_pcp_world_size,
@@ -78,6 +80,7 @@ from atom.model_ops.indexer import (
     fp8_rows,
     packed_concat_rows,
 )
+from atom.model_ops.indexer.layout import MFMA, fp4_scale_byte
 from atom.model_ops.indexer.schedule import any_layer_skips_index_topk
 from atom.model_ops.indexer.workspace import (
     ConcatKeyWorkspace,
@@ -385,6 +388,24 @@ class AiterMLABackend(AttentionBackend):
         return MLAAttention
 
 
+def _agree_fp4_prefill_combined(model_runner, is_fp4, dcp_world_size):
+    config = model_runner.config
+    supported = (
+        is_fp4
+        and getattr(config, "index_cache_layout", None) == MFMA
+        and model_runner.block_size == 64
+        and getattr(config.hf_config, "index_head_dim", None) == 128
+        and dcp_world_size > 1
+    )
+    if dcp_world_size <= 1:
+        return False
+    # Off and unsupported ranks participate too, before any staging collective.
+    return group_agree(
+        envs.ATOM_DCP_FP4_PREFILL_COMBINED and supported,
+        get_dcp_group().cpu_group,
+    )
+
+
 class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     # EagleProposer folds the per-draft-step position/context bump into
     # prepare_mtp_decode's fused kernel when this is set (matches the MHA
@@ -568,6 +589,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         self.dcp_world_size = get_dcp_world_size()
         self.dcp_rank = get_dcp_rank()
+        self._fp4_prefill_combined = _agree_fp4_prefill_combined(
+            model_runner, self._indexer_fp4, self.dcp_world_size
+        )
         self._publishes_dcp_local_lens = self.is_sparse and self.dcp_world_size > 1
         self.indexes_by_token_table = indexes_by_token_table(
             self.is_sparse, self.dcp_world_size, self.index_kpool
@@ -2008,11 +2032,24 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # Torch fallback (CPU / test builders); also the kernel's reference.
             page, row = slots // block, slots % block
             parts = (page, row, fp4_index_scale_rows(row, block))
+        combined = getattr(self, "_fp4_prefill_combined", False)
+        attn_metadata.dcp_indexer_fp4_combined = combined
+        names = ("page", "row", "scale_row")
+        if combined:
+            # Own fresh indices for this forward; scale offsets can exceed int32.
+            slots64 = slots.long()
+            chunks = torch.arange(4, device=slots.device)
+            parts = (
+                parts[0].long(),
+                parts[1].long(),
+                fp4_scale_byte(slots64[:, None], chunks[None, :]),
+            )
+            names = ("page", "row", "scale_at")
         for side, cut in (
             ("read", slice(0, len(read))),
             ("stage", slice(len(read), None)),
         ):
-            for part, tensor in zip(("page", "row", "scale_row"), parts):
+            for part, tensor in zip(names, parts):
                 setattr(attn_metadata, f"dcp_indexer_fp4_{side}_{part}", tensor[cut])
         attn_metadata.dcp_indexer_fp4_stage_pages = int(first_page[bs])
 

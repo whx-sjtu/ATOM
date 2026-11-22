@@ -10,6 +10,8 @@ conversion otherwise. The `Indexer` module (models/deepseek_v2.py) owns the
 projections and calls this op.
 """
 
+import logging
+
 import torch
 from aiter import dtypes, indexer_k_quant_and_cache
 
@@ -34,6 +36,8 @@ from .layout import MFMA, PRESHUFFLE, fp4_scale_byte
 from .nope import indexer_nope_quant_and_cache
 from .rows import IndexCache
 from .score import score_topk
+
+_FP4_COMBINED_REPORTED = False
 
 
 def _dcp_stage_indexer_fp4_prefill(
@@ -61,25 +65,68 @@ def _dcp_stage_indexer_fp4_prefill(
     page = prefill_metadata.dcp_indexer_fp4_read_page
     row = prefill_metadata.dcp_indexer_fp4_read_row
     if layout == MFMA:
-        # Scales cannot be indexed by the data plane's row axis. Gather
-        # each logical row's four bytes explicitly, then scatter the same
-        # OPUS permutation after the DCP all-gather.
-        g = torch.arange(4, device=kv_cache.device)
-        scale_at = fp4_scale_byte(row[:, None], g[None, :])
+        combined = getattr(prefill_metadata, "dcp_indexer_fp4_combined", False)
         data = kv_cache[page, :, row, :]
-        scale = kv_cache_scale.view(-1, 256)[page[:, None], scale_at]
+        if combined:
+            read_scale_at = prefill_metadata.dcp_indexer_fp4_read_scale_at
+            stage_scale_at = prefill_metadata.dcp_indexer_fp4_stage_scale_at
+            assert page.dtype == row.dtype == read_scale_at.dtype == torch.int64
+            assert (
+                prefill_metadata.dcp_indexer_fp4_stage_page.dtype
+                == prefill_metadata.dcp_indexer_fp4_stage_row.dtype
+                == stage_scale_at.dtype
+                == torch.int64
+            )
+            assert data.dtype == kv_cache_scale.dtype == torch.uint8
+            assert data.shape[1:] == (4, 16)
+            assert read_scale_at.shape == (data.shape[0], 4)
+            assert stage_scale_at.shape == (
+                prefill_metadata.dcp_indexer_gather_index.numel(),
+                4,
+            )
+            scale = kv_cache_scale.view(-1)[read_scale_at]
+        else:
+            g = torch.arange(4, device=kv_cache.device)
+            scale_at = fp4_scale_byte(row[:, None], g[None, :])
+            scale = kv_cache_scale.view(-1, 256)[page[:, None], scale_at]
         group = get_dcp_group()
         gather_index = prefill_metadata.dcp_indexer_gather_index
-        data = group.all_gather(data, dim=0).index_select(0, gather_index)
-        scale = group.all_gather(scale, dim=0).index_select(0, gather_index)
+        if combined:
+            packed = torch.cat((data.flatten(1), scale), dim=1)
+            assert packed.is_contiguous() and packed.shape[1] == 68
+            packed = group.all_gather(packed, dim=0, use_custom=False)
+            packed = packed.index_select(0, gather_index)
+            data, scale = packed[:, :64].unflatten(1, (4, 16)), packed[:, 64:]
+        else:
+            data = group.all_gather(data, dim=0).index_select(0, gather_index)
+            scale = group.all_gather(scale, dim=0).index_select(0, gather_index)
         page = prefill_metadata.dcp_indexer_fp4_stage_page
         row = prefill_metadata.dcp_indexer_fp4_stage_row
         pages = prefill_metadata.dcp_indexer_fp4_stage_pages
         staged = kv_cache.new_zeros(pages, *kv_cache.shape[1:])
         staged_scale = kv_cache_scale.new_zeros(pages, *kv_cache_scale.shape[1:])
         staged[page, :, row, :] = data
-        scale_at = fp4_scale_byte(row[:, None], g[None, :])
-        staged_scale.view(-1, 256)[page[:, None], scale_at] = scale
+        if combined:
+            staged_scale.view(-1)[stage_scale_at] = scale
+            global _FP4_COMBINED_REPORTED
+            context = get_forward_context()
+            if (
+                not _FP4_COMBINED_REPORTED
+                and context.context is not None
+                and not context.context.is_dummy_run
+                and not context.in_hipgraph
+            ):
+                logging.getLogger("atom").info(
+                    "DCP FP4 combined staging submitted: local_rows=%d, "
+                    "global_rows=%d, row_bytes=68, ranks=%d",
+                    prefill_metadata.dcp_indexer_fp4_read_page.numel(),
+                    data.shape[0],
+                    group.world_size,
+                )
+                _FP4_COMBINED_REPORTED = True
+        else:
+            scale_at = fp4_scale_byte(row[:, None], g[None, :])
+            staged_scale.view(-1, 256)[page[:, None], scale_at] = scale
         return staged, staged_scale
     data = kv_cache[page, :, :, row, :]
     scale = kv_cache_scale[page, :, :, prefill_metadata.dcp_indexer_fp4_read_scale_row]
