@@ -14,7 +14,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 from itertools import pairwise
 from pathlib import Path
 
@@ -49,6 +49,8 @@ def initialize_helpers():
 
 METHOD = "current_whole_k2_xready_ordinary_events"
 CLOCK_MODE = "clock_boundary"
+CLOCK_MARKER = PRIVATE / "cache/comgr/llvmcache.timestamp"
+EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 
 
 def save(path, value):
@@ -193,16 +195,52 @@ def execution_binding(base, *, clock_only=False):
     }
 
 
-def verify_binding(binding):
-    checked = {}
+def clock_marker_policy():
+    return {
+        "path": str(CLOCK_MARKER),
+        "vary": "st_mtime_ns",
+        "size": 0,
+        "sha256": EMPTY_SHA256,
+    }
+
+
+def verify_binding(binding, marker_policy=None):
+    if marker_policy is not None and marker_policy != clock_marker_policy():
+        raise RuntimeError("unsupported clock marker policy")
+    checked, observations = {}, []
     for records in (binding["files"], binding["models"]):
         for name, expected in records.items():
             path = Path(name)
             key = (str(path.resolve()), "sha256" in expected)
             if key not in checked:
                 checked[key] = file_identity(path, content=key[1])
-            if checked[key] != expected:
+            actual = checked[key]
+            if (
+                marker_policy is not None
+                and records is binding["files"]
+                and name == str(CLOCK_MARKER)
+            ):
+                if (
+                    expected["resolved"] != str(CLOCK_MARKER)
+                    or expected["stat"][2] != 0
+                    or expected.get("sha256") != EMPTY_SHA256
+                ):
+                    raise RuntimeError("clock marker is not the bound exact empty file")
+                observed = actual["stat"][3]
+                observations.append(
+                    {
+                        "path": name,
+                        "bound_mtime_ns": expected["stat"][3],
+                        "observed_mtime_ns": observed,
+                        "delta_mtime_ns": observed - expected["stat"][3],
+                    }
+                )
+                actual = {**actual, "stat": [*actual["stat"][:3], expected["stat"][3]]}
+            if actual != expected:
                 raise RuntimeError("runtime/model/cache binding changed: " + name)
+    if marker_policy is not None and len(observations) != 1:
+        raise RuntimeError("clock marker missing from binding")
+    return observations
 
 
 def binding_check():
@@ -735,11 +773,54 @@ def cpu_check(snapshot, out, compile_only=False):
     return result
 
 
-def clock_protocol(out):
+def clock_protocol(out, plan_path=None):
     tool = Path("/opt/rocm/lib/rocprofiler-sdk/librocprofiler-sdk-tool.so")
     sdk = Path("/opt/rocm/lib/librocprofiler-sdk.so")
     rocpd = Path("/opt/rocm/lib/librocprofiler-sdk-rocpd.so.1")
+    command = [
+        "/opt/venv/bin/python",
+        str(HERE / "replay.py"),
+        "--clock-cohort",
+        "traced",
+        "--plan",
+        str(plan_path or out / "frozen-plan.json"),
+    ]
     return {
+        "empty_marker_mtime_policy": clock_marker_policy(),
+        "normal_timer_messages": {
+            "origin": "simple_timer.cpp:55",
+            "format": "{} :: {:12.6f} sec",
+            "lifecycle_labels": [
+                "[rocprofv3] " + label
+                for label in (
+                    "tool initialization",
+                    "output generation",
+                    "tool finalization",
+                )
+            ],
+            "fixed_commands": [
+                command,
+                ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+                ["git", "-C", str(ROOT), "status", "--porcelain"],
+            ],
+            "python": "/opt/venv/bin/python",
+            "python_flags": ["-B", "-s"],
+            "children": {
+                "worker": {
+                    "max": TP,
+                    "caller": "popen_spawn_posix.Popen._launch",
+                    "program": "from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd={tracker_fd}, pipe_handle={pipe_handle})",
+                    "suffix": ["--multiprocessing-fork"],
+                },
+                "tracker": {
+                    "max": 1,
+                    "caller": "resource_tracker.ResourceTracker.ensure_running",
+                    "program": "from multiprocessing.resource_tracker import main;main({tracker_fd})",
+                    "suffix": [],
+                },
+            },
+            "meaning": "Source-proven elapsed summaries only; duplicates are allowed and are neither launch counts nor success/flush proof. Dynamic labels require the exact qualified pre-launch ledger.",
+        },
         "body_ms": 0.5,
         "guard_ms": [1, 1, 2, 2],
         "body_replay_ordinals": [0, 1, 2, 3, 4],
@@ -784,7 +865,9 @@ def clock_protocol(out):
     }
 
 
-def make_clock_plan(out):
+def make_clock_plan(out, plan_path):
+    if plan_path is None:
+        raise ValueError("clock plan requires its exact future filename")
     base = json.loads(RECIPE.read_text())
     head = subprocess.check_output(
         ["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True
@@ -828,6 +911,23 @@ def make_clock_plan(out):
             Path("/opt/rocm/include/hip/hip_runtime_api.h"),
         )
     )
+    paths.update(
+        Path("/usr/lib/python3.12/multiprocessing") / name
+        for name in (
+            "util.py",
+            "spawn.py",
+            "popen_spawn_posix.py",
+            "resource_tracker.py",
+        )
+    )
+    paths.update(
+        (
+            WS
+            / "agent-team/evidence/task-15-independent-clock-outcome-419aa118/sdk-simple_timer.cpp",
+            WS
+            / "agent-team/work/15/clock-boundary-audit/source__lib__rocprofiler-sdk-tool__tool.cpp",
+        )
+    )
     return {
         "schema": 1,
         "mode": CLOCK_MODE,
@@ -841,15 +941,15 @@ def make_clock_plan(out):
         "cpus": "0-111",
         "max_job_seconds": 180,
         "gpu_authorized_by_plan": False,
-        "clock_protocol": clock_protocol(out.resolve()),
+        "clock_protocol": clock_protocol(out.resolve(), plan_path.resolve()),
         "sources": {str(path): sha(path) for path in sorted(paths)},
         "execution": execution_binding(base, clock_only=True),
     }
 
 
-def make_plan(mode, out, snapshot=None, ready=None):
+def make_plan(mode, out, snapshot=None, ready=None, plan_path=None):
     if mode == CLOCK_MODE:
-        return make_clock_plan(out)
+        return make_clock_plan(out, plan_path)
     initialize_helpers()
     base = json.loads(RECIPE.read_text())
     head = subprocess.check_output(
@@ -996,14 +1096,23 @@ def check_plan(plan, path, worker=False):
     ):
         raise RuntimeError("worker environment differs from the frozen plan")
     if plan["mode"] == CLOCK_MODE:
-        if plan["clock_protocol"] != clock_protocol(Path(plan["output"])):
+        if plan["clock_protocol"] != clock_protocol(
+            Path(plan["output"]), path.resolve()
+        ):
             raise RuntimeError("clock protocol differs from fixed source")
         if (
             any(key in plan for key in ("snapshot", "model_args", "cache", "ready"))
             or plan["execution"]["models"]
         ):
             raise RuntimeError("clock-only plan contains model/snapshot work")
-    verify_binding(plan["execution"])
+    marker_observations = verify_binding(
+        plan["execution"],
+        (
+            plan["clock_protocol"]["empty_marker_mtime_policy"]
+            if plan["mode"] == CLOCK_MODE
+            else None
+        ),
+    )
     for name, expected in plan["sources"].items():
         if sha(Path(name)) != expected:
             raise RuntimeError("frozen source/input changed: " + name)
@@ -1016,6 +1125,7 @@ def check_plan(plan, path, worker=False):
         "LD_PRELOAD", ""
     ):
         raise RuntimeError("GPU job cannot run under the CPU guard")
+    return marker_observations
 
 
 def clock_remaining():
@@ -1153,7 +1263,123 @@ def clock_mapping(records, plan, expected=None):
     return actual
 
 
-def clock_live_check(plan, cohort):
+def clock_child_record(table, role, descriptors, argv, passfds):
+    expected_keys = (
+        {"tracker_fd", "pipe_handle"} if role == "worker" else {"tracker_fd"}
+    )
+    if role not in table["children"] or set(descriptors) != expected_keys:
+        raise RuntimeError("unknown clock child role/descriptors")
+    for fd in [*descriptors.values(), *passfds]:
+        if trace_uint(fd, True) >= 2**31:
+            raise RuntimeError("invalid child descriptor")
+    if not set(descriptors.values()) <= set(passfds):
+        raise RuntimeError("clock child descriptors not passed")
+    rule = table["children"][role]
+    expected = [
+        table["python"],
+        *table["python_flags"],
+        "-c",
+        rule["program"].format(**descriptors),
+        *rule["suffix"],
+    ]
+    argv = list(map(os.fsdecode, argv))
+    if argv != expected:
+        raise RuntimeError("unqualified clock child argv")
+    return {
+        "role": role,
+        "caller": rule["caller"],
+        "descriptors": descriptors,
+        "passfds": list(passfds),
+        "argv": argv,
+        "label": "[rocprofv3] '" + " ".join(argv) + "'",
+    }
+
+
+def clock_timer_labels(plan, complete=False):
+    table = plan["clock_protocol"]["normal_timer_messages"]
+    records = load_clock_json(Path(plan["output"]) / "data/traced/command-ledger.json")
+    counts = {role: 0 for role in table["children"]}
+    labels = [
+        *table["lifecycle_labels"],
+        *("[rocprofv3] '" + " ".join(cmd) + "'" for cmd in table["fixed_commands"]),
+    ]
+    if type(records) is not list:
+        raise RuntimeError("invalid clock command ledger")
+    for record in records:
+        checked = clock_child_record(
+            table,
+            record["role"],
+            record["descriptors"],
+            record["argv"],
+            record["passfds"],
+        )
+        if checked != record:
+            raise RuntimeError("clock command ledger identity differs")
+        counts[record["role"]] += 1
+        labels.append(record["label"])
+    for role, count in counts.items():
+        maximum = table["children"][role]["max"]
+        if count > maximum or complete and count != maximum:
+            raise RuntimeError("clock child launch count differs")
+    return labels
+
+
+def clock_spawn(plan, mp, worker_plan):
+    from multiprocessing import popen_spawn_posix, resource_tracker, util
+
+    table = plan["clock_protocol"]["normal_timer_messages"]
+    path = Path(plan["output"]) / "data/traced/command-ledger.json"
+    if (
+        util._args_from_interpreter_flags() != table["python_flags"]
+        or load_clock_json(path) != []
+    ):
+        raise RuntimeError("clock spawn flags/initial ledger differs")
+    original, records = util.spawnv_passfds, []
+    worker_code = popen_spawn_posix.Popen._launch.__code__
+    tracker_code = resource_tracker.ResourceTracker.ensure_running.__code__
+
+    def launch(executable, argv, passfds):
+        frame = sys._getframe(1)
+        local = frame.f_locals
+        if frame.f_code is worker_code:
+            role, descriptors = "worker", {
+                "tracker_fd": local["tracker_fd"],
+                "pipe_handle": local["child_r"],
+            }
+            expected_fds = local["self"]._fds
+        elif frame.f_code is tracker_code:
+            role, descriptors = "tracker", {"tracker_fd": local["r"]}
+            expected_fds = local["fds_to_pass"]
+        else:
+            raise RuntimeError("unknown clock spawn caller")
+        if os.fsdecode(executable) != table["python"] or list(passfds) != list(
+            expected_fds
+        ):
+            raise RuntimeError("clock spawn executable/passfds differs")
+        record = clock_child_record(table, role, descriptors, argv, passfds)
+        records.append(record)
+        if (
+            sum(item["role"] == role for item in records)
+            > table["children"][role]["max"]
+        ):
+            raise RuntimeError("extra clock child launch")
+        temporary = path.with_suffix(".tmp")
+        save(temporary, records)
+        temporary.replace(path)
+        return original(executable, argv, passfds)
+
+    util.spawnv_passfds = launch
+    try:
+        mp.spawn(clock_rank_main, args=(worker_plan, "traced"), nprocs=TP, join=True)
+    finally:
+        changed = util.spawnv_passfds is not launch
+        util.spawnv_passfds = original
+        if changed or util.spawnv_passfds is not original:
+            raise RuntimeError("clock spawn hook restoration failed")
+    clock_timer_labels(plan, complete=True)
+
+
+def clock_live_check(plan, cohort, record=False):
     clock_remaining()
     if cohort == "traced":
         directory = Path(plan["output"]) / "data" / cohort
@@ -1161,7 +1387,10 @@ def clock_live_check(plan, cohort):
             directory / "worker.log",
             list((directory / "profiler").glob("clock-*_results.json")),
             live=True,
+            timer_labels=clock_timer_labels(plan),
+            classification=directory / "log-classification.json" if record else None,
         )
+    clock_remaining()
 
 
 def clock_observations(timer, graph, body, report, plan, cohort, dist, out):
@@ -1300,35 +1529,77 @@ def trace_pointer(value):
     return trace_uint(int(value, 16), True)
 
 
-def clock_trace_logs(path, allowed_outputs=(), live=False):
+def clock_trace_logs(
+    path, allowed_outputs=(), live=False, timer_labels=(), classification=None
+):
     text = Path(path).read_text(errors="strict")
-    text = re.sub(r"\x1b\[[0-9;]*m", "", text)
     lines = text.splitlines()
     if live and text and not text.endswith("\n"):
         lines = lines[:-1]
-    for line in lines:
-        if re.search(
-            r"dropping record|dropped.{0,20}record|lost.{0,20}record|swapping the values|cannot offload buffer|cannot read tmp file|buffer is not empty after offload",
-            line,
-            re.IGNORECASE,
-        ):
-            raise RuntimeError("profiler loss/repair diagnostic: " + line)
-        if re.match(r"[WEF][0-9]{4,8}\s", line) or re.search(
-            r"(?<![A-Za-z])(?:WARNING|ERROR|FATAL)(?![A-Za-z])", line, re.IGNORECASE
-        ):
-            if re.match(
-                r"E[0-9]{4,8} .*output_stream\.cpp:[0-9]+\] Opened result file: ", line
-            ) and any(
-                line.endswith(
-                    (
-                        "Opened result file: " + str(p),
-                        'Opened result file: "' + str(p) + '"',
-                    )
-                )
-                for p in allowed_outputs
+    result = {"state": "CHECKED", "complete_lines": len(lines), "classifications": []}
+    try:
+        for number, raw in enumerate(lines, 1):
+            line = re.sub(r"\x1b\[[0-9;]*m", "", raw)
+            if re.search(
+                r"dropping record|dropped.{0,20}record|lost.{0,20}record|swapping the values|cannot offload buffer|cannot read tmp file|buffer is not empty after offload",
+                line,
+                re.IGNORECASE,
             ):
-                continue
-            raise RuntimeError("unqualified profiler diagnostic: " + line)
+                raise RuntimeError("profiler loss/repair diagnostic: " + line)
+            normal = re.fullmatch(
+                r"W[0-9]{8} [0-2][0-9]:[0-5][0-9]:[0-5][0-9]\.[0-9]{6} ([1-9][0-9]*) simple_timer\.cpp:55\] (.+) :: ( *[0-9]+\.[0-9]{6}) sec",
+                raw,
+            )
+            if normal and normal[2] in timer_labels:
+                datetime.strptime(raw[1:25], "%Y%m%d %H:%M:%S.%f")
+                seconds = float(normal[3])
+                trace_uint(int(normal[1]))
+                if (
+                    math.isfinite(seconds)
+                    and seconds >= 0
+                    and f"{seconds:12.6f}" == normal[3]
+                ):
+                    result["classifications"].append(
+                        {
+                            "line": number,
+                            "raw": raw,
+                            "class": "source_normal_timer_summary",
+                            "label": normal[2],
+                            "seconds": seconds,
+                        }
+                    )
+                    continue
+            if re.match(r"[WEF][0-9]{4,8}\s", line) or re.search(
+                r"(?<![A-Za-z])(?:WARNING|ERROR|FATAL)(?![A-Za-z])", line, re.IGNORECASE
+            ):
+                if re.match(
+                    r"E[0-9]{4,8} .*output_stream\.cpp:[0-9]+\] Opened result file: ",
+                    line,
+                ) and any(
+                    line.endswith(
+                        (
+                            "Opened result file: " + str(p),
+                            'Opened result file: "' + str(p) + '"',
+                        )
+                    )
+                    for p in allowed_outputs
+                ):
+                    result["classifications"].append(
+                        {
+                            "line": number,
+                            "raw": raw,
+                            "class": "expected_result_file_notice",
+                        }
+                    )
+                    continue
+                raise RuntimeError("unqualified profiler diagnostic: " + line)
+    except Exception as error:
+        result.update(state="REFUSED", line=number, error=repr(error))
+        raise
+    finally:
+        if classification is not None:
+            save(classification, result)
+    return result
 
 
 def trace_operation(document, record):
@@ -1554,7 +1825,12 @@ def validate_clock_trace(plan, reports, directory):
             documents[pid] = document
         elif document["buffer_records"]["kernel_dispatch"]:
             raise ValueError("unmodelled GPU work in a non-worker trace")
-    clock_trace_logs(Path(directory) / "worker.log", files)
+    clock_trace_logs(
+        Path(directory) / "worker.log",
+        files,
+        timer_labels=clock_timer_labels(plan, complete=True),
+        classification=Path(directory) / "log-classification.json",
+    )
     if set(documents) != set(by_pid):
         raise ValueError("missing worker trace export")
     return documents
@@ -1661,6 +1937,7 @@ def clock_driver(plan, path):
             str(path),
         ]
         if cohort == "traced":
+            save(directory / "command-ledger.json", [])
             command = [*plan["clock_protocol"]["profiler_command"], "--", *command]
         environment = {
             key: value
@@ -1683,7 +1960,7 @@ def clock_driver(plan, path):
                 },
             )
             while True:
-                clock_live_check(plan, cohort)
+                clock_live_check(plan, cohort, record=True)
                 if process.poll() is not None:
                     break
                 time.sleep(min(0.1, clock_remaining()))
@@ -1859,7 +2136,7 @@ def ownership_boundary(common, namespace):
 
 def supervise(plan, path):
     """Reuse the pinned V2 ownership body; only plan plumbing is adapted."""
-    check_plan(plan, path)
+    marker_observations = check_plan(plan, path)
     if Path(plan["output"]).exists():
         raise FileExistsError(plan["output"])
     if os.nice(0) != 0:
@@ -1983,6 +2260,7 @@ def supervise(plan, path):
     actual = dict(plan, environment=env, command=command)
     if plan["mode"] == CLOCK_MODE:
         actual["clock_plan_sha256"] = sha(path)
+        actual["clock_marker_observations"] = marker_observations
     namespace = {
         "C": C,
         "os": os,
@@ -2629,6 +2907,34 @@ def clock_driver_check(document, report):
             ):
                 cohort = command[command.index("--clock-cohort") + 1]
                 launched.append(cohort)
+                if cohort == "traced":
+                    table = plan["clock_protocol"]["normal_timer_messages"]
+                    commands = []
+                    for ordinal in range(TP + 1):
+                        role = "tracker" if ordinal == 0 else "worker"
+                        descriptors = (
+                            {"tracker_fd": 19}
+                            if ordinal == 0
+                            else {"tracker_fd": 20, "pipe_handle": 30 + ordinal}
+                        )
+                        rule = table["children"][role]
+                        argv = [
+                            table["python"],
+                            *table["python_flags"],
+                            "-c",
+                            rule["program"].format(**descriptors),
+                            *rule["suffix"],
+                        ]
+                        commands.append(
+                            clock_child_record(
+                                table,
+                                role,
+                                descriptors,
+                                argv,
+                                list(descriptors.values()),
+                            )
+                        )
+                    save(out / "data/traced/command-ledger.json", commands)
                 if case == "late_spawn":
                     now[0] = 181
                 protocol = plan["clock_protocol"]
@@ -2763,6 +3069,293 @@ def clock_driver_check(document, report):
             else:
                 raise AssertionError("cross-cohort ordinal mapping changed")
     return outcomes
+
+
+def clock_pre_setup_check_function(name):
+    source = subprocess.check_output(
+        [
+            "git",
+            "show",
+            "419aa118c82f82ebc93b620dbd2a8e02e1d1b832:spike/k31_k2_front/replay.py",
+        ],
+        text=True,
+    )
+    function = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    )
+    namespace = dict(globals())
+    exec(  # noqa: S102
+        compile(
+            ast.Module(body=[function], type_ignores=[]), "qualified-pre-setup", "exec"
+        ),
+        namespace,
+    )
+    return namespace[name]
+
+
+def clock_log_check():
+    from multiprocessing import get_context, util
+    from tempfile import TemporaryDirectory
+    from types import SimpleNamespace
+
+    with TemporaryDirectory() as directory:
+        out = Path(directory)
+        traced = out / "data/traced"
+        traced.mkdir(parents=True)
+        ledger = traced / "command-ledger.json"
+        save(ledger, [])
+        plan = {"output": str(out), "clock_protocol": clock_protocol(out)}
+        table = plan["clock_protocol"]["normal_timer_messages"]
+        table["python"] = sys.executable
+        table["python_flags"] = util._args_from_interpreter_flags()
+        original = util.spawnv_passfds
+
+        def spawn_cpu(function, args, nprocs, join):
+            assert (
+                function is clock_rank_main
+                and args == ({}, "traced")
+                and nprocs == TP
+                and join
+            )
+            processes = [
+                get_context("spawn").Process(target=time.sleep, args=(0.01,))
+                for _ in range(TP)
+            ]
+            for process in processes:
+                process.start()
+            for process in processes:
+                process.join(15)
+                assert process.exitcode == 0
+
+        clock_spawn(plan, SimpleNamespace(spawn=spawn_cpu), {})
+        assert util.spawnv_passfds is original
+        records = load_clock_json(ledger)
+        labels = clock_timer_labels(plan, complete=True)
+        assert len(records) == TP + 1
+        log = traced / "worker.log"
+        prefix = "W20261122 00:41:29.331333 123 simple_timer.cpp:55] "
+        normal = prefix + labels[0] + " ::     0.001101 sec"
+        log.write_text(
+            "\n".join(
+                prefix + label + f" :: {seconds:12.6f} sec"
+                for label in labels
+                for seconds in (0, 1.25)
+            )
+            + "\n"
+        )
+        result = clock_trace_logs(
+            log, timer_labels=labels, classification=traced / "classification.json"
+        )
+        assert len(result["classifications"]) == len(labels) * 2
+        try:
+            clock_pre_setup_check_function("clock_trace_logs")(log)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("pre-fix parser did not reject the normal summaries")
+        refused = []
+        for bad in (
+            normal.replace("tool initialization", "tool detachment"),
+            prefix + "[rocprofv3] 'unregistered command' ::     0.000000 sec",
+            normal.replace("simple_timer.cpp:55", "other.cpp:55"),
+            normal.replace("0.001101", "nan"),
+            normal.replace("0.001101", "inf"),
+            normal.replace("0.001101", "-0.001101"),
+            normal.replace(" ::     ", " :: "),
+            normal.replace("20261122", "20261322"),
+            normal + " appended diagnostic",
+            normal + "\nW20261122 00:41:29.331333 123 unrelated.cpp:1] unknown warning",
+            normal + "\nERROR: failed export",
+            normal + "\nFATAL: failed export",
+            normal + "\nDropping record",
+            normal + "\nswapping the values",
+            normal + "\ncannot offload buffer",
+        ):
+            log.write_text(bad + "\n")
+            try:
+                clock_trace_logs(log, timer_labels=labels)
+            except (RuntimeError, ValueError):
+                refused.append(bad)
+            else:
+                raise AssertionError("unqualified normal summary accepted")
+        for bad in (
+            records[:-1],
+            [*records, records[-1]],
+            [{**records[0], "label": "forged"}],
+            [{**records[0], "argv": ["unknown"]}],
+            [{**records[0], "passfds": []}],
+            [{**records[0], "descriptors": {"tracker_fd": True}}],
+        ):
+            save(ledger, bad)
+            try:
+                clock_timer_labels(plan, complete=True)
+            except (RuntimeError, ValueError):
+                pass
+            else:
+                raise AssertionError("invalid command ledger accepted")
+        for malformed in (None, "{", '{"launches":[],"launches":[]}'):
+            if malformed is None:
+                ledger.unlink()
+            else:
+                ledger.write_text(malformed)
+            try:
+                clock_timer_labels(plan)
+            except (ValueError, RuntimeError, FileNotFoundError):
+                pass
+            else:
+                raise AssertionError("missing/corrupt command ledger accepted")
+        save(ledger, [])
+        table["python_flags"].append("-I")
+        try:
+            clock_spawn(plan, SimpleNamespace(spawn=spawn_cpu), {})
+        except RuntimeError:
+            assert util.spawnv_passfds is original
+        else:
+            raise AssertionError("unknown interpreter flags accepted")
+        table["python_flags"].pop()
+        for failure in ("unknown_caller", "corrupt_hook", "spawn_failure"):
+            save(ledger, [])
+
+            def failed_spawn(*args, failure=failure, **kwargs):
+                if failure == "unknown_caller":
+                    util.spawnv_passfds(b"unknown", [], [])
+                elif failure == "corrupt_hook":
+                    util.spawnv_passfds = None
+                else:
+                    raise OSError("controlled launch failure")
+
+            try:
+                clock_spawn(plan, SimpleNamespace(spawn=failed_spawn), {})
+            except (RuntimeError, OSError):
+                assert util.spawnv_passfds is original
+            else:
+                raise AssertionError("invalid launch/hook accepted")
+    return {
+        "exact_CPU_prelaunch_forwarding": True,
+        "dynamic_children": TP + 1,
+        "prelaunch_records": records,
+        "normal_summary_classes_checked": True,
+        "pre_fix_parser_refused_normal_summaries": True,
+        "diagnostic_refusals": len(refused),
+        "ledger_and_hook_refusals": True,
+        "GPU_executed": False,
+    }
+
+
+def clock_marker_check():
+    from tempfile import TemporaryDirectory
+    from unittest.mock import patch
+
+    assert (
+        str(CLOCK_MARKER)
+        == "/app/k31-agent-team-private/task-15/cache/comgr/llvmcache.timestamp"
+    )
+    rejected = []
+    old_verify = clock_pre_setup_check_function("verify_binding")
+    for case in (
+        "mtime_only",
+        "missing",
+        "missing_record",
+        "replaced",
+        "retargeted",
+        "nonempty",
+        "other_file",
+        "model",
+        "wrong_policy",
+        "read_mtime_race",
+        "read_identity_race",
+        "read_ctime_race",
+    ):
+        with TemporaryDirectory() as directory:
+            marker, other, model = [
+                Path(directory) / name
+                for name in ("llvmcache.timestamp", "payload", "model.bin")
+            ]
+            marker.write_bytes(b"")
+            other.write_bytes(b"payload")
+            model.write_bytes(b"weight")
+            binding = {
+                "files": {str(p): file_identity(p) for p in (marker, other)},
+                "models": {str(model): file_identity(model)},
+            }
+            with patch.object(sys.modules[__name__], "CLOCK_MARKER", marker):
+                policy = clock_marker_policy()
+                assert verify_binding(binding, policy)[0]["delta_mtime_ns"] == 0
+                if case in ("mtime_only", "other_file", "model"):
+                    target = {
+                        "mtime_only": marker,
+                        "other_file": other,
+                        "model": model,
+                    }[case]
+                    status = target.stat()
+                    os.utime(target, ns=(status.st_atime_ns, status.st_mtime_ns + 100))
+                elif case == "missing":
+                    marker.unlink()
+                elif case == "missing_record":
+                    del binding["files"][str(marker)]
+                elif case == "replaced":
+                    replacement = marker.with_suffix(".replacement")
+                    replacement.write_bytes(b"")
+                    replacement.replace(marker)
+                elif case == "retargeted":
+                    target = marker.with_suffix(".target")
+                    os.link(marker, target)
+                    marker.unlink()
+                    marker.symlink_to(target)
+                elif case == "nonempty":
+                    marker.write_bytes(b"changed")
+                elif case == "wrong_policy":
+                    policy = {**policy, "path": str(other)}
+                original_sha = sha
+
+                def racing_sha(
+                    path, case=case, marker=marker, original_sha=original_sha
+                ):
+                    value = original_sha(path)
+                    if Path(path) == marker:
+                        status = marker.stat()
+                        if case == "read_mtime_race":
+                            os.utime(
+                                marker,
+                                ns=(status.st_atime_ns, status.st_mtime_ns + 100),
+                            )
+                        elif case == "read_identity_race":
+                            replacement = marker.with_suffix(".replacement")
+                            replacement.write_bytes(b"")
+                            replacement.replace(marker)
+                        elif case == "read_ctime_race":
+                            marker.chmod(0o600)
+                    return value
+
+                with patch.object(sys.modules[__name__], "sha", side_effect=racing_sha):
+                    try:
+                        observed = verify_binding(binding, policy)
+                    except (RuntimeError, FileNotFoundError):
+                        assert case != "mtime_only"
+                        rejected.append(case)
+                    else:
+                        assert (
+                            case == "mtime_only"
+                            and observed[0]["delta_mtime_ns"] == 100
+                        )
+                        for verify in (old_verify, verify_binding):
+                            try:
+                                verify(binding)
+                            except RuntimeError:
+                                pass
+                            else:
+                                raise AssertionError(
+                                    "strict old/ordinary binding accepted marker mtime change"
+                                )
+    return {
+        "mtime_only_clock_positive": True,
+        "ordinary_binding_stays_strict": True,
+        "pre_fix_binding_refused_mtime": True,
+        "refused": rejected,
+        "real_cache_modified": False,
+    }
 
 
 def clock_source_check():
@@ -3012,6 +3605,8 @@ def clock_source_check():
                     pass
     return {
         "state": "CLOCK_DRIVER_CPU_CHECKED",
+        "clock_marker_policy_checked": clock_marker_check(),
+        "clock_normal_logs_checked": clock_log_check(),
         "old_event_failure_retained": True,
         "hard_content_order_submission_failures_checked": True,
         "timebase_and_loader_failures_checked": True,
@@ -3051,7 +3646,9 @@ def main():
             )
         )
     elif args.write_plan:
-        plan = make_plan(args.write_plan, args.out, args.snapshot, args.ready)
+        plan = make_plan(
+            args.write_plan, args.out, args.snapshot, args.ready, args.plan
+        )
         if args.plan:
             with args.plan.open("x") as target:
                 json.dump(plan, target, indent=2)
@@ -3064,9 +3661,13 @@ def main():
         print(json.dumps(clock_source_check(), indent=2))
     elif args.clock_cohort:
         plan = json.loads(args.plan.read_text())
-        check_plan(plan, args.plan, worker=True)
+        marker_observations = check_plan(plan, args.plan, worker=True)
         if plan["mode"] != CLOCK_MODE:
             raise ValueError("wrong clock cohort mode")
+        save(
+            Path(plan["output"]) / "data" / args.clock_cohort / "binding.json",
+            marker_observations,
+        )
         clock_remaining()
         import torch.multiprocessing as mp
 
@@ -3074,14 +3675,21 @@ def main():
             key: plan[key]
             for key in ("mode", "output", "environment", "clock_protocol")
         }
-        mp.spawn(
-            clock_rank_main, args=(worker_plan, args.clock_cohort), nprocs=TP, join=True
-        )
+        if args.clock_cohort == "traced":
+            clock_spawn(plan, mp, worker_plan)
+        else:
+            mp.spawn(
+                clock_rank_main,
+                args=(worker_plan, args.clock_cohort),
+                nprocs=TP,
+                join=True,
+            )
         clock_remaining()
     else:
         plan = json.loads(args.plan.read_text())
-        check_plan(plan, args.plan, worker=True)
+        marker_observations = check_plan(plan, args.plan, worker=True)
         if plan["mode"] == CLOCK_MODE:
+            save(Path(plan["output"]) / "driver-binding.json", marker_observations)
             clock_driver(plan, args.plan)
             return
         if plan["mode"] != "timing":

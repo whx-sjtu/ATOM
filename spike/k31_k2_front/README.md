@@ -112,12 +112,36 @@ priming/guard dispatches and six module calls, including one capture-definition
 call without a dispatch. Exact internal correlation must close each required
 call; no nearest-time, duration, ancestor or alias fallback is allowed.
 
-All visible SDK loss, repair, warning and error diagnostics fail, including
-unrelated domains. The sole log exception is the SDK's exact expected-file
-`Opened result file` success message. Complete normal process exit, complete
-JSON and independent required counts are required; `metadata.fini_time` is not
-flush completion. Unmodelled unrelated records are retained, without a claim
-that every unrelated exported record was lossless.
+Loss/repair/error and unknown warning diagnostics fail, including unrelated
+domains. The new setup phase classifies only source-proven `simple_timer.cpp:55`
+normal summaries: tool initialization, output generation, finalization and exact
+qualified launched-command labels, with the pinned full-line format and finite
+nonnegative seconds. Detachment, unknown labels/origins, malformed/appended or
+adjacent diagnostics still fail. Preserve raw lines and classification results;
+these summaries are neither success nor flush acknowledgements. The existing
+exact expected-file `Opened result file` notice remains unchanged.
+
+Dynamic Python command labels require a finite pre-launch ledger for eight
+workers and one tracker. The unchanged bound callers supply descriptor/passfds;
+fixed executable, interpreter flags and complete code skeletons are checked.
+Exact argv and SDK labels are atomically published before unchanged forwarding;
+the local hook is restored in finally. Missing/corrupt/extra ledger records,
+unknown callers/flags/code and launch/restoration failures reject. Repeated timer
+lines do not count launches. The exact plan filename is part of command identity.
+
+Only clock plans permit `st_mtime_ns` variation for the exact empty
+`/app/k31-agent-team-private/task-15/cache/comgr/llvmcache.timestamp` record.
+Resolved path/device/inode, zero length and empty-content SHA remain bound;
+identity-read races and all other payload/model bindings stay strict. Supervisor,
+driver and cohort receipts retain bound/observed mtimes and deltas. No marker is
+touched or rebound to pass. Metadata may affect housekeeping/timing; the exception
+identifies no writer/pruning path and proves no whole-cache or timing invariance.
+
+Complete normal process exit, complete JSON and independent required counts are
+required; `metadata.fini_time` is not flush completion. Unmodelled unrelated
+records are retained without a whole-export zero-loss claim. The old FAILED job,
+consumed allowance and refused offline command remain unchanged. Any newly
+qualified job collects both cohorts afresh, with no old-row splicing.
 
 Run CPU fixture checks and plan creation through the approved device-open guard:
 
