@@ -1,9 +1,8 @@
 # One actual native MLA-tail invocation
 
 This preparation preserves the retired fixture experiment's inconclusive result.
-It cannot change old bounds or certify a model/C12 benefit. There is no qualified
-current all-rank raw tuple to reuse: the inventory found historical rank0 data,
-synthetic frontend controls and CPU K2 fixtures, not the required input.
+It cannot change old bounds or certify a model/C12 benefit. The initial inventory found historical rank0 data, synthetic frontend controls
+and CPU K2 fixtures, without the required complete current all-rank tuple.
 
 The prospective treatment is current Mono1, TP8/DCP8, K3/AL2.88 with the bound
 current precision/state recipe. One fixed real request selects DSA layer3 and
@@ -25,7 +24,7 @@ qualifications are excluded. Canonical helper globals preclude an implicit joint
 capture. The other task never waits for this work; sharing needs a separate,
 explicitly compatible reviewed plan. No current shared-load plan exists.
 
-Replay requires the complete matched eight-rank manifest and successful producer
+Normal replay admission requires the complete matched eight-rank manifest and successful producer
 cleanup. Both arms consume the same actual tuple; external o_proj and gate
 production are excluded equally, with no scheduling benefit claimed. Original
 stage strides and aliases remain represented; unsupported inputs are rejected.
@@ -78,3 +77,10 @@ paths stay in an inactive evidence directory; new graph compilation is private.
 preserved capture plan/source and strict native int32-ID/int64-position schema.
 Its separate integrity report binds the failed controller and root stop/release,
 retains missing producer evidence, and cannot authorize capture or replay.
+
+`--write-recovery` writes the explicit ruled admission record outside the failed
+run. `--recovery` requires that exact record for replay-plan preparation; normal
+successful-producer admission remains unchanged. The record pins the unchanged
+eight invalid payloads, executed plan 78a5c221, qualified integrity report and
+reviewed completion/one-shot source proof. Original failure and missing evidence
+remain; recovery gives no GPU lease or numerical, timing or quality result.

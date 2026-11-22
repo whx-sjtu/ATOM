@@ -229,6 +229,247 @@ def qualify_preserved(plan_path, receipts, report_path):
     }
 
 
+RECOVERY_RUN = PRIVATE / "runs/5880d8e4-capture-01"
+RECOVERY_EVIDENCE = {
+    str(
+        WS
+        / "agent-team/evidence/task-19-payload-integrity-3d2deed6-01/payload-integrity.json"
+    ): "01b4695af4ef37955758c13f4c0d286ecb29a7dce9f66bddc9aed05b1cd69322",
+    str(
+        WS / "agent-team/evidence/review-19-payload-integrity-3d2deed6-01/manifest.json"
+    ): "4a3b4014c3a9697544048ebb12f54ae5bff3473541e661b5cf653b95d6fe8b00",
+    str(
+        WS / "agent-team/evidence/task-19-recovery-ruling-7071087912/comment.json"
+    ): "034a72ef4e2a4f88192485cc0d42961104b8058fea57b33de098d7480cd43e2a",
+}
+
+
+def recovery_record():
+    """This exact ruled tuple only; reuse its independently qualified proof."""
+    helpers()
+    capture.initialize_snapshot()
+    bindings = dict(RECOVERY_EVIDENCE)
+    for name, expected in bindings.items():
+        assert sha(name) == expected, name
+    integrity_path, review_path, ruling_path = map(Path, RECOVERY_EVIDENCE)
+    integrity = json.loads(integrity_path.read_text())
+    review_manifest = json.loads(review_path.read_text())
+    bindings.update(
+        {
+            str(review_path.parent / name): value
+            for name, value in review_manifest.items()
+        }
+    )
+    bindings.update(integrity["bindings"])
+    assert (
+        integrity["state"] == "PAYLOAD_INTEGRITY_ONLY"
+        and not integrity["replay_admitted"]
+    )
+    assert (
+        integrity["capture_remains_failed"]
+        and integrity["validator_head"] == "3d2deed6065ab1a44aaab899b1b73cebf5b0c4f8"
+    )
+    assert (
+        integrity["original_capture_head"] == "5880d8e4ba8d9563ce7df51f78e136dd9cf42b35"
+    )
+    assert sha(Path(capture.__file__)) == integrity["validator_sha256"]
+    ruling = json.loads(ruling_path.read_text())
+    assert ruling["id"] == 7071087912
+    for name, key in (
+        ("capture.py", "validator_sha256"),
+        ("replay.py", "qualifier_sha256"),
+    ):
+        source = subprocess.check_output(
+            [
+                "git",
+                "-C",
+                str(ROOT),
+                "show",
+                integrity["validator_head"] + ":spike/k31_mla_tail_real/" + name,
+            ]
+        )
+        assert hashlib.sha256(source).hexdigest() == integrity[key]
+    capture_plan = (
+        WS / "agent-team/evidence/task-19-preparation-5880d8e4-01/capture-plan.json"
+    )
+    assert (
+        bindings[str(capture_plan)]
+        == "78a5c221b2fc10f2c57e9ca4684db3518697b529225ef36bef1d23cb4fadfdcb"
+    )
+    original = json.loads(capture_plan.read_text())
+    assert Path(original["output"]) == RECOVERY_RUN
+    for name, expected in original["sources"].items():
+        source = Path(name)
+        if source.is_relative_to(ROOT / "spike/k31_mla_tail_real"):
+            contents = subprocess.check_output(
+                [
+                    "git",
+                    "-C",
+                    str(ROOT),
+                    "show",
+                    original["head"] + ":" + str(source.relative_to(ROOT)),
+                ]
+            )
+            assert hashlib.sha256(contents).hexdigest() == expected
+        else:
+            assert sha(source) == expected, name
+    ranks = integrity["ranks"]
+    assert len(ranks) == 8 and [r["rank"] for r in ranks] == list(range(8))
+    for rank, item in enumerate(ranks):
+        assert Path(item["path"]) == RECOVERY_RUN / "data" / f"rank{rank}.invalid.pt"
+        bindings[item["path"]] = item["sha256"]
+    for name, expected in bindings.items():
+        assert sha(name) == expected, name
+    assert all(
+        not Path(name).exists() for name in integrity["missing_producer_evidence"]
+    )
+    proof = json.loads((review_path.parent / "lifetime-audit.json").read_text())
+    for name, expected in proof[
+        "pinned_sources_verified_against_original_plan"
+    ].items():
+        assert sha(name) == expected
+        bindings[name] = expected
+    return {
+        "state": "RECOVERED_OPERATOR_INPUT_ADMISSION",
+        "ruling": ruling["html_url"],
+        "producer_success": False,
+        "original_capture_head": integrity["original_capture_head"],
+        "executed_capture_plan_sha256": bindings[str(capture_plan)],
+        "integrity_report": str(integrity_path),
+        "integrity_replay_admitted": False,
+        "proof_scope": {
+            key: proof[key]
+            for key in (
+                "device_completion_proof",
+                "serialization_order",
+                "one_shot_source_proof",
+                "retained_limits",
+            )
+        },
+        "missing_evidence": [
+            "full original drained state vector was not serialized",
+            *integrity["missing_producer_evidence"],
+        ],
+        "bindings": bindings,
+        "matched_identity": integrity["matched_identity"],
+        "ranks": ranks,
+        "GPU_grant_or_numerical_timing_quality_result": False,
+    }
+
+
+def check_recovery(path):
+    path = Path(path)
+    assert not path.resolve().is_relative_to(RECOVERY_RUN)
+    record = json.loads(path.read_text())
+    assert record == recovery_record(), "altered or wrong-run recovery record"
+    return record
+
+
+def recovery_checks():
+    from tempfile import TemporaryDirectory
+    from unittest.mock import patch
+
+    expected = recovery_record()
+    failures = []
+    with TemporaryDirectory() as temporary:
+        path = Path(temporary) / "recovery.json"
+        save(path, expected)
+        assert check_recovery(path) == expected
+        for field, value in (
+            ("ruling", "wrong ruling"),
+            ("original_capture_head", "wrong run"),
+            ("producer_success", True),
+            ("ranks", expected["ranks"][:-1]),
+            ("ranks", expected["ranks"][::-1]),
+            ("matched_identity", {}),
+            ("bindings", {}),
+            ("missing_evidence", []),
+        ):
+            save(path, {**expected, field: value})
+            try:
+                check_recovery(path)
+            except AssertionError:
+                failures.append(field)
+            else:
+                raise AssertionError("recovery mutation accepted: " + field)
+        save(path, expected)
+        original_sha = sha
+        for target in (
+            expected["ranks"][0]["path"],
+            next(
+                name
+                for name in expected["bindings"]
+                if name.endswith("root-release-verification.json")
+            ),
+        ):
+            with patch.dict(
+                globals(),
+                sha=lambda name, target=target: (
+                    "0" * 64 if str(name) == target else original_sha(name)
+                ),
+            ):
+                try:
+                    check_recovery(path)
+                except AssertionError:
+                    failures.append(target)
+                else:
+                    raise AssertionError("changed raw/release evidence accepted")
+        import copy
+
+        import torch
+
+        recovered_plan = {"recovery_record": str(path)}
+        for rank in range(8):
+            payload, actual_path = load_replay_input(recovered_plan, rank)
+            assert payload["meta"]["identity"]["rank"] == rank
+            assert str(actual_path) == expected["ranks"][rank]["path"]
+        wrong = copy.deepcopy(payload)
+        wrong["meta"]["identity"]["rank"] = 0
+        with patch.object(torch, "load", return_value=wrong):
+            try:
+                load_replay_input(recovered_plan, 7)
+            except AssertionError:
+                failures.append("loaded_rank_identity")
+            else:
+                raise AssertionError("consumer accepted a different rank")
+        with patch.object(
+            capture.SNAP, "load_rank_snapshot", return_value="normal"
+        ) as normal:
+            loaded, actual_path = load_replay_input({"snapshot": temporary}, 0)
+            assert loaded == "normal" and actual_path == Path(temporary) / "rank0.pt"
+            normal.assert_called_once_with(actual_path)
+        release_path = next(
+            name
+            for name in expected["bindings"]
+            if name.endswith("root-release-verification.json")
+        )
+
+        def missing_release(name):
+            if str(name) == release_path:
+                raise FileNotFoundError(name)
+            return original_sha(name)
+
+        with patch.dict(globals(), sha=missing_release):
+            try:
+                check_recovery(path)
+            except FileNotFoundError:
+                failures.append("missing_release")
+            else:
+                raise AssertionError("missing release evidence accepted")
+        path.unlink()
+        try:
+            check_recovery(path)
+        except FileNotFoundError:
+            failures.append("missing_record")
+        else:
+            raise AssertionError("missing recovery record accepted")
+    return {
+        "exact_record_passed": True,
+        "refusals": failures,
+        "original_integrity_replay_admitted": False,
+    }
+
+
 def validation_command(path):
     return [
         "flock",
@@ -263,6 +504,9 @@ def check_plan(plan, path, worker=False):
         "reproduction": "fixed_author_observed_min_max",
     }
     binding_functions()["verify_binding"](plan["execution"])
+    if "recovery_record" in plan:
+        assert plan["mode"] == "replay" and "snapshot" not in plan
+        check_recovery(plan["recovery_record"])
     for name, expected in plan["sources"].items():
         assert sha(name) == expected, name
     if worker:
@@ -280,7 +524,7 @@ def check_plan(plan, path, worker=False):
         )
 
 
-def make_plan(mode, output, path, snapshot=None):
+def make_plan(mode, output, path, snapshot=None, recovery=None):
     helpers()
     assert not LEGACY.git("status", "--porcelain") and not output.exists()
     base = json.loads(RECIPE.read_text())
@@ -401,7 +645,13 @@ def make_plan(mode, output, path, snapshot=None):
         "validation_command": validation_command(path),
         "gpu_authorized_by_plan": False,
     }
-    if mode == "replay":
+    if recovery is not None:
+        assert mode == "replay" and snapshot is None
+        record = check_recovery(recovery)
+        plan["recovery_record"] = str(recovery.resolve())
+        plan["sources"].update(record["bindings"])
+        plan["sources"][str(recovery.resolve())] = sha(recovery)
+    elif mode == "replay":
         if snapshot is None:
             raise ValueError("MISSING_NATIVE_INPUT: complete all-rank capture required")
         capture.initialize_snapshot()
@@ -559,6 +809,27 @@ def empty_controls(item, graphs):
     return records
 
 
+def load_replay_input(plan, rank):
+    import torch
+
+    capture.initialize_snapshot()
+    if "recovery_record" in plan:
+        record = check_recovery(plan["recovery_record"])
+        input_path = Path(record["ranks"][rank]["path"])
+        snapshot = torch.load(input_path, map_location="cpu", weights_only=True)
+        capture.validate_snapshot(snapshot)
+        entry = record["ranks"][rank]
+        assert snapshot["meta"]["identity"] == entry["identity"]
+        assert (
+            snapshot["meta"]["key"] == entry["key"]
+            and snapshot["tensor_hashes"] == entry["tensor_hashes"]
+        )
+    else:
+        input_path = Path(plan["snapshot"]) / f"rank{rank}.pt"
+        snapshot = capture.SNAP.load_rank_snapshot(input_path)
+    return snapshot, input_path
+
+
 def rank_worker(rank, plan):
     from datetime import timedelta
     from types import SimpleNamespace
@@ -572,9 +843,7 @@ def rank_worker(rank, plan):
 
     helpers()
     capture.initialize_snapshot()
-    snapshot = capture.SNAP.load_rank_snapshot(
-        Path(plan["snapshot"]) / f"rank{rank}.pt"
-    )
+    snapshot, input_path = load_replay_input(plan, rank)
     torch.cuda.set_device(rank)
     assert (
         torch.cuda.device_count() == 8
@@ -655,7 +924,7 @@ def rank_worker(rank, plan):
             "rank": rank,
             "hardware": hardware,
             "workspace": workspace,
-            "input_sha256": sha(Path(plan["snapshot"]) / f"rank{rank}.pt"),
+            "input_sha256": sha(input_path),
             "checks": checks,
             "diagnostic_controls": controls,
             "graph_proof": proof,
@@ -1209,6 +1478,7 @@ def cpu_checks():
         result["unknown_or_occupied_release_refused"] = True
     assert not torch.cuda.is_initialized()
     result["absolute_deadline"] = deadline_checks()
+    result["recovered_input_admission"] = recovery_checks()
     return result
 
 
@@ -1222,6 +1492,8 @@ if __name__ == "__main__":
     parser.add_argument("--ownership-fixture", type=Path)
     parser.add_argument("--out", type=Path)
     parser.add_argument("--snapshot", type=Path)
+    parser.add_argument("--recovery", type=Path)
+    parser.add_argument("--write-recovery", action="store_true")
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--validate-results", action="store_true")
     parser.add_argument("--rank", type=int, choices=range(8))
@@ -1234,10 +1506,20 @@ if __name__ == "__main__":
                 qualify_preserved(args.plan, args.root_receipts, args.out), indent=2
             )
         )
+    elif args.write_recovery:
+        assert not args.out.exists() and not args.out.resolve().is_relative_to(
+            RECOVERY_RUN
+        )
+        save(args.out, recovery_record())
     elif args.ownership_fixture:
         ownership_fixture(args.ownership_fixture)
     elif args.write_plan:
-        save(args.plan, make_plan(args.write_plan, args.out, args.plan, args.snapshot))
+        save(
+            args.plan,
+            make_plan(
+                args.write_plan, args.out, args.plan, args.snapshot, args.recovery
+            ),
+        )
     else:
         assert args.plan is not None
         plan = json.loads(args.plan.read_text())
