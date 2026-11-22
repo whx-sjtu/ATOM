@@ -2956,6 +2956,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         W, S = self.dcp_world_size, self.cp_kv_cache_interleave_size
         gathers = []
         for g in dcp_gather_index(ranges, g_cu, cu_pad, W, S):
+            local_cu = upload_numpy(g.local_cu.astype(np.int32), self.device)
             buffer = None
             if fp4_prefix is not None and len(ranges) == 1:
                 buffer = self._dcp_fp4_prefill_buffer(
@@ -2974,7 +2975,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             gathers.append(
                 DcpGather(
                     g.local_total,
-                    upload_numpy(g.local_cu.astype(np.int32), self.device),
+                    local_cu,
                     gather_index,
                 )
             )
