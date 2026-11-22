@@ -738,6 +738,7 @@ def cpu_check(snapshot, out, compile_only=False):
 def clock_protocol(out):
     tool = Path("/opt/rocm/lib/rocprofiler-sdk/librocprofiler-sdk-tool.so")
     sdk = Path("/opt/rocm/lib/librocprofiler-sdk.so")
+    rocpd = Path("/opt/rocm/lib/librocprofiler-sdk-rocpd.so.1")
     return {
         "body_ms": 0.5,
         "guard_ms": [1, 1, 2, 2],
@@ -756,8 +757,13 @@ def clock_protocol(out):
             "ROCPROFILER_CI_FREQ_SCALE_TIMESTAMPS": "0",
         },
         "profiler_tool_library": str(tool.resolve()),
-        "profiler_loaded_libraries": [str(tool.resolve()), str(sdk.resolve())],
-        "profiler_files": ["/opt/rocm/bin/rocprofv3", str(tool), str(sdk)],
+        "profiler_preload_libraries": [str(tool.resolve()), str(sdk.resolve())],
+        "profiler_loaded_libraries": [
+            str(tool.resolve()),
+            str(sdk.resolve()),
+            str(rocpd.resolve()),
+        ],
+        "profiler_files": ["/opt/rocm/bin/rocprofv3", str(tool), str(sdk), str(rocpd)],
         "profiler_command": [
             "/opt/rocm/bin/rocprofv3",
             "--kernel-trace",
@@ -1098,7 +1104,8 @@ def validate_clock_identity(identity, plan, cohort):
     if cohort == "traced":
         if (
             loaded != expected
-            or libraries(env.get("LD_PRELOAD", "")) != expected
+            or libraries(env.get("LD_PRELOAD", ""))
+            != set(protocol["profiler_preload_libraries"])
             or libraries(env.get("ROCP_TOOL_LIBRARIES", ""))
             != {protocol["profiler_tool_library"]}
         ):
@@ -1290,7 +1297,7 @@ def trace_uint(value, zero=False):
 def trace_pointer(value):
     if type(value) is not str or not re.fullmatch(r"0|0x[0-9a-f]+", value):
         raise ValueError("unsupported raw pointer representation")
-    return int(value, 16)
+    return trace_uint(int(value, 16), True)
 
 
 def clock_trace_logs(path, allowed_outputs=(), live=False):
@@ -1419,7 +1426,12 @@ def trace_inventory(document, report):
         symbol = document["kernel_symbols"][kid]
         if trace_uint(symbol["kernel_id"]) != kid or not symbol["kernel_name"]:
             raise ValueError("kernel symbol entity differs")
-        if symbol["formatted_kernel_name"] == "delay_0":
+        if "delay_0" in (symbol["kernel_name"], symbol["formatted_kernel_name"]):
+            if (
+                symbol["kernel_name"] != "delay_0"
+                or symbol["formatted_kernel_name"] != "delay_0"
+            ):
+                raise ValueError("clock raw/formatted kernel symbol differs")
             if (
                 trace_operation(document, dispatch)
                 != ("KERNEL_DISPATCH", "KERNEL_DISPATCH_COMPLETE")
@@ -1431,6 +1443,9 @@ def trace_inventory(document, report):
                 or dispatch["end_timestamp"] <= dispatch["start_timestamp"]
             ):
                 raise ValueError("clock thread/timestamp differs")
+            for geometry in ("workgroup_size", "grid_size"):
+                for dimension in ("x", "y", "z"):
+                    trace_uint(info[geometry][dimension])
             if info["workgroup_size"] != {"x": 64, "y": 1, "z": 1} or info[
                 "grid_size"
             ] != {"x": 64, "y": 1, "z": 1}:
@@ -2377,6 +2392,33 @@ def clock_trace_check():
         ("bdf", ("agents", 0, "location_id"), 0x1500),
         ("symbol_hole", ("kernel_symbols", 1, "kernel_id"), 0),
         (
+            "bool_geometry",
+            (
+                "buffer_records",
+                "kernel_dispatch",
+                1,
+                "dispatch_info",
+                "workgroup_size",
+                "y",
+            ),
+            True,
+        ),
+        (
+            "float_geometry",
+            ("buffer_records", "kernel_dispatch", 1, "dispatch_info", "grid_size", "x"),
+            64.0,
+        ),
+        (
+            "raw_symbol_tamper",
+            ("kernel_symbols", 1, "kernel_name"),
+            "unexpected_actual_kernel",
+        ),
+        (
+            "formatted_symbol_tamper",
+            ("kernel_symbols", 1, "formatted_kernel_name"),
+            "unexpected_label",
+        ),
+        (
             "module_function",
             ("buffer_records", "hip_api", 1, "args", 0, "value"),
             "0x3333",
@@ -2403,6 +2445,13 @@ def clock_trace_check():
         else:
             records.pop(index)
         cases.append((name, changed, report))
+    changed = deepcopy(document)
+    for api in changed["buffer_records"]["hip_api"]:
+        if api["operation"] == 1:
+            api["args"][0]["value"] = "0x10000000000000000"
+    cases.append(("all_module_pointer_overflow", changed, report))
+    assert trace_pointer("0xffffffffffffffff") == 2**64 - 1
+    assert trace_pointer("0") == 0
     changed_report = deepcopy(report)
     changed_report["rows"][2]["body_replay_ordinal"] = 4
     cases.append(("ordinal_gap", document, changed_report))
@@ -2604,7 +2653,7 @@ def clock_driver_check(document, report):
                         ]
                         record["profiler_environment"].update(
                             protocol["profiler_environment"],
-                            LD_PRELOAD=":".join(protocol["profiler_loaded_libraries"]),
+                            LD_PRELOAD=":".join(protocol["profiler_preload_libraries"]),
                             ROCP_TOOL_LIBRARIES=protocol["profiler_tool_library"],
                             ROCPROF_HIP_RUNTIME_API_TRACE="1",
                             ROCPROF_HIP_COMPILER_API_TRACE="1",
@@ -2745,51 +2794,97 @@ def clock_source_check():
         ({**row, "t1_ns": 900_000}, 100_740, 150_740),
     ):
         assert clock_controls(changed, start, end, 50_000)[1]
+    fixed = clock_protocol(Path("/cpu-fixture"))
+    rocpd = Path("/opt/rocm/lib/librocprofiler-sdk-rocpd.so.1")
+    dynamic = subprocess.check_output(
+        ["readelf", "-d", fixed["profiler_tool_library"]], text=True
+    )
+    assert "Shared library: [librocprofiler-sdk-rocpd.so.1]" in dynamic
+    assert str(rocpd) in fixed["profiler_files"]
+    assert set(fixed["profiler_loaded_libraries"]) == set(
+        fixed["profiler_preload_libraries"]
+    ) | {str(rocpd.resolve())}
     identity = {
         "hip_pci_status": 0,
         "pci_bus_id": "0000:05:00.0",
         "hsa_frequency_status": 0,
         "hsa_timestamp_frequency_hz": 10**9,
-        "loaded_profiler_libraries": ["/sdk", "/tool"],
+        "loaded_profiler_libraries": fixed["profiler_loaded_libraries"],
         "profiler_environment": {
-            "LD_LIBRARY_PATH": "/runtime",
-            "LD_PRELOAD": "/sdk:/tool",
-            "ROCP_TOOL_LIBRARIES": "/tool",
-            "ROCPROFILER_CI_STRICT_TIMESTAMPS": "1",
-            "ROCPROFILER_CI_FREQ_SCALE_TIMESTAMPS": "0",
+            "LD_LIBRARY_PATH": "/opt/rocm/lib",
+            "LD_PRELOAD": ":".join(fixed["profiler_preload_libraries"]),
+            "ROCP_TOOL_LIBRARIES": fixed["profiler_tool_library"],
+            **fixed["profiler_environment"],
             "ROCPROF_HIP_RUNTIME_API_TRACE": "1",
             "ROCPROF_HIP_COMPILER_API_TRACE": "1",
             "ROCPROF_KERNEL_TRACE": "1",
         },
     }
     protocol = {
-        "environment": {"LD_LIBRARY_PATH": "/runtime"},
-        "clock_protocol": {
-            "pci_bdfs": ["0000:05:00.0"],
-            "profiler_environment": {
-                "ROCPROFILER_CI_STRICT_TIMESTAMPS": "1",
-                "ROCPROFILER_CI_FREQ_SCALE_TIMESTAMPS": "0",
-            },
-            "hsa_timestamp_frequency_hz": 10**9,
-            "profiler_loaded_libraries": ["/sdk", "/tool"],
-            "profiler_tool_library": "/tool",
-        },
+        "environment": {"LD_LIBRARY_PATH": "/opt/rocm/lib"},
+        "clock_protocol": fixed,
     }
     validate_clock_identity(identity, protocol, "traced")
-    for bad in (
-        {**identity, "hsa_timestamp_frequency_hz": 10**8},
-        {**identity, "hsa_frequency_status": 1},
-        {**identity, "loaded_profiler_libraries": []},
-        {**identity, "profiler_environment": {}},
-        {**identity, "hip_pci_status": 1},
-        {**identity, "pci_bus_id": "0000:ff:00.0"},
+    old = {
+        **protocol,
+        "clock_protocol": {
+            **fixed,
+            "profiler_loaded_libraries": fixed["profiler_preload_libraries"],
+        },
+    }
+    try:
+        validate_clock_identity(identity, old, "traced")
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError(
+            "old two-library map accepted the required rocpd dependency"
+        )
+    rejected_identity = []
+    for name, changed in (
+        ("frequency", {"hsa_timestamp_frequency_hz": 10**8}),
+        ("frequency_status", {"hsa_frequency_status": 1}),
+        (
+            "missing_rocpd",
+            {"loaded_profiler_libraries": fixed["profiler_preload_libraries"]},
+        ),
+        (
+            "unexpected_mapping",
+            {
+                "loaded_profiler_libraries": [
+                    *fixed["profiler_loaded_libraries"],
+                    "/unexpected",
+                ]
+            },
+        ),
+        (
+            "extra_explicit_preload",
+            {
+                "profiler_environment": {
+                    **identity["profiler_environment"],
+                    "LD_PRELOAD": ":".join(fixed["profiler_loaded_libraries"]),
+                }
+            },
+        ),
+        ("missing_environment", {"profiler_environment": {}}),
+        ("hip_status", {"hip_pci_status": 1}),
+        ("wrong_bdf", {"pci_bus_id": "0000:ff:00.0"}),
     ):
         try:
-            validate_clock_identity(bad, protocol, "traced")
+            validate_clock_identity({**identity, **changed}, protocol, "traced")
         except RuntimeError:
-            pass
+            rejected_identity.append(name)
         else:
-            raise AssertionError("invalid trace identity accepted")
+            raise AssertionError("invalid trace identity accepted: " + name)
+    loader_check = {
+        "DT_NEEDED_rocpd": True,
+        "rocpd": file_identity(rocpd),
+        "explicit_preloads": fixed["profiler_preload_libraries"],
+        "required_filtered_maps": fixed["profiler_loaded_libraries"],
+        "old_two_library_expectation_rejected": True,
+        "negative_cases": rejected_identity,
+        "libraries_loaded": False,
+    }
     sys.path.insert(0, str(WS / "harness"))
     import common as original_common
 
@@ -2920,6 +3015,7 @@ def clock_source_check():
         "old_event_failure_retained": True,
         "hard_content_order_submission_failures_checked": True,
         "timebase_and_loader_failures_checked": True,
+        "static_loader_dependency_check": loader_check,
         "absolute_deadline_cases": outcomes,
         "trace_schema_and_stops": clock_trace_check(),
         "GPU_executed": False,

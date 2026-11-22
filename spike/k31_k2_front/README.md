@@ -103,7 +103,10 @@ The fixed rocprofv3/SDK backend traces HIP and kernel records to JSON. Strict
 invalid-timestamp rejection is enabled and frequency scaling is disabled. Each
 leased worker requires a successful HSA timestamp-frequency query of 1 GHz before
 interpreting unscaled dispatch ticks as nanoseconds. Resolved loader mappings,
-raw graph/stream handles, native TID, PID and actual BDF are recorded. The required
+raw graph/stream handles, native TID, PID and actual BDF are recorded. Explicit
+preloads are the tool and SDK; filtered loaded mappings also require the tool's
+source-bound `librocprofiler-sdk-rocpd.so.1` dependency, with its resolved bytes
+bound separately. Missing or additional mappings/preloads fail. The required
 lineage is five graph calls (warmup ordinal 0, measured ordinals 1–4), five
 priming/guard dispatches and six module calls, including one capture-definition
 call without a dispatch. Exact internal correlation must close each required
