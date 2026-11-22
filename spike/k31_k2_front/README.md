@@ -79,3 +79,59 @@ runtime distribution bytes, AITER sources and preexisting private cache artifact
 Model identity binds metadata bytes plus shard filesystem/header identities;
 selected materialized weight bytes are hashed by the real capture. Full engine
 configuration and startup can require a device and remain lease-bound checks.
+
+## Prospective clock-boundary diagnostic
+
+The separate `clock_boundary` plan runs no model, snapshot or K2 path. It keeps
+all eight visible device mappings, original Timer event/delay priming, one graph
+warmup, the same 0.5 ms body, 1 ms/2 ms guards, and exactly two trials per delay.
+An untraced cohort precedes a traced cohort, at most 64 measured rows in total.
+There is no `collect_pair`, retry, replacement sample or backend/counter search.
+Each worker records its HIP BDF before Timer priming; untraced identities must
+form the fixed eight-device bijection, and traced ordinals must match it.
+
+The original event gate remains `E + 5 >= B` and
+`E <= B + max(50, 0.10 * B)` in microseconds. A finite mismatch is recorded as
+a failed observation while the fixed set may finish. Content, counter, order,
+submission, trace, ownership or deadline failures stop subsequent observations
+and cohorts. The absolute 180 s bound starts before the first diagnostic child
+spawn and covers both cohorts, workers, profiler exit/flush and in-run validation.
+Late exit or late validation fails even if the child returned zero. Owned cleanup
+uses bounded TERM/KILL and retains the lock when release is uncertain.
+
+The fixed rocprofv3/SDK backend traces HIP and kernel records to JSON. Strict
+invalid-timestamp rejection is enabled and frequency scaling is disabled. Each
+leased worker requires a successful HSA timestamp-frequency query of 1 GHz before
+interpreting unscaled dispatch ticks as nanoseconds. Resolved loader mappings,
+raw graph/stream handles, native TID, PID and actual BDF are recorded. The required
+lineage is five graph calls (warmup ordinal 0, measured ordinals 1–4), five
+priming/guard dispatches and six module calls, including one capture-definition
+call without a dispatch. Exact internal correlation must close each required
+call; no nearest-time, duration, ancestor or alias fallback is allowed.
+
+All visible SDK loss, repair, warning and error diagnostics fail, including
+unrelated domains. The sole log exception is the SDK's exact expected-file
+`Opened result file` success message. Complete normal process exit, complete
+JSON and independent required counts are required; `metadata.fini_time` is not
+flush completion. Unmodelled unrelated records are retained, without a claim
+that every unrelated exported record was lossless.
+
+Run CPU fixture checks and plan creation through the approved device-open guard:
+
+    python spike/k31_k2_front/replay.py --clock-source-check
+    python spike/k31_k2_front/replay.py --write-plan clock_boundary --out NEW_PRIVATE_RUN --plan NEW_PLAN
+
+Plan creation does not grant execution. After independent Source qualification,
+root alone may issue the exact head/plan lease for one set. Only after verified
+owned release does offline analysis pair measured rows with their exact dispatch:
+
+    python spike/k31_k2_front/replay.py --analyze-clock --plan FROZEN_PLAN --out NEW_ANALYSIS
+
+B spans first `memrealtime` through the last loop read, excluding the two stores
+and return. K is the SDK/HSA dispatch processing/completion duration; E is the
+unchanged ordinary event envelope. Report raw durations and K−B/E−K, without
+absolute counter/SDK-clock alignment, overhead subtraction or physical-cause
+attribution. Non-nesting, trace-only behavior, unmatched records and nonrecurrence
+remain unresolved. Seal, review and stop after the one set, including success;
+there is no automatic method adoption or K2 continuation. Earlier failed clock
+observations and the zero-K2 result are unchanged.

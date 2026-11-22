@@ -8,10 +8,14 @@ import hashlib
 import json
 import math
 import os
+import re
 import statistics
 import subprocess
 import sys
+import threading
+import time
 from datetime import timedelta
+from itertools import pairwise
 from pathlib import Path
 
 import capture
@@ -44,6 +48,7 @@ def initialize_helpers():
 
 
 METHOD = "current_whole_k2_xready_ordinary_events"
+CLOCK_MODE = "clock_boundary"
 
 
 def save(path, value):
@@ -104,7 +109,7 @@ def file_identity(path, *, content=True):
     return result
 
 
-def execution_binding(base):
+def execution_binding(base, *, clock_only=False):
     """Bind installed runtime bytes without importing their executable modules."""
     import importlib.metadata
 
@@ -145,6 +150,8 @@ def execution_binding(base):
             "/opt/rocm/llvm/bin/llvm-objdump",
         )
     )
+    if clock_only:
+        paths.update(Path(name) for name in clock_protocol(PRIVATE)["profiler_files"])
     seed = WS / "agent-team/work/15/cache-seed.json"
     paths.add(seed)
     records, resolved = {}, {}
@@ -154,7 +161,7 @@ def execution_binding(base):
             resolved[real] = file_identity(path)
         records[str(path)] = resolved[real]
     models = {}
-    for name in ("model", "draft"):
+    for name in (() if clock_only else ("model", "draft")):
         directory = Path(base["protocol"][name])
         files = [
             p for p in directory.rglob("*") if p.is_file() and ".git" not in p.parts
@@ -177,7 +184,11 @@ def execution_binding(base):
         ),
         "files": records,
         "models": models,
-        "model_scope": "Metadata/content and shard filesystem/header identity; actual selected materialized weight bytes are hashed in the real capture.",
+        "model_scope": (
+            "No model or snapshot binding/loading in clock-only mode."
+            if clock_only
+            else "Metadata/content and shard filesystem/header identity; actual selected materialized weight bytes are hashed in the real capture."
+        ),
         "cache_scope": "Preexisting private artifacts are bound; runtime may append artifacts only within the declared private caches.",
     }
 
@@ -724,7 +735,115 @@ def cpu_check(snapshot, out, compile_only=False):
     return result
 
 
+def clock_protocol(out):
+    tool = Path("/opt/rocm/lib/rocprofiler-sdk/librocprofiler-sdk-tool.so")
+    sdk = Path("/opt/rocm/lib/librocprofiler-sdk.so")
+    return {
+        "body_ms": 0.5,
+        "guard_ms": [1, 1, 2, 2],
+        "body_replay_ordinals": [0, 1, 2, 3, 4],
+        "module_api_count": 6,
+        "dispatch_count": 10,
+        "max_measured_rows": 64,
+        "cohorts": ["untraced", "traced"],
+        "pci_bdfs": [
+            f"0000:{bus}:00.0"
+            for bus in ("05", "15", "65", "75", "85", "95", "e5", "f5")
+        ],
+        "hsa_timestamp_frequency_hz": 10**9,
+        "profiler_environment": {
+            "ROCPROFILER_CI_STRICT_TIMESTAMPS": "1",
+            "ROCPROFILER_CI_FREQ_SCALE_TIMESTAMPS": "0",
+        },
+        "profiler_tool_library": str(tool.resolve()),
+        "profiler_loaded_libraries": [str(tool.resolve()), str(sdk.resolve())],
+        "profiler_files": ["/opt/rocm/bin/rocprofv3", str(tool), str(sdk)],
+        "profiler_command": [
+            "/opt/rocm/bin/rocprofv3",
+            "--kernel-trace",
+            "--hip-trace",
+            "--output-format",
+            "json",
+            "--output-directory",
+            str(out / "data/traced/profiler"),
+            "--output-file",
+            "clock-%pid%",
+            "--log-level",
+            "warning",
+        ],
+        "lineage": "One priming module dispatch, one capture-definition module API without dispatch, five graph body dispatches and four measured module guards. Join PID/native TID/raw graphExec/raw stream/API ordinal/internal correlation exactly.",
+        "scope": "Required clock lineage and all visible loss/repair diagnostics; unrelated unmodelled records retained without a whole-export zero-loss claim.",
+        "stop": "First hard content/tick/order/submission/trace/ownership/deadline error stops subsequent observations/cohorts. Finite old E/B gate failures remain failed observations. Seal/review/stop after one set, including success.",
+        "interpretation": "B is first memrealtime through last loop read, excluding stores/return; K is dispatch processing/completion; E is unchanged graph event envelope. No tick alignment, overhead subtraction or physical attribution. Non-nesting, trace-only behavior, unmatched records and nonrecurrence remain unresolved.",
+    }
+
+
+def make_clock_plan(out):
+    base = json.loads(RECIPE.read_text())
+    head = subprocess.check_output(
+        ["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True
+    ).strip()
+    environment = {
+        key: value.replace("/app/k31-agent-team-private/task-6", str(PRIVATE))
+        for key, value in base["environment"].items()
+        if not key.startswith(
+            (
+                "K31_",
+                "ROCP",
+                "HSA_TOOLS",
+                "LD_PRELOAD",
+                "ATOM_PROFILER",
+                "AIPERF",
+                "LMCACHE",
+            )
+        )
+    }
+    environment.update(
+        PYTHONPATH=f"{HERE}:{ROOT}:{PRIVATE / 'aiter-572232d'}",
+        K31_K2_FRONT_WORKER_GRANT=head,
+        ATOM_MONO_COMPILE_INDEX=str(PRIVATE / "cache/mono-index"),
+        HF_MODULES_CACHE=str(PRIVATE / "cache/hf-modules"),
+        TIKTOKEN_CACHE_DIR=str(PRIVATE / "cache/tiktoken"),
+    )
+    paths = set((ROOT / "atom").rglob("*.py"))
+    paths.update(path for path in HERE.iterdir() if path.is_file())
+    paths.update(
+        capture.TOOLS / (name + ".py")
+        for name in (
+            "front_floor_timing_v2",
+            "front_floor_event_probe",
+            "run_front_floor_v2",
+        )
+    )
+    paths.update(
+        (
+            WS / "harness/common.py",
+            RECIPE,
+            Path("/opt/rocm/include/hip/hip_runtime_api.h"),
+        )
+    )
+    return {
+        "schema": 1,
+        "mode": CLOCK_MODE,
+        "head": head,
+        "base": base["base"],
+        "root": str(ROOT),
+        "output": str(out.resolve()),
+        "environment": environment,
+        "ports": [29675],
+        "gpu_ids": list(range(TP)),
+        "cpus": "0-111",
+        "max_job_seconds": 180,
+        "gpu_authorized_by_plan": False,
+        "clock_protocol": clock_protocol(out.resolve()),
+        "sources": {str(path): sha(path) for path in sorted(paths)},
+        "execution": execution_binding(base, clock_only=True),
+    }
+
+
 def make_plan(mode, out, snapshot=None, ready=None):
+    if mode == CLOCK_MODE:
+        return make_clock_plan(out)
     initialize_helpers()
     base = json.loads(RECIPE.read_text())
     head = subprocess.check_output(
@@ -849,9 +968,9 @@ def check_plan(plan, path, worker=False):
         )
     if not Path(plan["output"]).resolve().is_relative_to(PRIVATE / "runs"):
         raise RuntimeError("output must be in the task's private run directory")
-    if plan["mode"] not in ("capture", "timing") or plan["max_job_seconds"] != (
-        900 if plan["mode"] == "capture" else 180
-    ):
+    if plan["mode"] not in ("capture", "timing", CLOCK_MODE) or plan[
+        "max_job_seconds"
+    ] != (900 if plan["mode"] == "capture" else 180):
         raise RuntimeError("unexpected mode or bound")
     if (
         plan["head"]
@@ -865,9 +984,19 @@ def check_plan(plan, path, worker=False):
     ).strip():
         raise RuntimeError("source is not clean")
     if worker and any(
-        os.environ.get(name) != value for name, value in plan["environment"].items()
+        os.environ.get(name) != value
+        for name, value in plan["environment"].items()
+        if not (plan["mode"] == CLOCK_MODE and name == "LD_LIBRARY_PATH")
     ):
         raise RuntimeError("worker environment differs from the frozen plan")
+    if plan["mode"] == CLOCK_MODE:
+        if plan["clock_protocol"] != clock_protocol(Path(plan["output"])):
+            raise RuntimeError("clock protocol differs from fixed source")
+        if (
+            any(key in plan for key in ("snapshot", "model_args", "cache", "ready"))
+            or plan["execution"]["models"]
+        ):
+            raise RuntimeError("clock-only plan contains model/snapshot work")
     verify_binding(plan["execution"])
     for name, expected in plan["sources"].items():
         if sha(Path(name)) != expected:
@@ -881,6 +1010,718 @@ def check_plan(plan, path, worker=False):
         "LD_PRELOAD", ""
     ):
         raise RuntimeError("GPU job cannot run under the CPU guard")
+
+
+def clock_remaining():
+    remaining = (int(os.environ["K31_CLOCK_DEADLINE_NS"]) - time.monotonic_ns()) / 1e9
+    if remaining <= 0:
+        raise TimeoutError("absolute clock-diagnostic deadline exceeded")
+    return remaining
+
+
+def clock_controls(row, body_start, body_end, body_ticks):
+    module = capture.helper("front_floor_timing_v2")
+    body_us = (body_end - body_start) * 1000 / row["wall_khz"]
+    result = {
+        **row,
+        "body_start_tick": body_start,
+        "body_end_tick": body_end,
+        "body_us": body_us,
+    }
+    gate = module.trial_gate([{**row, "rank": 0}], world_size=1)
+    result["local_submission_gate"] = gate
+    result["original_event_gate"] = row["us"] + 5 >= body_us and row[
+        "us"
+    ] <= body_us + max(50, body_us * 0.10)
+    if (
+        body_end - body_start < body_ticks
+        or body_start < row["guard_end_tick"]
+        or not gate["valid"]
+    ):
+        return result, "clock content/order/submission prerequisite failed"
+    return result, None
+
+
+def clock_identity(device, plan, cohort):
+    hip = ctypes.CDLL("/opt/rocm/lib/libamdhip64.so")
+    hip.hipDeviceGetPCIBusId.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+    hip.hipDeviceGetPCIBusId.restype = ctypes.c_int
+    address = ctypes.create_string_buffer(32)
+    hip_status = hip.hipDeviceGetPCIBusId(address, len(address), device)
+    hsa = ctypes.CDLL("/opt/rocm/lib/libhsa-runtime64.so")
+    hsa.hsa_system_get_info.argtypes = [ctypes.c_int, ctypes.c_void_p]
+    hsa.hsa_system_get_info.restype = ctypes.c_int
+    frequency = ctypes.c_uint64()
+    hsa_status = hsa.hsa_system_get_info(3, ctypes.byref(frequency))
+    loaded = {
+        str(Path(line.split(None, 5)[5].strip()).resolve())
+        for line in Path("/proc/self/maps").read_text().splitlines()
+        if len(line.split(None, 5)) == 6 and "librocprofiler-sdk" in line
+    }
+    return {
+        "pid": os.getpid(),
+        "native_tid": threading.get_native_id(),
+        "device": device,
+        "pci_bus_id": address.value.decode("ascii", errors="backslashreplace"),
+        "hip_pci_status": hip_status,
+        "hsa_frequency_status": hsa_status,
+        "hsa_timestamp_frequency_hz": frequency.value,
+        "loaded_profiler_libraries": sorted(loaded),
+        "profiler_environment": {
+            key: value
+            for key, value in os.environ.items()
+            if key.startswith(("ROCP", "HSA_TOOLS"))
+            or key in ("LD_PRELOAD", "LD_LIBRARY_PATH")
+        },
+    }
+
+
+def validate_clock_identity(identity, plan, cohort):
+    protocol = plan["clock_protocol"]
+    if (
+        identity["hip_pci_status"]
+        or identity["pci_bus_id"].lower() not in protocol["pci_bdfs"]
+    ):
+        raise RuntimeError(
+            "HIP PCI device identity unavailable or outside the fixed set"
+        )
+    if (
+        identity["hsa_frequency_status"]
+        or identity["hsa_timestamp_frequency_hz"]
+        != protocol["hsa_timestamp_frequency_hz"]
+    ):
+        raise RuntimeError("HSA timebase differs from the qualified mapping")
+    loaded = set(identity["loaded_profiler_libraries"])
+    expected = set(protocol["profiler_loaded_libraries"])
+    env = identity["profiler_environment"]
+    libraries = lambda value: {str(Path(p).resolve()) for p in value.split(":") if p}
+    if cohort == "traced":
+        if (
+            loaded != expected
+            or libraries(env.get("LD_PRELOAD", "")) != expected
+            or libraries(env.get("ROCP_TOOL_LIBRARIES", ""))
+            != {protocol["profiler_tool_library"]}
+        ):
+            raise RuntimeError(
+                "profiler loader mapping differs from the declared cohort"
+            )
+        for key, value in protocol["profiler_environment"].items():
+            if env.get(key) != value:
+                raise RuntimeError("strict profiler timestamp environment differs")
+        for key in (
+            "ROCPROF_HIP_RUNTIME_API_TRACE",
+            "ROCPROF_HIP_COMPILER_API_TRACE",
+            "ROCPROF_KERNEL_TRACE",
+        ):
+            if env.get(key) != "1":
+                raise RuntimeError("required profiler trace domain disabled")
+        if any(
+            value not in ("0", "")
+            for key, value in env.items()
+            if key.endswith("_TRACE")
+            and key
+            not in (
+                "ROCPROF_HIP_RUNTIME_API_TRACE",
+                "ROCPROF_HIP_COMPILER_API_TRACE",
+                "ROCPROF_KERNEL_TRACE",
+            )
+        ):
+            raise RuntimeError("unexpected profiler trace domain")
+    elif loaded or any(value for key, value in env.items() if key != "LD_LIBRARY_PATH"):
+        raise RuntimeError("untraced cohort inherited profiling settings")
+    if libraries(env.get("LD_LIBRARY_PATH", "")) != libraries(
+        plan["environment"]["LD_LIBRARY_PATH"]
+    ):
+        raise RuntimeError("runtime library search path differs")
+
+
+def clock_mapping(records, plan, expected=None):
+    actual = [record["pci_bus_id"].lower() for record in records]
+    if (
+        len(actual) != TP
+        or set(actual) != set(plan["clock_protocol"]["pci_bdfs"])
+        or (expected is not None and actual != expected)
+    ):
+        raise RuntimeError("clock cohort ordinal/BDF bijection differs")
+    return actual
+
+
+def clock_live_check(plan, cohort):
+    clock_remaining()
+    if cohort == "traced":
+        directory = Path(plan["output"]) / "data" / cohort
+        clock_trace_logs(
+            directory / "worker.log",
+            list((directory / "profiler").glob("clock-*_results.json")),
+            live=True,
+        )
+
+
+def clock_observations(timer, graph, body, report, plan, cohort, dist, out):
+    for ordinal in range(1, 5):
+        error = None
+        try:
+            clock_live_check(plan, cohort)
+        except Exception as failure:  # noqa: BLE001
+            error = repr(failure)
+        errors = [None] * TP
+        dist.all_gather_object(errors, error)
+        if any(errors):
+            raise RuntimeError("clock pre-observation failure: " + repr(errors))
+        record = {
+            "body_replay_ordinal": ordinal,
+            "delay_scale": 1 if ordinal <= 2 else 2,
+            "trial": (ordinal - 1) % 2,
+        }
+        try:
+            row = timer.measure(graph, record["delay_scale"])
+            start, end = map(int, body.cpu().tolist())
+            checked, problem = clock_controls(row, start, end, report["body_ticks"])
+            record.update(checked)
+            if problem:
+                raise RuntimeError(problem)
+            clock_live_check(plan, cohort)
+        except Exception as failure:  # noqa: BLE001
+            error = repr(failure)
+            record["hard_failure"] = error
+            record = {
+                key: (
+                    repr(value)
+                    if isinstance(value, float) and not math.isfinite(value)
+                    else value
+                )
+                for key, value in record.items()
+            }
+        report["rows"].append(record)
+        save(out / f"rank{report['rank']}.json", report)
+        dist.all_gather_object(errors, error)
+        if any(errors):
+            raise RuntimeError(
+                "clock cohort stopped after hard failure: " + repr(errors)
+            )
+
+
+def clock_rank_main(rank, plan, cohort):
+    import torch
+    import torch.distributed as dist
+
+    clock_remaining()
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+    torch.cuda.set_device(rank)
+    if torch.cuda.device_count() != TP:
+        raise RuntimeError("clock diagnostic requires all eight existing mappings")
+    dist.init_process_group(
+        "gloo",
+        init_method="tcp://127.0.0.1:29675",
+        rank=rank,
+        world_size=TP,
+        timeout=timedelta(seconds=min(30, clock_remaining())),
+    )
+    sys.path.append(str(capture.TOOLS))
+    module = capture.helper("front_floor_timing_v2")
+    out = Path(plan["output"]) / "data" / cohort
+    report = {
+        "state": "STARTED",
+        "scope": CLOCK_MODE,
+        "rank": rank,
+        "cohort": cohort,
+        "rows": [],
+    }
+    stream = torch.cuda.Stream(device=torch.device("cuda", rank))
+    stream.wait_stream(torch.cuda.current_stream())
+    torch.cuda.set_stream(stream)
+    try:
+        report.update(clock_identity(rank, plan, cohort))
+        validate_clock_identity(report, plan, cohort)
+        identities = [None] * TP
+        dist.all_gather_object(identities, report)
+        expected = None
+        if cohort == "traced":
+            expected = json.loads(
+                (Path(plan["output"]) / "data/untraced/mapping.json").read_text()
+            )
+        clock_mapping(identities, plan, expected)
+        clock_live_check(plan, cohort)
+        timer = module.Timer(rank, stream, rank)
+        body = torch.empty_like(timer.guard)
+        ticks = max(1, math.ceil(timer.rate * 0.5))
+        graph = torch.cuda.CUDAGraph(keep_graph=True)
+        graph.enable_debug_mode()
+        with torch.cuda.graph(graph, stream=stream):
+            timer.run(timer.delay, body.data_ptr(), ticks, stream)
+        graph.debug_dump(str(out / f"clock-rank{rank}.dot"))
+        report["graph"] = module.verify_single_kernel_graph(graph)
+        graph.instantiate()
+        report.update(
+            graph_exec=int(graph.raw_cuda_graph_exec()),
+            stream_handle=int(stream.cuda_stream),
+            body_ticks=ticks,
+            wall_khz=timer.rate,
+            graph_dot_sha256=sha(out / f"clock-rank{rank}.dot"),
+        )
+        graph.replay()
+        stream.synchronize()
+        report["body_warmup_ordinal"] = 0
+        dist.barrier()
+        clock_observations(timer, graph, body, report, plan, cohort, dist, out)
+        report["state"] = "COMPLETE"
+        report["original_event_gate_failures"] = sum(
+            not row["original_event_gate"] for row in report["rows"]
+        )
+        report["meaning"] = (
+            "Fixed observation set complete; failed old event gates stay failed and never authorize K2."
+        )
+        clock_remaining()
+    except BaseException as failure:
+        report.update(state="FAILED", error=repr(failure))
+        raise
+    finally:
+        save(out / f"rank{rank}.json", report)
+        dist.destroy_process_group()
+
+
+def trace_uint(value, zero=False):
+    if type(value) is not int or not (0 if zero else 1) <= value < 2**64:
+        raise ValueError("invalid integral trace identity/timestamp")
+    return value
+
+
+def trace_pointer(value):
+    if type(value) is not str or not re.fullmatch(r"0|0x[0-9a-f]+", value):
+        raise ValueError("unsupported raw pointer representation")
+    return int(value, 16)
+
+
+def clock_trace_logs(path, allowed_outputs=(), live=False):
+    text = Path(path).read_text(errors="strict")
+    text = re.sub(r"\x1b\[[0-9;]*m", "", text)
+    lines = text.splitlines()
+    if live and text and not text.endswith("\n"):
+        lines = lines[:-1]
+    for line in lines:
+        if re.search(
+            r"dropping record|dropped.{0,20}record|lost.{0,20}record|swapping the values|cannot offload buffer|cannot read tmp file|buffer is not empty after offload",
+            line,
+            re.IGNORECASE,
+        ):
+            raise RuntimeError("profiler loss/repair diagnostic: " + line)
+        if re.match(r"[WEF][0-9]{4,8}\s", line) or re.search(
+            r"(?<![A-Za-z])(?:WARNING|ERROR|FATAL)(?:\s|:)", line
+        ):
+            if re.match(
+                r"E[0-9]{4,8} .*output_stream\.cpp:[0-9]+\] Opened result file: ", line
+            ) and any(
+                line.endswith(
+                    (
+                        "Opened result file: " + str(p),
+                        'Opened result file: "' + str(p) + '"',
+                    )
+                )
+                for p in allowed_outputs
+            ):
+                continue
+            raise RuntimeError("unqualified profiler diagnostic: " + line)
+
+
+def trace_operation(document, record):
+    kind, operation = trace_uint(record["kind"], True), trace_uint(
+        record["operation"], True
+    )
+    names = document["strings"]["buffer_records"]
+    return names[kind]["kind"], names[kind]["operations"][operation]
+
+
+def trace_args(record):
+    entries = record["args"]
+    if type(entries) is not list or len({x["name"] for x in entries}) != len(entries):
+        raise ValueError("missing/duplicate API arguments")
+    if any(type(x[k]) is not str for x in entries for k in ("type", "name", "value")):
+        raise ValueError("invalid API argument schema")
+    return {x["name"]: x["value"] for x in entries}
+
+
+def trace_inventory(document, report):
+    if trace_uint(document["metadata"]["pid"]) != report["pid"]:
+        raise ValueError("trace PID differs")
+    apis = document["buffer_records"]["hip_api"]
+    kernels = document["buffer_records"]["kernel_dispatch"]
+    api_ids, dispatch_ids = [], []
+    for record in [*apis, *kernels]:
+        start = trace_uint(record["start_timestamp"])
+        end = trace_uint(record["end_timestamp"])
+        if end < start:
+            raise ValueError("reversed trace timestamp")
+        trace_uint(record["thread_id"])
+        trace_uint(record["correlation_id"]["internal"])
+        trace_uint(record["stream_id"]["handle"], True)
+    for record in apis:
+        api_ids.append(record["correlation_id"]["internal"])
+    for record in kernels:
+        dispatch_ids.append(trace_uint(record["dispatch_info"]["dispatch_id"]))
+    if len(set(api_ids)) != len(api_ids) or len(set(dispatch_ids)) != len(dispatch_ids):
+        raise ValueError("duplicate API/dispatch identity")
+    graph_calls, module_calls = [], []
+    for api in apis:
+        kind, operation = trace_operation(document, api)
+        if operation.startswith(("hipGraphLaunch", "hipModuleLaunchKernel")):
+            if kind != "HIP_RUNTIME_API_EXT" or operation not in (
+                "hipGraphLaunch",
+                "hipModuleLaunchKernel",
+            ):
+                raise ValueError("unexpected required API domain/variant")
+            args = trace_args(api)
+            if (
+                api["thread_id"] != report["native_tid"]
+                or trace_uint(api["retval"]["uint64_t_retval"], True) != 0
+            ):
+                raise ValueError("required API thread/result differs")
+            if trace_pointer(args["stream"]) != trace_uint(report["stream_handle"]):
+                raise ValueError("required raw stream handle differs")
+            if operation == "hipGraphLaunch":
+                if set(args) != {"graphExec", "stream"} or trace_pointer(
+                    args["graphExec"]
+                ) != trace_uint(report["graph_exec"]):
+                    raise ValueError("graph handle/argument schema differs")
+                graph_calls.append(api)
+            else:
+                required = {
+                    "func",
+                    "gridDimX",
+                    "gridDimY",
+                    "gridDimZ",
+                    "blockDimX",
+                    "blockDimY",
+                    "blockDimZ",
+                    "sharedMemBytes",
+                    "stream",
+                    "kernelParams",
+                    "extra",
+                }
+                if set(args) != required or not trace_pointer(args["func"]):
+                    raise ValueError("module function/argument schema differs")
+                for name in (
+                    "gridDimX",
+                    "gridDimY",
+                    "gridDimZ",
+                    "blockDimY",
+                    "blockDimZ",
+                ):
+                    if args[name] != "1":
+                        raise ValueError("module launch geometry differs")
+                if args["blockDimX"] != "64" or args["sharedMemBytes"] != "0":
+                    raise ValueError("module launch block/shared memory differs")
+                module_calls.append(api)
+    relevant = []
+    for dispatch in kernels:
+        info = dispatch["dispatch_info"]
+        kid = trace_uint(info["kernel_id"])
+        symbol = document["kernel_symbols"][kid]
+        if trace_uint(symbol["kernel_id"]) != kid or not symbol["kernel_name"]:
+            raise ValueError("kernel symbol entity differs")
+        if symbol["formatted_kernel_name"] == "delay_0":
+            if (
+                trace_operation(document, dispatch)
+                != ("KERNEL_DISPATCH", "KERNEL_DISPATCH_COMPLETE")
+                or dispatch["operation"] != 2
+            ):
+                raise ValueError("not a completed kernel dispatch")
+            if (
+                dispatch["thread_id"] != report["native_tid"]
+                or dispatch["end_timestamp"] <= dispatch["start_timestamp"]
+            ):
+                raise ValueError("clock thread/timestamp differs")
+            if info["workgroup_size"] != {"x": 64, "y": 1, "z": 1} or info[
+                "grid_size"
+            ] != {"x": 64, "y": 1, "z": 1}:
+                raise ValueError("clock dispatch geometry differs")
+            agent_id = trace_uint(info["agent_id"]["handle"])
+            agents = [
+                agent
+                for agent in document["agents"]
+                if agent["id"]["handle"] == agent_id
+            ]
+            if len(agents) != 1:
+                raise ValueError("unknown/duplicate dispatch agent")
+            agent = agents[0]
+            location = trace_uint(agent["location_id"], True)
+            domain = trace_uint(agent["domain"], True)
+            bdf = f"{domain:04x}:{location >> 8:02x}:{(location >> 3) & 31:02x}.{location & 7:x}"
+            if (
+                location > 65535
+                or domain > 65535
+                or bdf != report["pci_bus_id"].lower()
+            ):
+                raise ValueError("dispatch physical device differs")
+            trace_uint(info["queue_id"]["handle"])
+            relevant.append(dispatch)
+    if len(graph_calls) != 5 or len(module_calls) != 6 or len(relevant) != 10:
+        raise ValueError("required five-body/five-guard/six-module ledger incomplete")
+    if (
+        len({kernel["dispatch_info"]["queue_id"]["handle"] for kernel in relevant}) != 1
+        or len({kernel["dispatch_info"]["kernel_id"] for kernel in relevant}) != 1
+    ):
+        raise ValueError("clock dispatches changed queue/kernel")
+    if len({trace_pointer(trace_args(api)["func"]) for api in module_calls}) != 1:
+        raise ValueError("module function identity changed")
+    if [row["body_replay_ordinal"] for row in report["rows"]] != [1, 2, 3, 4] or report[
+        "body_warmup_ordinal"
+    ] != 0:
+        raise ValueError("worker body ordinal ledger differs")
+    cid = lambda record: record["correlation_id"]["internal"]
+    graphs, modules = sorted(graph_calls, key=cid), sorted(module_calls, key=cid)
+    ledger = [modules[0], modules[1], graphs[0]]
+    for guard, body in zip(modules[2:], graphs[1:]):
+        ledger.extend((guard, body))
+    if ledger != sorted(ledger, key=cid) or any(
+        a["end_timestamp"] > b["start_timestamp"] for a, b in pairwise(ledger)
+    ):
+        raise ValueError("required API call ordinal/order differs")
+    matched = {}
+    for api in ledger:
+        children = [kernel for kernel in kernels if cid(kernel) == cid(api)]
+        if api is modules[1]:
+            if children:
+                raise ValueError("capture-definition API unexpectedly dispatched")
+            continue
+        if len(children) != 1 or children[0] not in relevant:
+            raise ValueError("missing/duplicate/extra required correlation dispatch")
+        kernel = children[0]
+        if api["stream_id"]["handle"] != kernel["stream_id"]["handle"]:
+            raise ValueError("API/dispatch SDK stream differs")
+        matched[cid(api)] = kernel
+    ordered = list(matched.values())
+    if len({cid(kernel) for kernel in relevant}) != 10 or ordered != sorted(
+        relevant, key=lambda k: k["dispatch_info"]["dispatch_id"]
+    ):
+        raise ValueError("clock dispatch correlation/order differs")
+    return graphs, modules, matched, relevant
+
+
+def load_clock_json(path):
+    def pairs(entries):
+        result = {}
+        for key, value in entries:
+            if key in result:
+                raise ValueError("duplicate trace JSON key")
+            result[key] = value
+        return result
+
+    def constant(value):
+        raise ValueError("nonfinite trace JSON value: " + value)
+
+    return json.loads(
+        Path(path).read_text(), object_pairs_hook=pairs, parse_constant=constant
+    )
+
+
+def validate_clock_trace(plan, reports, directory):
+    """Check complete required lineage; row B/K/E analysis stays after release."""
+    by_pid = {trace_uint(row["pid"]): row for row in reports}
+    if len(by_pid) != TP:
+        raise ValueError("missing/duplicate traced worker PID")
+    documents, seen = {}, set()
+    files = sorted((Path(directory) / "profiler").glob("*_results.json"))
+    for path in files:
+        if path.stat().st_size > 128 << 20:
+            raise ValueError("unexpected trace export size")
+        processes = load_clock_json(path)["rocprofiler-sdk-tool"]
+        if type(processes) is not list or len(processes) != 1:
+            raise ValueError("unexpected trace process schema")
+        document = processes[0]
+        pid = trace_uint(document["metadata"]["pid"])
+        if path.name != f"clock-{pid}_results.json" or pid in seen:
+            raise ValueError("trace output/PID identity differs")
+        seen.add(pid)
+        if pid in by_pid:
+            validate_clock_identity(by_pid[pid], plan, "traced")
+            trace_inventory(document, by_pid[pid])
+            documents[pid] = document
+        elif document["buffer_records"]["kernel_dispatch"]:
+            raise ValueError("unmodelled GPU work in a non-worker trace")
+    clock_trace_logs(Path(directory) / "worker.log", files)
+    if set(documents) != set(by_pid):
+        raise ValueError("missing worker trace export")
+    return documents
+
+
+def join_clock_trace(document, report):
+    graphs, modules, matched, relevant = trace_inventory(document, report)
+    rows = []
+    for sample, api in zip(report["rows"], graphs[1:]):
+        dispatch = matched[api["correlation_id"]["internal"]]
+        k_ns = dispatch["end_timestamp"] - dispatch["start_timestamp"]
+        k_us = k_ns / 1000
+        rows.append(
+            {
+                **sample,
+                "graph_api": api,
+                "dispatch": dispatch,
+                "K_ns": k_ns,
+                "K_us": k_us,
+                "K_minus_B_us": k_us - sample["body_us"],
+                "E_minus_K_us": sample["us"] - k_us,
+                "nested_durations": sample["body_us"] <= k_us <= sample["us"],
+            }
+        )
+    return {
+        "rows": rows,
+        "warmup_dispatch": matched[graphs[0]["correlation_id"]["internal"]],
+        "capture_definition_api": modules[1],
+        "guard_dispatches": [
+            matched[api["correlation_id"]["internal"]]
+            for api in [modules[0], *modules[2:]]
+        ],
+        "unmodelled_dispatches": [
+            kernel
+            for kernel in document["buffer_records"]["kernel_dispatch"]
+            if kernel not in relevant
+        ],
+        "completeness_scope": "Independent required clock lineage and visible loss diagnostics; no whole-export zero-loss certificate.",
+    }
+
+
+def analyze_clock(plan, path, target):
+    out = Path(plan["output"])
+    contract = load_clock_json(out / "contract.json")
+    if (
+        contract.get("mode") != CLOCK_MODE
+        or contract.get("head") != plan["head"]
+        or contract.get("clock_plan_sha256") != sha(path)
+        or contract.get("state") != "COMPLETE"
+        or contract.get("cleanup_status") != "released"
+        or not contract.get("gpu_released")
+        or not contract.get("stopped")
+        or contract.get("alive") != []
+        or contract["after"].get("owned_identity_or_group_unknown")
+        or not whole_node_idle(contract["after"])
+    ):
+        raise RuntimeError(
+            "offline analysis requires exact-plan completed owned release"
+        )
+    if contract["workload_elapsed_seconds"] >= 180:
+        raise RuntimeError("late set cannot be analyzed as completed")
+    records = [load_clock_json(out / "data" / f"rank{rank}.json") for rank in range(TP)]
+    untraced = [record["cohorts"]["untraced"] for record in records]
+    traced = [record["cohorts"]["traced"] for record in records]
+    clock_mapping(traced, plan, clock_mapping(untraced, plan))
+    documents = validate_clock_trace(plan, traced, out / "data/traced")
+    result = {
+        "state": "CLOCK_BOUNDARIES_JOINED_AFTER_RELEASE",
+        "plan_sha256": sha(path),
+        "contract_sha256": sha(out / "contract.json"),
+        "inputs": {
+            str(p.relative_to(out)): sha(p)
+            for p in sorted((out / "data").rglob("*"))
+            if p.is_file()
+        },
+        "untraced": untraced,
+        "traced": [
+            join_clock_trace(documents[record["pid"]], record) for record in traced
+        ],
+        "interpretation": plan["clock_protocol"]["interpretation"],
+        "K2_executed": False,
+        "next": "Seal/review/stop; no method adoption or automatic continuation.",
+    }
+    with Path(target).open("x") as output:
+        json.dump(result, output, indent=2, allow_nan=False)
+    return result
+
+
+def clock_driver(plan, path):
+    """Run the two fixed cohorts; full B/K/E joining is an offline operation."""
+    out = Path(plan["output"]) / "data"
+    out.mkdir(parents=True, exist_ok=False)
+    reports = {}
+    for cohort in ("untraced", "traced"):
+        clock_remaining()
+        directory = out / cohort
+        directory.mkdir()
+        command = [
+            "/opt/venv/bin/python",
+            str(HERE / "replay.py"),
+            "--clock-cohort",
+            cohort,
+            "--plan",
+            str(path),
+        ]
+        if cohort == "traced":
+            command = [*plan["clock_protocol"]["profiler_command"], "--", *command]
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith(("ROCP", "HSA_TOOLS")) and key != "LD_PRELOAD"
+        }
+        if cohort == "traced":
+            environment.update(plan["clock_protocol"]["profiler_environment"])
+        clock_remaining()
+        with (directory / "worker.log").open("x") as log:
+            process = subprocess.Popen(
+                command, stdout=log, stderr=subprocess.STDOUT, env=environment
+            )
+            save(
+                directory / "launch.json",
+                {
+                    "pid": process.pid,
+                    "command": command,
+                    "started_ns": time.monotonic_ns(),
+                },
+            )
+            while True:
+                clock_live_check(plan, cohort)
+                if process.poll() is not None:
+                    break
+                time.sleep(min(0.1, clock_remaining()))
+            clock_remaining()
+            if process.returncode:
+                raise RuntimeError(f"{cohort} diagnostic exited {process.returncode}")
+        records = [
+            json.loads((directory / f"rank{rank}.json").read_text())
+            for rank in range(TP)
+        ]
+        if any(
+            r["state"] != "COMPLETE" or r["rank"] != rank or len(r["rows"]) != 4
+            for rank, r in enumerate(records)
+        ):
+            raise RuntimeError("incomplete clock observation set")
+        for record in records:
+            validate_clock_identity(record, plan, cohort)
+        expected = (
+            None
+            if cohort == "untraced"
+            else [record["pci_bus_id"].lower() for record in reports["untraced"]]
+        )
+        mapping = clock_mapping(records, plan, expected)
+        save(directory / "mapping.json", mapping)
+        reports[cohort] = records
+        if cohort == "traced":
+            # Strict schema/loss checks run here; same-invocation joining stays offline.
+            validate_clock_trace(plan, records, directory)
+        clock_remaining()
+    for rank in range(TP):
+        save(
+            out / f"rank{rank}.json",
+            {
+                "state": "COMPLETE",
+                "rank": rank,
+                "scope": CLOCK_MODE,
+                "cohorts": {name: records[rank] for name, records in reports.items()},
+            },
+        )
+    clock_remaining()
+    save(
+        out / "clock-set.json",
+        {
+            "state": "OBSERVATION_SET_COMPLETE",
+            "rows": 64,
+            "K2_executed": False,
+            "elapsed_seconds": (
+                time.monotonic_ns() - int(os.environ["K31_CLOCK_STARTED_NS"])
+            )
+            / 1e9,
+        },
+    )
+    clock_remaining()
 
 
 def whole_node_idle(snapshot):
@@ -1021,7 +1862,16 @@ def supervise(plan, path):
         if isinstance(n, ast.Import) and n.names[0].name == "psutil"
     )
     body = main.body[start:]
-    changes = {"environment": 0, "ports": 0, "grant": 0, "remember": 0, "signal": 0}
+    changes = {
+        "environment": 0,
+        "ports": 0,
+        "grant": 0,
+        "remember": 0,
+        "signal": 0,
+        "clock_start": 0,
+        "clock_poll": 0,
+        "clock_end": 0,
+    }
 
     class Plumbing(ast.NodeTransformer):
         def visit_FunctionDef(self, node):
@@ -1031,7 +1881,41 @@ def supervise(plan, path):
                 return node
             return self.generic_visit(node)
 
+        def visit_If(self, node):
+            if (
+                plan["mode"] == CLOCK_MODE
+                and ast.unparse(node.test) == "proc.poll() is not None"
+            ):
+                changes["clock_poll"] += 1
+                return [
+                    *ast.parse("check_absolute_clock()").body,
+                    self.generic_visit(node),
+                ]
+            return self.generic_visit(node)
+
         def visit_Assign(self, node):
+            if plan["mode"] == CLOCK_MODE:
+                target = ast.unparse(node.targets[0])
+                if (
+                    target == "proc"
+                    and isinstance(node.value, ast.Call)
+                    and ast.unparse(node.value.func) == "C.spawn"
+                ):
+                    changes["clock_start"] += 1
+                    return [
+                        *ast.parse("start_absolute_clock(env)").body,
+                        self.generic_visit(node),
+                    ]
+                if (
+                    target == "state['state']"
+                    and isinstance(node.value, ast.Constant)
+                    and node.value.value == "COMPLETE"
+                ):
+                    changes["clock_end"] += 1
+                    return [
+                        *ast.parse("check_absolute_clock()").body,
+                        self.generic_visit(node),
+                    ]
             if isinstance(node.targets[0], ast.Name) and node.targets[0].id == "env":
                 node.value = ast.parse('plan["environment"].copy()', mode="eval").body
                 changes["environment"] += 1
@@ -1070,6 +1954,9 @@ def supervise(plan, path):
         "grant": 1,
         "remember": 1,
         "signal": 1,
+        "clock_start": int(plan["mode"] == CLOCK_MODE),
+        "clock_poll": int(plan["mode"] == CLOCK_MODE),
+        "clock_end": int(plan["mode"] == CLOCK_MODE),
     }:
         raise RuntimeError("pinned supervisor shape changed")
     sys.path.insert(0, str(WS / "harness"))
@@ -1079,6 +1966,8 @@ def supervise(plan, path):
     command = [C.PYTHON, str(script), "--worker", "--plan", str(path)]
     env = dict(plan["environment"], K31_K2_FRONT_PLAN=str(path))
     actual = dict(plan, environment=env, command=command)
+    if plan["mode"] == CLOCK_MODE:
+        actual["clock_plan_sha256"] = sha(path)
     namespace = {
         "C": C,
         "os": os,
@@ -1098,6 +1987,35 @@ def supervise(plan, path):
         "HERE": HERE,
         "TREE": ROOT,
     }
+
+    def start_absolute_clock(env):
+        started = time.monotonic_ns()
+        deadline = started + plan["max_job_seconds"] * 10**9
+        namespace["clock_started_ns"], namespace["clock_deadline_ns"] = (
+            started,
+            deadline,
+        )
+        env.update(
+            K31_CLOCK_STARTED_NS=str(started), K31_CLOCK_DEADLINE_NS=str(deadline)
+        )
+        namespace["state"].update(
+            workload_started_ns=started, absolute_deadline_ns=deadline
+        )
+
+    def check_absolute_clock():
+        now = time.monotonic_ns()
+        namespace["state"]["workload_elapsed_seconds"] = (
+            now - namespace["clock_started_ns"]
+        ) / 1e9
+        if now >= namespace["clock_deadline_ns"]:
+            raise TimeoutError(
+                "absolute diagnostic bound exceeded; late completion is failure"
+            )
+
+    namespace.update(
+        start_absolute_clock=start_absolute_clock,
+        check_absolute_clock=check_absolute_clock,
+    )
     namespace["C"] = ownership_boundary(C, namespace)
     # Only the source-hash-bound local supervisor AST is executable here.
     exec(compile(module, str(original), "exec"), namespace)  # noqa: S102
@@ -1207,6 +2125,7 @@ def ownership_check():
                     patch("time.sleep", side_effect=Held),
                 ):
                     try:
+                        save(Path(directory) / "plan.json", plan)
                         supervise(plan, Path(directory) / "plan.json")
                     except Held:
                         held = True
@@ -1279,13 +2198,742 @@ def ownership_check():
     }
 
 
+def clock_trace_check():
+    from copy import deepcopy
+    from tempfile import TemporaryDirectory
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    report = {
+        "pid": 101,
+        "native_tid": 201,
+        "graph_exec": 0x123456789ABCDEF0,
+        "stream_handle": 0x2000,
+        "pci_bus_id": "0000:05:00.0",
+        "body_warmup_ordinal": 0,
+        "body_ticks": 50_000,
+        "rank": 0,
+        "rows": [
+            {"body_replay_ordinal": i, "body_us": 500.0, "us": 514.0}
+            for i in range(1, 5)
+        ],
+    }
+    document = {
+        "metadata": {"pid": 101},
+        "strings": {
+            "buffer_records": [
+                {
+                    "kind": "HIP_RUNTIME_API_EXT",
+                    "operations": ["hipGraphLaunch", "hipModuleLaunchKernel"],
+                },
+                {
+                    "kind": "KERNEL_DISPATCH",
+                    "operations": ["NONE", "ENQUEUE", "KERNEL_DISPATCH_COMPLETE"],
+                },
+            ]
+        },
+        "kernel_symbols": [
+            {"kernel_id": 0, "kernel_name": "", "formatted_kernel_name": "0"},
+            {
+                "kernel_id": 1,
+                "kernel_name": "delay_0",
+                "formatted_kernel_name": "delay_0",
+            },
+        ],
+        "agents": [{"id": {"handle": 9}, "domain": 0, "location_id": 0x500}],
+        "buffer_records": {"hip_api": [], "kernel_dispatch": []},
+    }
+    module_args = {
+        "func": "0x3000",
+        "gridDimX": "1",
+        "gridDimY": "1",
+        "gridDimZ": "1",
+        "blockDimX": "64",
+        "blockDimY": "1",
+        "blockDimZ": "1",
+        "sharedMemBytes": "0",
+        "stream": "0x2000",
+        "kernelParams": "0x4000",
+        "extra": "0",
+    }
+    for ordinal, operation in enumerate([1, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0], 1):
+        args = (
+            module_args
+            if operation
+            else {"graphExec": hex(report["graph_exec"]), "stream": "0x2000"}
+        )
+        api = {
+            "kind": 0,
+            "operation": operation,
+            "thread_id": 201,
+            "start_timestamp": ordinal * 1_000_000,
+            "end_timestamp": ordinal * 1_000_000 + 100,
+            "correlation_id": {"internal": ordinal, "ancestor": 0, "external": 0},
+            "stream_id": {"handle": 7},
+            "retval": {"uint64_t_retval": 0},
+            "args": [
+                {"type": "RTTI", "name": key, "value": value}
+                for key, value in args.items()
+            ],
+        }
+        document["buffer_records"]["hip_api"].append(api)
+        if ordinal != 2:
+            document["buffer_records"]["kernel_dispatch"].append(
+                {
+                    "kind": 1,
+                    "operation": 2,
+                    "thread_id": 201,
+                    "start_timestamp": ordinal * 1_000_000 + 100,
+                    "end_timestamp": ordinal * 1_000_000 + 501_100,
+                    "correlation_id": {
+                        "internal": ordinal,
+                        "ancestor": 0,
+                        "external": 0,
+                    },
+                    "stream_id": {"handle": 7},
+                    "dispatch_info": {
+                        "kernel_id": 1,
+                        "dispatch_id": ordinal,
+                        "agent_id": {"handle": 9},
+                        "queue_id": {"handle": 10},
+                        "workgroup_size": {"x": 64, "y": 1, "z": 1},
+                        "grid_size": {"x": 64, "y": 1, "z": 1},
+                    },
+                }
+            )
+    joined = join_clock_trace(document, report)
+    assert len(joined["rows"]) == 4 and joined["rows"][0]["K_minus_B_us"] == 1
+    assert joined["rows"][0]["E_minus_K_us"] == 13
+    assert trace_pointer("0x123456789abcdef0") == report["graph_exec"]
+    cases = []
+    changes = [
+        ("pid", ("metadata", "pid"), 102),
+        ("tid", ("buffer_records", "hip_api", 2, "thread_id"), 202),
+        ("graph", ("buffer_records", "hip_api", 2, "args", 0, "value"), "0x9999"),
+        ("raw_stream", ("buffer_records", "hip_api", 2, "args", 1, "value"), "0x9999"),
+        ("float_pointer", ("buffer_records", "hip_api", 2, "args", 0, "value"), 1.0),
+        ("retval", ("buffer_records", "hip_api", 2, "retval", "uint64_t_retval"), 1),
+        (
+            "bool_retval",
+            ("buffer_records", "hip_api", 2, "retval", "uint64_t_retval"),
+            False,
+        ),
+        ("invalid_time", ("buffer_records", "hip_api", 2, "end_timestamp"), 1),
+        ("float_time", ("buffer_records", "hip_api", 2, "end_timestamp"), 1.5),
+        (
+            "wrong_correlation",
+            ("buffer_records", "kernel_dispatch", 1, "correlation_id", "internal"),
+            99,
+        ),
+        (
+            "capture_dispatch",
+            ("buffer_records", "kernel_dispatch", 1, "correlation_id", "internal"),
+            2,
+        ),
+        (
+            "duplicate_correlation",
+            ("buffer_records", "kernel_dispatch", 1, "correlation_id", "internal"),
+            1,
+        ),
+        (
+            "duplicate_dispatch",
+            ("buffer_records", "kernel_dispatch", 1, "dispatch_info", "dispatch_id"),
+            1,
+        ),
+        (
+            "agent",
+            (
+                "buffer_records",
+                "kernel_dispatch",
+                1,
+                "dispatch_info",
+                "agent_id",
+                "handle",
+            ),
+            19,
+        ),
+        (
+            "queue",
+            (
+                "buffer_records",
+                "kernel_dispatch",
+                1,
+                "dispatch_info",
+                "queue_id",
+                "handle",
+            ),
+            19,
+        ),
+        (
+            "sdk_stream",
+            ("buffer_records", "kernel_dispatch", 1, "stream_id", "handle"),
+            19,
+        ),
+        (
+            "sdk_stream_type",
+            ("buffer_records", "kernel_dispatch", 1, "stream_id", "handle"),
+            "7",
+        ),
+        ("bdf", ("agents", 0, "location_id"), 0x1500),
+        ("symbol_hole", ("kernel_symbols", 1, "kernel_id"), 0),
+        (
+            "module_function",
+            ("buffer_records", "hip_api", 1, "args", 0, "value"),
+            "0x3333",
+        ),
+    ]
+    for name, path, value in changes:
+        changed = deepcopy(document)
+        target = changed
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = value
+        cases.append((name, changed, report))
+    for name, field, index, add in (
+        ("missing_dispatch", "kernel_dispatch", 1, False),
+        ("extra_dispatch", "kernel_dispatch", 1, True),
+        ("missing_graph_call", "hip_api", 2, False),
+        ("missing_capture_call", "hip_api", 1, False),
+        ("extra_graph_call", "hip_api", 2, True),
+    ):
+        changed = deepcopy(document)
+        records = changed["buffer_records"][field]
+        if add:
+            records.append(deepcopy(records[index]))
+        else:
+            records.pop(index)
+        cases.append((name, changed, report))
+    changed_report = deepcopy(report)
+    changed_report["rows"][2]["body_replay_ordinal"] = 4
+    cases.append(("ordinal_gap", document, changed_report))
+    rejected = []
+    for name, changed, record in cases:
+        try:
+            join_clock_trace(changed, record)
+        except (ValueError, KeyError, IndexError, TypeError):
+            rejected.append(name)
+        else:
+            raise AssertionError("invalid trace accepted: " + name)
+    with TemporaryDirectory() as directory:
+        path = Path(directory) / "fixture"
+        for text in ('{"x":1,"x":2}', '{"x":NaN}', '{"x":'):
+            path.write_text(text)
+            try:
+                load_clock_json(path)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("malformed/nonfinite/duplicate JSON accepted")
+        for text in (
+            "W1122 warning",
+            "E1122 error",
+            "Dropped 1 record",
+            "swapping the values",
+            "cannot offload buffer",
+        ):
+            path.write_text(text + "\n")
+            try:
+                clock_trace_logs(path)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("loss/error diagnostic accepted")
+        path.write_text("UserWarning: DEBUG: graph dump\n")
+        clock_trace_logs(path)
+        path.write_text(
+            "E1122 12:00:00 output_stream.cpp:123] Opened result file: /expected\n"
+        )
+        clock_trace_logs(path, ["/expected"])
+        measure_calls, check_calls = [], []
+        row = {
+            "rank": 0,
+            "clock_id": "cpu",
+            "t0_ns": 0,
+            "t1_ns": 40_000,
+            "wall_khz": 100_000,
+            "requested_ticks": 100_000,
+            "observed_ticks": 100_000,
+            "guard_start_tick": 0,
+            "guard_end_tick": 100_000,
+            "us": 570.0,
+        }
+        for case in (
+            "event_mismatch",
+            "content",
+            "order",
+            "submission",
+            "trace_after",
+            "trace_before",
+            "deadline",
+        ):
+            measure_calls.clear()
+            check_calls.clear()
+            sample = deepcopy(report)
+            sample["rows"] = []
+
+            def measure(graph, scale, case=case):
+                measure_calls.append(scale)
+                return {
+                    **row,
+                    "t1_ns": 900_000 if case == "submission" else row["t1_ns"],
+                }
+
+            def live(*args, case=case):
+                check_calls.append(True)
+                if (
+                    case in ("trace_before", "deadline")
+                    or case == "trace_after"
+                    and len(check_calls) == 2
+                ):
+                    raise RuntimeError(case)
+
+            ticks = (
+                [100_740, 150_739]
+                if case == "content"
+                else [99_999, 150_740] if case == "order" else [100_740, 150_740]
+            )
+            body = SimpleNamespace(
+                cpu=lambda ticks=ticks: SimpleNamespace(tolist=lambda: ticks)
+            )
+            dist = SimpleNamespace(
+                all_gather_object=lambda results, error: results.__setitem__(
+                    slice(None), [error] * TP
+                )
+            )
+            with patch.object(
+                sys.modules[__name__], "clock_live_check", side_effect=live
+            ):
+                try:
+                    clock_observations(
+                        SimpleNamespace(measure=measure),
+                        None,
+                        body,
+                        sample,
+                        {},
+                        "traced",
+                        dist,
+                        Path(directory),
+                    )
+                except RuntimeError:
+                    assert case != "event_mismatch"
+                else:
+                    assert case == "event_mismatch" and all(
+                        not r["original_event_gate"] for r in sample["rows"]
+                    )
+            assert len(measure_calls) == (
+                4
+                if case == "event_mismatch"
+                else 0 if case in ("trace_before", "deadline") else 1
+            )
+    driver_cases = clock_driver_check(document, report)
+    return {
+        "rejected_trace_cases": rejected,
+        "driver_and_release_cases": driver_cases,
+        "JSON_log_and_observation_stop_negatives": True,
+        "finite_event_mismatch_finishes_fixed_set": True,
+        "GPU_executed": False,
+    }
+
+
+def clock_driver_check(document, report):
+    from copy import deepcopy
+    from tempfile import TemporaryDirectory
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    outcomes = {}
+    for case in (
+        "complete",
+        "before_spawn",
+        "late_spawn",
+        "late_validation",
+        "hard_cohort",
+    ):
+        with TemporaryDirectory() as directory:
+            out = Path(directory)
+            plan = {
+                "mode": CLOCK_MODE,
+                "head": "cpu",
+                "output": str(out),
+                "environment": {"LD_LIBRARY_PATH": "/opt/rocm/lib"},
+                "clock_protocol": clock_protocol(out),
+            }
+            path = out / "plan.json"
+            save(path, plan)
+            now, launched = [0], []
+
+            def check(case=case, now=now):
+                if case == "before_spawn" or now[0] >= 180:
+                    raise TimeoutError("fixture deadline")
+                return 180 - now[0]
+
+            def popen(
+                command,
+                case=case,
+                now=now,
+                launched=launched,
+                plan=plan,
+                out=out,
+                **kwargs,
+            ):
+                cohort = command[command.index("--clock-cohort") + 1]
+                launched.append(cohort)
+                if case == "late_spawn":
+                    now[0] = 181
+                protocol = plan["clock_protocol"]
+                for rank, bdf in enumerate(protocol["pci_bdfs"]):
+                    record = deepcopy(report)
+                    record.update(
+                        state="COMPLETE",
+                        rank=rank,
+                        cohort=cohort,
+                        pid=101 + rank,
+                        native_tid=201,
+                        pci_bus_id=bdf,
+                        hip_pci_status=0,
+                        hsa_frequency_status=0,
+                        hsa_timestamp_frequency_hz=10**9,
+                        loaded_profiler_libraries=[],
+                        profiler_environment={"LD_LIBRARY_PATH": "/opt/rocm/lib"},
+                    )
+                    if cohort == "traced":
+                        record["loaded_profiler_libraries"] = protocol[
+                            "profiler_loaded_libraries"
+                        ]
+                        record["profiler_environment"].update(
+                            protocol["profiler_environment"],
+                            LD_PRELOAD=":".join(protocol["profiler_loaded_libraries"]),
+                            ROCP_TOOL_LIBRARIES=protocol["profiler_tool_library"],
+                            ROCPROF_HIP_RUNTIME_API_TRACE="1",
+                            ROCPROF_HIP_COMPILER_API_TRACE="1",
+                            ROCPROF_KERNEL_TRACE="1",
+                        )
+                        trace = deepcopy(document)
+                        trace["metadata"]["pid"] = record["pid"]
+                        trace["agents"][0]["location_id"] = (
+                            int(bdf.split(":")[1], 16) << 8
+                        )
+                        prof = out / "data/traced/profiler"
+                        prof.mkdir(exist_ok=True)
+                        save(
+                            prof / f"clock-{record['pid']}_results.json",
+                            {"rocprofiler-sdk-tool": [trace]},
+                        )
+                    save(out / "data" / cohort / f"rank{rank}.json", record)
+                return SimpleNamespace(
+                    pid=99, returncode=1 if case == "hard_cohort" else 0, poll=lambda: 0
+                )
+
+            original_validate = validate_clock_trace
+
+            def validate(
+                *args, original_validate=original_validate, case=case, now=now
+            ):
+                result = original_validate(*args)
+                if case == "late_validation":
+                    now[0] = 181
+                return result
+
+            with (
+                patch.object(
+                    sys.modules[__name__], "clock_remaining", side_effect=check
+                ),
+                patch.object(
+                    sys.modules[__name__], "validate_clock_trace", side_effect=validate
+                ),
+                patch("subprocess.Popen", side_effect=popen),
+                patch.dict(os.environ, {"K31_CLOCK_STARTED_NS": "0"}),
+                patch("time.monotonic_ns", side_effect=lambda now=now: now[0] * 10**9),
+            ):
+                try:
+                    clock_driver(plan, path)
+                except (RuntimeError, TimeoutError):
+                    assert case != "complete"
+                    outcomes[case] = "REJECTED"
+                else:
+                    assert case == "complete"
+                    outcomes[case] = "COMPLETE"
+            assert len(launched) == (
+                0
+                if case == "before_spawn"
+                else 1 if case in ("late_spawn", "hard_cohort") else 2
+            )
+            if case != "complete":
+                continue
+            released = {
+                "mode": CLOCK_MODE,
+                "head": "cpu",
+                "clock_plan_sha256": sha(path),
+                "state": "COMPLETE",
+                "cleanup_status": "released",
+                "gpu_released": True,
+                "stopped": True,
+                "alive": [],
+                "workload_elapsed_seconds": 10,
+                "after": {
+                    "owned_identity_or_group_unknown": False,
+                    "kfd_pids": [],
+                    "cards": {
+                        f"card{r}": {"used_gib": 0.277, "free_gib": 287.707}
+                        for r in range(8)
+                    },
+                },
+            }
+            for field, bad in (
+                ("gpu_released", False),
+                ("alive", [99]),
+                ("clock_plan_sha256", "wrong"),
+                ("workload_elapsed_seconds", 180),
+            ):
+                save(out / "contract.json", {**released, field: bad})
+                try:
+                    analyze_clock(plan, path, out / "analysis.json")
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError("analysis preceded qualified release")
+            save(out / "contract.json", released)
+            analyzed = analyze_clock(plan, path, out / "analysis.json")
+            assert sum(len(record["rows"]) for record in analyzed["traced"]) == 32
+            bad_mapping = [deepcopy(report)] * 8
+            try:
+                clock_mapping(bad_mapping, plan)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("non-bijective BDF mapping accepted")
+            original = [
+                {"pci_bus_id": bdf} for bdf in plan["clock_protocol"]["pci_bdfs"]
+            ]
+            try:
+                clock_mapping(original[::-1], plan, clock_mapping(original, plan))
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("cross-cohort ordinal mapping changed")
+    return outcomes
+
+
+def clock_source_check():
+    if "kfd-guard" not in os.environ.get("LD_PRELOAD", ""):
+        raise RuntimeError("clock CPU checks require no_gpu.sh")
+    from tempfile import TemporaryDirectory
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    row = {
+        "rank": 0,
+        "clock_id": "cpu",
+        "t0_ns": 0,
+        "t1_ns": 40_000,
+        "wall_khz": 100_000,
+        "requested_ticks": 100_000,
+        "observed_ticks": 100_000,
+        "guard_start_tick": 0,
+        "guard_end_tick": 100_000,
+        "us": 514.0,
+    }
+    good, error = clock_controls(row, 100_740, 150_740, 50_000)
+    assert error is None and good["original_event_gate"]
+    mismatch, error = clock_controls({**row, "us": 570.0}, 100_740, 150_740, 50_000)
+    assert error is None and not mismatch["original_event_gate"]
+    for changed, start, end in (
+        (row, 100_740, 150_739),
+        (row, 99_999, 149_999),
+        ({**row, "t1_ns": 900_000}, 100_740, 150_740),
+    ):
+        assert clock_controls(changed, start, end, 50_000)[1]
+    identity = {
+        "hip_pci_status": 0,
+        "pci_bus_id": "0000:05:00.0",
+        "hsa_frequency_status": 0,
+        "hsa_timestamp_frequency_hz": 10**9,
+        "loaded_profiler_libraries": ["/sdk", "/tool"],
+        "profiler_environment": {
+            "LD_LIBRARY_PATH": "/runtime",
+            "LD_PRELOAD": "/sdk:/tool",
+            "ROCP_TOOL_LIBRARIES": "/tool",
+            "ROCPROFILER_CI_STRICT_TIMESTAMPS": "1",
+            "ROCPROFILER_CI_FREQ_SCALE_TIMESTAMPS": "0",
+            "ROCPROF_HIP_RUNTIME_API_TRACE": "1",
+            "ROCPROF_HIP_COMPILER_API_TRACE": "1",
+            "ROCPROF_KERNEL_TRACE": "1",
+        },
+    }
+    protocol = {
+        "environment": {"LD_LIBRARY_PATH": "/runtime"},
+        "clock_protocol": {
+            "pci_bdfs": ["0000:05:00.0"],
+            "profiler_environment": {
+                "ROCPROFILER_CI_STRICT_TIMESTAMPS": "1",
+                "ROCPROFILER_CI_FREQ_SCALE_TIMESTAMPS": "0",
+            },
+            "hsa_timestamp_frequency_hz": 10**9,
+            "profiler_loaded_libraries": ["/sdk", "/tool"],
+            "profiler_tool_library": "/tool",
+        },
+    }
+    validate_clock_identity(identity, protocol, "traced")
+    for bad in (
+        {**identity, "hsa_timestamp_frequency_hz": 10**8},
+        {**identity, "hsa_frequency_status": 1},
+        {**identity, "loaded_profiler_libraries": []},
+        {**identity, "profiler_environment": {}},
+        {**identity, "hip_pci_status": 1},
+        {**identity, "pci_bus_id": "0000:ff:00.0"},
+    ):
+        try:
+            validate_clock_identity(bad, protocol, "traced")
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("invalid trace identity accepted")
+    sys.path.insert(0, str(WS / "harness"))
+    import common as original_common
+
+    outcomes = {}
+    for case in (
+        "on_time",
+        "late_exit",
+        "late_validation",
+        "negative_without_new_gate",
+    ):
+        with TemporaryDirectory() as directory:
+            out = Path(directory) / "result"
+            fd = os.open(Path(directory) / "lock", os.O_CREAT | os.O_RDWR, 0o600)
+            now = [0]
+            process = SimpleNamespace(
+                pid=19,
+                create_time=lambda: 1.0,
+                status=lambda: "zombie",
+                children=lambda recursive: [],
+            )
+            popen = SimpleNamespace(pid=19, returncode=0, poll=lambda: 0)
+
+            def spawn(*args, out=out, now=now, popen=popen, case=case, **kwargs):
+                (out / "data").mkdir()
+                for rank in range(8):
+                    save(
+                        out / "data" / f"rank{rank}.json",
+                        {"state": "COMPLETE", "rank": rank},
+                    )
+                now[0] = (
+                    181 if case in ("late_exit", "negative_without_new_gate") else 10
+                ) * 10**9
+                return popen
+
+            original_loads = json.loads
+
+            def loads(
+                value,
+                *args,
+                now=now,
+                case=case,
+                original_loads=original_loads,
+                **kwargs,
+            ):
+                result = original_loads(value, *args, **kwargs)
+                if (
+                    case == "late_validation"
+                    and isinstance(result, dict)
+                    and result.get("rank") == 7
+                ):
+                    now[0] = 181 * 10**9
+                return result
+
+            good_snapshot = {
+                "kfd_pids": [],
+                "cards": {
+                    f"card{r}": {"used_gib": 0.277, "free_gib": 287.707}
+                    for r in range(8)
+                },
+            }
+            common = SimpleNamespace(
+                PYTHON="cpu-fixture",
+                GpuLock=lambda fd=fd: SimpleNamespace(acquire=lambda: fd),
+                save_json=original_common.save_json,
+                now_iso=lambda: "cpu-fixture",
+                spawn=spawn,
+                assert_gpus_idle=lambda good_snapshot=good_snapshot: good_snapshot,
+                assert_ports_free=lambda ports: None,
+                wait_gpus_released=lambda timeout, good_snapshot=good_snapshot: (
+                    True,
+                    good_snapshot,
+                ),
+            )
+            psutil = SimpleNamespace(
+                Process=lambda pid, process=process: process,
+                process_iter=list,
+                NoSuchProcess=ProcessLookupError,
+                AccessDenied=PermissionError,
+                STATUS_ZOMBIE="zombie",
+            )
+            plan = {
+                "head": "cpu",
+                "mode": "clock_boundary",
+                "output": str(out),
+                "environment": {},
+                "gpu_ids": list(range(8)),
+                "ports": [],
+                "max_job_seconds": 180,
+            }
+            rejected = False
+            try:
+                with (
+                    patch.dict(sys.modules, {"common": common, "psutil": psutil}),
+                    patch.object(
+                        sys.modules[__name__], "check_plan", lambda *a, **k: None
+                    ),
+                    patch.object(
+                        sys.modules[__name__],
+                        "CLOCK_MODE",
+                        (
+                            "disabled"
+                            if case == "negative_without_new_gate"
+                            else "clock_boundary"
+                        ),
+                    ),
+                    patch("json.loads", side_effect=loads),
+                    patch("os.nice", return_value=0),
+                    patch("signal.signal"),
+                    patch("time.monotonic", return_value=0),
+                    patch("time.monotonic_ns", side_effect=lambda now=now: now[0]),
+                ):
+                    try:
+                        save(Path(directory) / "plan.json", plan)
+                        supervise(plan, Path(directory) / "plan.json")
+                    except TimeoutError:
+                        rejected = True
+                state = json.loads((out / "contract.json").read_text())
+                assert rejected == (case in ("late_exit", "late_validation"))
+                assert state["gpu_released"] and state["alive"] == []
+                outcomes[case] = state["state"]
+            finally:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+    return {
+        "state": "CLOCK_DRIVER_CPU_CHECKED",
+        "old_event_failure_retained": True,
+        "hard_content_order_submission_failures_checked": True,
+        "timebase_and_loader_failures_checked": True,
+        "absolute_deadline_cases": outcomes,
+        "trace_schema_and_stops": clock_trace_check(),
+        "GPU_executed": False,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument("--source-check", action="store_true")
     action.add_argument("--compile-only", action="store_true")
     action.add_argument("--cpu-check", action="store_true")
-    action.add_argument("--write-plan", choices=("capture", "timing"))
+    action.add_argument("--write-plan", choices=("capture", "timing", CLOCK_MODE))
+    action.add_argument("--clock-cohort", choices=("untraced", "traced"))
+    action.add_argument("--clock-source-check", action="store_true")
+    action.add_argument("--analyze-clock", action="store_true")
     action.add_argument("--run-plan", type=Path)
     action.add_argument("--worker", action="store_true")
     parser.add_argument("--plan", type=Path)
@@ -1312,9 +2960,32 @@ def main():
         print(json.dumps(plan, indent=2))
     elif args.run_plan:
         supervise(json.loads(args.run_plan.read_text()), args.run_plan)
+    elif args.analyze_clock:
+        analyze_clock(load_clock_json(args.plan), args.plan, args.out)
+    elif args.clock_source_check:
+        print(json.dumps(clock_source_check(), indent=2))
+    elif args.clock_cohort:
+        plan = json.loads(args.plan.read_text())
+        check_plan(plan, args.plan, worker=True)
+        if plan["mode"] != CLOCK_MODE:
+            raise ValueError("wrong clock cohort mode")
+        clock_remaining()
+        import torch.multiprocessing as mp
+
+        worker_plan = {
+            key: plan[key]
+            for key in ("mode", "output", "environment", "clock_protocol")
+        }
+        mp.spawn(
+            clock_rank_main, args=(worker_plan, args.clock_cohort), nprocs=TP, join=True
+        )
+        clock_remaining()
     else:
         plan = json.loads(args.plan.read_text())
         check_plan(plan, args.plan, worker=True)
+        if plan["mode"] == CLOCK_MODE:
+            clock_driver(plan, args.plan)
+            return
         if plan["mode"] != "timing":
             raise ValueError("wrong worker mode")
         out = Path(plan["output"]) / "data"
