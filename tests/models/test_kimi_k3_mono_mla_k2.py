@@ -173,8 +173,8 @@ def _ffn_only_runner(runner_module, calls, core):
     runner.inner = SimpleNamespace(layers={3: _k2_layer(calls, core)})
     runner._k1 = runner._fallback = lambda *a, **k: pytest.fail("not this layer's path")
 
-    def k2(build, plan, core_in, prefix, blocks):
-        calls["k2"] = (build, plan, core_in, prefix, blocks)
+    def k2(build, plan, core_in, prefix, blocks, metadata):
+        calls["k2"] = (build, plan, core_in, prefix, blocks, metadata)
         return "k2 out"
 
     runner._k2 = k2
@@ -189,7 +189,7 @@ def _step(runner_module, core):
     plan = LayerPlan(3, None, object())
     prefix, blocks = torch.ones(ROWS, HIDDEN), torch.zeros(ROWS, 4, HIDDEN)
     add, add2 = torch.full((ROWS, HIDDEN), 2.0), None
-    args = ("build", plan, "positions", prefix, blocks, add, add2, None)
+    args = ("build", plan, "positions", prefix, blocks, add, add2, object())
     return runner, calls, args
 
 
@@ -209,6 +209,7 @@ def test_a_full_attention_layer_runs_its_attention_then_k2(runner_module):
     assert calls["k2"][2] is core
     assert calls["k2"][3] is calls["new_prefix"]
     assert calls["k2"][4] is blocks
+    assert calls["k2"][5] is args[-1]
     assert out == (calls["new_prefix"], "k2 out", None)
 
 

@@ -97,6 +97,8 @@ class K2Build:
     ln_eps: float = 1e-5  # the latent RMSNorm
     # the final reduce here (else the next layer's K1)
     reduce: bool = field(default=True, metadata={"sym": "r"})
+    qlen: int = field(default=1, metadata={"sym": "q"})
+    skip_padding: bool = field(default=False, metadata={"sym": "sp"})
     diag: bool = field(default=False, metadata={"sym": "g"})
     timeline: bool = field(default=False, metadata={"sym": "t"})
 
@@ -109,6 +111,8 @@ ABI = KernelAbi(
         "blocks",
         "blk_sm",
         "blk_sr",
+        "st_idx",
+        "st_stride",
         "ares_nw",
         "ares_qk",
         "in_nw",
@@ -246,10 +250,15 @@ def stage_routes(c, bid):
 _BUILDS: dict = {}
 
 
+def padding_supported(key: K2Build):
+    return key.skip_padding and key.tokens == 64 and key.qlen in (1, 4)
+
+
 def build(key: K2Build):
     if key in _BUILDS:
         return _BUILDS[key]
     s, ns = key.tokens, key.nblocks + 1
+    skip_padding = padding_supported(key)
     # past one token group (``TG``) the per-token stages run a group at a
     # time, so their LDS holds one group; the latent ug multiplies is the
     # step's (``UgLds``). The width's real bound is LDS (64 rows fit).
@@ -301,6 +310,8 @@ def build(key: K2Build):
         blocks: Int64,
         blk_sm: Int32,
         blk_sr: Int32,
+        st_idx: Int64,
+        st_stride: Int32,
         ares_nw: Int64,
         ares_qk: Int64,
         in_nw: Int64,
@@ -350,6 +361,8 @@ def build(key: K2Build):
             peer[region + "_own"] = preg(own, off, region)
         c = {
             "S": s,
+            "qlen": key.qlen,
+            "skip_padding": skip_padding,
             "G": G,
             "NS": ns,
             "NB": key.nblocks,
@@ -395,6 +408,8 @@ def build(key: K2Build):
             "ln": plain + fx.Int64(plain_lay["ln"][0]),
             "shp": plain + fx.Int64(plain_lay["shp"][0]),
             "args": {
+                "st_idx": st_idx,
+                "st_stride": st_stride,
                 "core": core,
                 "w_o": w_o,
                 "prefix": prefix,
@@ -476,7 +491,11 @@ def build(key: K2Build):
         stamp(on, tls, tid, 11)
         k2b.load_latq(c)
         stamp(on, tls, tid, 12)
-        k2b.run_ug(c, bid, nu)
+        if const_expr(skip_padding):
+            if nu > 0:
+                k2b.run_ug(c, bid, nu)
+        else:
+            k2b.run_ug(c, bid, nu)
         stamp(on, tls, tid, 3)
         # the shared SiTU after ug, on the shared down's CTAs: only the shared
         # down reads it (before ug it held the AttnRes CTAs' ug start back)
@@ -485,8 +504,15 @@ def build(key: K2Build):
         enter_stage("k2.down")
         if bid < k2b.DOWN_TASKS:
             # the first w2 batch in flight before any ug flag is waited for
-            dops = k2b.down_loads(c, bid, nu, fx.min(c["wave"], nu - 1))
-            k2b.stage_down(c, bid, nu, dops)
+            if const_expr(skip_padding):
+                if nu > 0:
+                    dops = k2b.down_loads(c, bid, nu, fx.min(c["wave"], nu - 1))
+                    k2b.stage_down(c, bid, nu, dops)
+                else:
+                    k2b.publish_down(c, bid, contributions=False)
+            else:
+                dops = k2b.down_loads(c, bid, nu, fx.min(c["wave"], nu - 1))
+                k2b.stage_down(c, bid, nu, dops)
             stamp(on, tls, tid, 16)
         enter_stage("k2.sdown")
         k2b.run_sdown(c, bid, w_sd)
@@ -520,6 +546,8 @@ def build(key: K2Build):
         blocks: Int64,
         blk_sm: Int32,
         blk_sr: Int32,
+        st_idx: Int64,
+        st_stride: Int32,
         ares_nw: Int64,
         ares_qk: Int64,
         in_nw: Int64,
@@ -554,6 +582,8 @@ def build(key: K2Build):
             blocks,
             blk_sm,
             blk_sr,
+            st_idx,
+            st_stride,
             ares_nw,
             ares_qk,
             in_nw,
