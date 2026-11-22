@@ -559,6 +559,9 @@ class KVConnectorOutput:
     # Final P/D metadata travels with successful receive completion. The TP
     # aggregator validates agreement and discards it on any worker failure.
     received_handoffs: dict[ReqId, PrefillHandoff] = field(default_factory=dict)
+    # Controller clock before the aggregated query was sent. A buffered empty
+    # snapshot cannot prove that its transfers are still pending when consumed.
+    poll_started_at: float | None = None
 
     def is_empty(self) -> bool:
         """Return True if no transfers finished on this worker."""

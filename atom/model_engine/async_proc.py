@@ -991,10 +991,11 @@ class AsyncIOProcManager:
         self, func_name: str, args: tuple[object, ...]
     ) -> _PendingKvAggregation:
         """Broadcast one KV aggregation RPC and record its empty result slots."""
+        started_at = time.monotonic()
         self.rpc_broadcast_mq.enqueue((func_name, *args))
         pending = _PendingKvAggregation(
             worker_outputs=[None] * self.proc_num,
-            started_at=time.monotonic(),
+            started_at=started_at,
         )
         self._pending_kv_aggregation = pending
         return pending
@@ -1055,6 +1056,7 @@ class AsyncIOProcManager:
                 output for output in pending.worker_outputs if output is not None
             ]
         )
+        kv_output.poll_started_at = pending.started_at
         self._pending_kv_aggregation = None
         # Keep the completion query pipelined: workers can produce this next
         # snapshot while EngineCore processes the completed one and executes
