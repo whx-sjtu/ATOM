@@ -26,9 +26,9 @@ RECIPE = (
 sha = capture.sha
 LEGACY = TAIL = None
 COMGR_PROOF = (
-    WS / "agent-team/evidence/task-19-comgr-metadata-preflight-01/manifest.json"
+    WS / "agent-team/evidence/task-19-comgr-metadata-preflight-02/manifest.json"
 )
-COMGR_PROOF_SHA = "e0e376edae4ca94a3d0a47e3972440ee798f8f01f486edc8e0c1521fabc723d5"
+COMGR_PROOF_SHA = "cbbd57601473bf94fd6bb82ba27d2d09c100cceebe53ad7d0adcc00b7dd64168"
 
 
 def helpers():
