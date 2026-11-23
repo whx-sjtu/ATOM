@@ -9,6 +9,8 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.utils import envs
+
 # from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 PAD_SLOT_ID = -1
@@ -57,7 +59,9 @@ def _causal_conv1d_metadata_kernel(
             tl.store(token_chunk_offset_ptr + p, pad, mask=mask)
 
 
-def compute_causal_conv1d_metadata(query_start_loc_p: torch.Tensor, num_tokens: int):
+def compute_causal_conv1d_metadata(
+    query_start_loc_p: torch.Tensor, num_tokens: int, block_m: int = 8
+):
     """Program -> (sequence, chunk) map for `_causal_conv1d_fwd_kernel`, on the GPU.
 
     `num_tokens` is a host upper bound on `query_start_loc_p[-1] -
@@ -65,8 +69,10 @@ def compute_causal_conv1d_metadata(query_start_loc_p: torch.Tensor, num_tokens: 
     sum(ceil(len_i / BLOCK_M)) <= ceil(num_tokens / BLOCK_M) + num_seqs, and the
     surplus programs read PAD_SLOT_ID and return at once. `causal_conv1d_fn`
     rebuilds the map if `num_tokens` is below the width of its `x`.
+    `block_m` is 8 for `_causal_conv1d_fwd_kernel` and the tiled prefill
+    kernel's BLOCK_M for it.
     """
-    BLOCK_M = 8  # must match causal_conv1d_fn's BLOCK_M
+    BLOCK_M = block_m
     num_seqs = query_start_loc_p.numel() - 1
     num_programs = triton.cdiv(num_tokens, BLOCK_M) + num_seqs
     out = torch.empty(
@@ -596,6 +602,295 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         tl.store(v_ptrs, acc, mask=mask_token & is_v_block)
 
 
+# Tile of the tiled prefill kernel; `compute_causal_conv1d_metadata(...,
+# block_m=_TILED_BLOCK_M)` builds its program map. The channel-fast grid
+# launches a token chunk's channel blocks back to back.
+_TILED_BLOCK_M = 16
+_TILED_BLOCK_N = 512
+_TILED_NUM_WARPS = 4
+_TILED_CHANNEL_FAST = True
+
+
+@triton.jit()
+def _causal_conv1d_fwd_tiled_kernel(
+    x_ptr,  # (dim, cu_seqlen), channel-last (feature stride 1)
+    w_ptr,  # (dim, width)
+    bias_ptr,
+    conv_states_ptr,  # (num_cache_lines, dim, >= width - 1)
+    cache_indices_ptr,  # (batch,) slot the final state is written to
+    cache_indices_in_ptr,  # (batch,) slot the initial state is read from
+    has_initial_states_ptr,
+    query_start_loc_ptr,
+    batch_ptr,
+    token_chunk_offset_ptr,
+    query_ptr,
+    key_ptr,
+    value_ptr,
+    k_dim_size: tl.constexpr,
+    num_cache_lines: tl.constexpr,
+    stride_x_token: tl.constexpr,
+    stride_w_dim: tl.constexpr,
+    stride_w_width: tl.constexpr,
+    stride_istate_seq: tl.constexpr,
+    stride_istate_dim: tl.constexpr,
+    stride_istate_token: tl.constexpr,
+    stride_cache_indices: tl.constexpr,
+    k_token_stride: tl.constexpr,
+    v_token_stride: tl.constexpr,
+    pad_slot_id: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    KERNEL_WIDTH: tl.constexpr,
+    SILU_ACTIVATION: tl.constexpr,
+    USE_PAD_SLOT: tl.constexpr,
+    NP2_STATELEN: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    CHANNEL_FAST: tl.constexpr,  # grid is (channel blocks, token chunks)
+):
+    # One program: BLOCK_M tokens x BLOCK_N channels of one sequence. Each
+    # output element is bias or 0, then += x[t - width + 1 + j] * w[j] for j
+    # ascending with every product rounded: the launch disables fp fusion. That
+    # is what `_causal_conv1d_fwd_kernel` compiles to at Kimi-K3's shape (width
+    # 4, no bias), so there the two agree bit for bit. Elsewhere the row
+    # kernel's backend may contract a tap into an fma (it does at some widths
+    # and strides), a 1-ulp difference.
+    state_len: tl.constexpr = KERNEL_WIDTH - 1
+    if CHANNEL_FAST:
+        pid_m = tl.program_id(1)
+        pid_n = tl.program_id(0)
+    else:
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+    idx_seq = tl.load(batch_ptr + pid_m).to(tl.int64)
+    if idx_seq < 0:
+        return
+    chunk = tl.load(token_chunk_offset_ptr + pid_m)
+    seq_start = tl.load(query_start_loc_ptr + idx_seq).to(tl.int64)
+    seqlen = (tl.load(query_start_loc_ptr + idx_seq + 1) - seq_start).to(tl.int32)
+    slot_in = tl.load(cache_indices_in_ptr + idx_seq * stride_cache_indices).to(
+        tl.int64
+    )
+    if USE_PAD_SLOT:  # noqa
+        if slot_in == pad_slot_id:
+            return
+    slot_out = tl.load(cache_indices_ptr + idx_seq * stride_cache_indices).to(tl.int64)
+
+    feats = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    load_init = (chunk == 0) & tl.load(has_initial_states_ptr + idx_seq).to(tl.int1)
+
+    x_base = x_ptr + seq_start * stride_x_token + feats  # [BLOCK_N]
+    state_in = (
+        conv_states_ptr + slot_in * stride_istate_seq + feats * stride_istate_dim
+    )  # [BLOCK_N]
+    feat0 = pid_n * BLOCK_N
+
+    rows = chunk * BLOCK_M + tl.arange(0, BLOCK_M)
+    row_ok = rows < seqlen
+    if HAS_BIAS:
+        acc = tl.broadcast_to(
+            tl.load(bias_ptr + feats).to(tl.float32)[None, :], (BLOCK_M, BLOCK_N)
+        )
+    else:
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for j in tl.static_range(KERNEL_WIDTH):
+        src = rows - state_len + j
+        xv = tl.load(
+            x_base[None, :] + (src * stride_x_token)[:, None],
+            mask=((src >= 0) & row_ok)[:, None],
+            other=0.0,
+        )
+        if j < state_len:
+            # Taps before the sequence start come from the conv state (or are 0).
+            from_state = (src < 0) & row_ok & load_init
+            sv = tl.load(
+                state_in[None, :] + ((src + state_len) * stride_istate_token)[:, None],
+                mask=from_state[:, None],
+                other=0.0,
+            )
+            xv = tl.where(from_state[:, None], sv, xv)
+        w = tl.load(w_ptr + feats * stride_w_dim + j * stride_w_width)
+        acc += xv * w[None, :]
+    if SILU_ACTIVATION:
+        acc = acc / (1 + tl.exp(-acc))
+
+    # BLOCK_N divides k_dim_size, so the whole tile lands in one of q/k/v.
+    # One store per branch: a pointer picked across branches crashes
+    # TritonAMDGPUCanonicalizePointers.
+    tok = seq_start + rows
+    if feat0 < k_dim_size:
+        tl.store(
+            query_ptr + (tok * k_token_stride)[:, None] + feats[None, :],
+            acc,
+            mask=row_ok[:, None],
+        )
+    elif feat0 < 2 * k_dim_size:
+        tl.store(
+            key_ptr + (tok * k_token_stride)[:, None] + (feats - k_dim_size)[None, :],
+            acc,
+            mask=row_ok[:, None],
+        )
+    else:
+        tl.store(
+            value_ptr
+            + (tok * v_token_stride)[:, None]
+            + (feats - 2 * k_dim_size)[None, :],
+            acc,
+            mask=row_ok[:, None],
+        )
+
+    if chunk == 0:
+        # New conv state = the last `state_len` inputs, as in
+        # `_causal_conv1d_fwd_kernel`. The barriers order every read of the
+        # old state above before the writes below.
+        state_out = (
+            conv_states_ptr + slot_out * stride_istate_seq + feats * stride_istate_dim
+        )
+        idx_conv = tl.arange(0, NP2_STATELEN)
+        st_mask = (idx_conv < state_len)[:, None]
+        st_ptrs = state_out[None, :] + (idx_conv * stride_istate_token)[:, None]
+        if state_len <= seqlen:
+            idx_last = seqlen - state_len + idx_conv
+            new_state = tl.load(
+                x_base[None, :] + (idx_last * stride_x_token)[:, None],
+                mask=(idx_last < seqlen)[:, None],
+                other=0.0,
+            )
+            tl.debug_barrier()
+            tl.store(st_ptrs, new_state, st_mask)
+        else:
+            shift = state_len - seqlen
+            x_part = tl.load(
+                x_base[None, :] + ((idx_conv - shift) * stride_x_token)[:, None],
+                mask=((idx_conv - shift >= 0) & (idx_conv - shift < seqlen))[:, None],
+                other=0.0,
+            )
+            if load_init:
+                keep = (
+                    (slot_in < num_cache_lines)
+                    & ((idx_conv + seqlen) < state_len)[:, None]
+                    & (feats >= 0)[None, :]
+                )
+                old_part = tl.load(
+                    state_in[None, :]
+                    + ((idx_conv + seqlen) * stride_istate_token)[:, None],
+                    mask=keep,
+                    other=0.0,
+                )
+                tl.debug_barrier()
+                new_state = tl.where(keep, old_part, x_part)
+            else:
+                tl.debug_barrier()
+                new_state = x_part
+            tl.store(st_ptrs, new_state, st_mask)
+
+
+def _tiled_conv1d_map(metadata, query_start_loc, num_tokens, block_m):
+    """The tiled kernel's program map, cached in the step's `nums_dict`."""
+    nums_dict = None if metadata is None else metadata.nums_dict
+    entry = None if nums_dict is None else nums_dict.get(block_m)
+    if (
+        entry is None
+        or entry.get("num_tokens", 0) < num_tokens
+        or entry["batch_ptr"].device != query_start_loc.device
+    ):
+        entry = compute_causal_conv1d_metadata(
+            query_start_loc, num_tokens, block_m=block_m
+        )[0][block_m]
+        if nums_dict is not None:
+            nums_dict[block_m] = entry
+    return entry
+
+
+def _causal_conv1d_fwd_tiled(
+    x,
+    weight,
+    bias,
+    conv_states,
+    query_start_loc,
+    k_dim_size,
+    v_dim_size,
+    cache_indices,
+    cache_indices_in,
+    has_initial_state,
+    activation,
+    pad_slot_id,
+    metadata,
+    block_m=None,
+    block_n=None,
+    num_warps=None,
+    channel_fast=None,
+):
+    block_m = block_m or _TILED_BLOCK_M
+    block_n = block_n or _TILED_BLOCK_N
+    num_warps = num_warps or _TILED_NUM_WARPS
+    if channel_fast is None:
+        channel_fast = _TILED_CHANNEL_FAST
+    dim, cu_seqlen = x.shape
+    width = weight.shape[1]
+    entry = _tiled_conv1d_map(metadata, query_start_loc, cu_seqlen, block_m)
+    query = torch.empty([cu_seqlen, k_dim_size], dtype=x.dtype, device=x.device)
+    key = torch.empty([cu_seqlen, k_dim_size], dtype=x.dtype, device=x.device)
+    value = torch.empty([cu_seqlen, v_dim_size], dtype=x.dtype, device=x.device)
+    grid = (entry["tot"], dim // block_n)
+    if channel_fast:
+        grid = grid[::-1]
+    _causal_conv1d_fwd_tiled_kernel[grid](
+        x,
+        weight,
+        bias,
+        conv_states,
+        cache_indices,
+        cache_indices if cache_indices_in is None else cache_indices_in,
+        has_initial_state,
+        query_start_loc,
+        entry["batch_ptr"],
+        entry["token_chunk_offset_ptr"],
+        query,
+        key,
+        value,
+        k_dim_size,
+        conv_states.size(0),
+        x.stride(1),
+        weight.stride(0),
+        weight.stride(1),
+        conv_states.stride(0),
+        conv_states.stride(1),
+        conv_states.stride(2),
+        cache_indices.stride(0),
+        key.stride(0),
+        value.stride(0),
+        pad_slot_id,
+        HAS_BIAS=bias is not None,
+        KERNEL_WIDTH=width,
+        SILU_ACTIVATION=activation in ["silu", "swish"],
+        USE_PAD_SLOT=pad_slot_id is not None,
+        NP2_STATELEN=triton.next_power_of_2(width - 1),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        CHANNEL_FAST=channel_fast,
+        num_warps=num_warps,
+        enable_fp_fusion=False,
+    )
+    return query, key, value
+
+
+def _tiled_conv1d_applies(
+    x, weight, conv_states, k_dim_size, v_dim_size, cache_indices, has_initial_state
+):
+    block_n = _TILED_BLOCK_N
+    return (
+        conv_states is not None
+        and cache_indices is not None
+        and has_initial_state is not None
+        and x.dim() == 2
+        and x.stride(0) == 1
+        and weight.shape[1] in (2, 3, 4)
+        and k_dim_size % block_n == 0
+        and v_dim_size % block_n == 0
+        and x.shape[0] == 2 * k_dim_size + v_dim_size
+    )
+
+
 def causal_conv1d_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -680,6 +975,34 @@ def causal_conv1d_fn(
     # Store original dtype to cast back at the end
     original_x_dtype = x.dtype
     x = x.to(conv_states.dtype)
+    if (
+        envs.ATOM_CONV1D_TILED_PREFILL
+        and block_idx_last_scheduled_token is None
+        and _tiled_conv1d_applies(
+            x,
+            weight,
+            conv_states,
+            k_dim_size,
+            v_dim_size,
+            cache_indices,
+            has_initial_state,
+        )
+    ):
+        return _causal_conv1d_fwd_tiled(
+            x,
+            weight,
+            bias,
+            conv_states,
+            query_start_loc,
+            k_dim_size,
+            v_dim_size,
+            cache_indices,
+            cache_indices_in,
+            has_initial_state,
+            activation,
+            pad_slot_id,
+            metadata,
+        )
     # `x` covers every token `query_start_loc` indexes, so its width is a bound
     # the caller cannot get wrong. A precomputed map built for fewer tokens (or
     # none at all) is rebuilt from it; vLLM's maps carry an exact `tot` and no

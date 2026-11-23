@@ -908,6 +908,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_K3_KDA_FUSED_DECODE": lambda: (
         os.getenv("ATOM_KIMI_K3_KDA_FUSED_DECODE", "1").lower() == "1"
     ),
+    # Prefill causal conv1d (channel-last, no prefix caching) with a
+    # [tokens x channels] tile per program instead of the 8-token row kernel.
+    # Bit-identical output at Kimi-K3's shape (width 4, no bias); off by default.
+    "ATOM_CONV1D_TILED_PREFILL": lambda: (
+        os.getenv("ATOM_CONV1D_TILED_PREFILL", "0") == "1"
+    ),
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT": lambda: (
         os.getenv("ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT", "1") == "1"
     ),
