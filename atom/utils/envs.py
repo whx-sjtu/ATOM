@@ -868,6 +868,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSPARK_STACKED_CTX_KV_GEMM": lambda: _flag_env(
         "ATOM_DSPARK_STACKED_CTX_KV_GEMM"
     ),
+    # Kimi-K3 DSpark draft: its MLA layers' BF16 W_K absorb bmm of <= 64 rows per
+    # head on gfx950 takes an explicit Triton tile instead of aiter's untuned
+    # default. The target's layers keep aiter's. Same output. Off by default.
+    "ATOM_MLA_BF16_ABSORB_BMM_CONFIG": lambda: _flag_env(
+        "ATOM_MLA_BF16_ABSORB_BMM_CONFIG"
+    ),
     # Lossless speculative sampling: the DSpark draft samples its block from q
     # and the verify accepts by the probability ratio (u * q < p). Off by
     # default; needs an aiter with ROCm/aiter#6954 under TP; where it arms,

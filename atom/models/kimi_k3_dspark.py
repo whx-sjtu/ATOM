@@ -276,6 +276,9 @@ class K3DSparkMLAAttention(nn.Module):
             config=atom_config,
             prefix=f"{prefix}.mla_attn",
         )
+        # Only the draft's own W_K absorb takes ATOM_MLA_BF16_ABSORB_BMM_CONFIG's
+        # tile; the target's MLA layers keep aiter's.
+        self.mla_attn.impl.bf16_absorb_bmm_tile = True
 
         # Which scheme -- if any -- the two fusable activation quants run in.
         # Resolved from the CONSUMER linear, the way kimi_k3 does it, so an
