@@ -133,7 +133,10 @@ def mla_builder_cls():
             get_mla_decode_fwd_max_splits=noop,
             get_mla_decode_shape_support=noop,
         ),
-        "triton": _module("triton", next_power_of_2=lambda value: value),
+        "triton": _module(
+            "triton", next_power_of_2=lambda value: value, jit=lambda fn: fn
+        ),
+        "triton.language": _module("triton.language", constexpr=object),
         "atom.distributed.dcp_utils": _module(
             "atom.distributed.dcp_utils",
             NONPS_MAX_Q_ROWS=32768,
