@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, ClassVar
 import numpy as np
 import torch
 import triton
+import triton.language as tl
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
@@ -209,6 +210,46 @@ def fork_read_table(write: torch.Tensor, read: torch.Tensor) -> torch.Tensor:
     return torch.where(forked, read.unsqueeze(1), write)
 
 
+@triton.jit(do_not_specialize=["n", "T_MAX", "CAP"])
+def _gdn_spec_decode_tail_kernel(
+    masks,
+    query_start_loc,
+    cu_seqlens_q,
+    num_accepted,
+    write_pos,
+    slot_idx,
+    n,
+    T_MAX,
+    CAP,
+    N_ROWS: tl.constexpr,
+    REPLAY: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """A spec decode's GDN tail over ``N_ROWS`` request rows, ``n`` of them
+    live: ``masks`` True / False, ``query_start_loc`` the live prefix of
+    ``cu_seqlens_q`` and then its last entry, ``num_accepted`` 1 past the live
+    rows, and under ``REPLAY`` the record cursor advance of
+    `_replayssm_commit_kernel`."""
+    i = tl.arange(0, BLOCK)
+    rows = i < N_ROWS
+    live = i < n
+    tl.store(masks + i, live, mask=rows)
+    loc = tl.load(cu_seqlens_q + tl.minimum(i, n), mask=i <= N_ROWS)
+    tl.store(
+        query_start_loc + i,
+        loc.to(query_start_loc.dtype.element_ty),
+        mask=i <= N_ROWS,
+    )
+    tl.store(num_accepted + i, tl.full([BLOCK], 1, tl.int32), mask=rows & ~live)
+    if REPLAY:
+        slot = tl.load(slot_idx + i, mask=live, other=-1).to(tl.int64)
+        ok = live & (slot >= 0)
+        h = tl.load(write_pos + slot, mask=ok, other=0)
+        base = tl.where(h + 2 * T_MAX > CAP, 0, h)
+        advanced = base + tl.load(num_accepted + i, mask=ok, other=0)
+        tl.store(write_pos + slot, tl.where(h < 0, 0, advanced), mask=ok)
+
+
 class GDNStateMixin(PoolRowsMixin):
     def __init__(self, model_runner, **kwargs):
         super().__init__(model_runner=model_runner, **kwargs)
@@ -277,6 +318,7 @@ class GDNStateMixin(PoolRowsMixin):
         self.replayssm_max_query_len = self.num_spec + 1
         self.replayssm_route = envs.ATOM_REPLAYSSM_ROUTE
         self.replayssm_cache_len = 0
+        self._fused_spec_tail = self.use_spec_decode and envs.ATOM_GDN_FUSED_SPEC_TAIL
         if self.replayssm:
             requested_cache_len = envs.ATOM_REPLAYSSM_CACHE_LEN
             min_cache_len = 2 * self.replayssm_max_query_len
@@ -1534,7 +1576,10 @@ class GDNStateMixin(PoolRowsMixin):
         *,
         prepare_block_tables: bool = True,
         running_tokens: int = 0,
+        fused_spec_tail: bool = False,
     ) -> GDNAttentionMetadata:
+        """``fused_spec_tail``: the caller writes the spec masks and advances
+        the record cursor itself (`_spec_decode_tail`)."""
 
         num_decodes = batch.total_seqs_num_decode
         num_prefills = batch.total_seqs_num_prefill
@@ -1589,7 +1634,8 @@ class GDNStateMixin(PoolRowsMixin):
             spec_token_indx = self.spec_token_indx[:spec_token_size]
             non_spec_token_indx = self.non_spec_token_indx[:0]
             spec_sequence_masks = self.spec_sequence_masks[:num_reqs]
-            spec_sequence_masks.fill_(True)
+            if not fused_spec_tail:
+                spec_sequence_masks.fill_(True)
             spec_state_indices_tensor = state_indices(self.spec_state_indices_tensor)
             non_spec_state_indices_tensor = None
             # Only when forked: every other spec step ships None, as before.
@@ -1674,11 +1720,17 @@ class GDNStateMixin(PoolRowsMixin):
             token_chunk_offset_ptr=token_chunk_offset_ptr,
         )
         if self.replayssm:
-            self._attach_replayssm(gdn_attn_metadata, num_reqs, is_prefill)
+            self._attach_replayssm(
+                gdn_attn_metadata, num_reqs, is_prefill, commit=not fused_spec_tail
+            )
         return gdn_attn_metadata
 
     def _attach_replayssm(
-        self, md: GDNAttentionMetadata, num_reqs: int, is_prefill: bool
+        self,
+        md: GDNAttentionMetadata,
+        num_reqs: int,
+        is_prefill: bool,
+        commit: bool = True,
     ) -> None:
         """Fill the ReplaySSM fields and move the record cursor exactly once.
 
@@ -1727,13 +1779,14 @@ class GDNStateMixin(PoolRowsMixin):
         # Decode: apply the PREVIOUS step's accepted counts.  For non-spec
         # decode `num_accepted_tokens` stays at its initialised value of 1,
         # which is exactly one committed token per step.
-        replayssm_commit(
-            write_pos,
-            slot_idx,
-            self.num_accepted_tokens[:num_reqs],
-            self.replayssm_max_query_len,
-            self.replayssm_cache_len,
-        )
+        if commit:
+            replayssm_commit(
+                write_pos,
+                slot_idx,
+                self.num_accepted_tokens[:num_reqs],
+                self.replayssm_max_query_len,
+                self.replayssm_cache_len,
+            )
 
     def _attach_gdn_decode_metadata(
         self,
@@ -1743,15 +1796,23 @@ class GDNStateMixin(PoolRowsMixin):
         prepare_block_tables: bool = True,
     ) -> None:
         num_decodes = batch.total_seqs_num_decode
+        fused_spec_tail = (
+            self._fused_spec_tail
+            and batch.total_seqs_num == num_decodes
+            and not getattr(self, "_fork_slots", None)
+        )
         gdn_metadata = self.prepare_gdn_metadata(
             batch,
             attn_metadata,
             prepare_block_tables=prepare_block_tables,
+            fused_spec_tail=fused_spec_tail,
         )
 
         # The state slots past `num_decodes` are PAD already: published from
         # the host with the attention metadata (`stage_decode`).
-        if self.use_spec_decode:
+        if fused_spec_tail:
+            self._spec_decode_tail(gdn_metadata, num_decodes)
+        elif self.use_spec_decode:
             self.spec_sequence_masks[num_decodes:].fill_(False)
 
             self.spec_query_start_loc[: num_decodes + 1].copy_(
@@ -1783,6 +1844,30 @@ class GDNStateMixin(PoolRowsMixin):
             ]
 
         attn_metadata.gdn_metadata = gdn_metadata
+
+    def _spec_decode_tail(self, gdn_metadata, num_decodes: int) -> None:
+        """The spec branch above and the masks and cursor advance
+        `prepare_gdn_metadata` left to it, in one launch
+        (ATOM_GDN_FUSED_SPEC_TAIL)."""
+        replay = self.replayssm
+        slot_idx = self.non_spec_state_indices_tensor.gpu
+        _gdn_spec_decode_tail_kernel[(1,)](
+            self.spec_sequence_masks,
+            self.spec_query_start_loc,
+            gdn_metadata.spec_query_start_loc,
+            self.num_accepted_tokens,
+            self.model_runner.replayssm_write_pos if replay else slot_idx,
+            slot_idx,
+            num_decodes,
+            self.replayssm_max_query_len,
+            self.replayssm_cache_len,
+            N_ROWS=self.max_bs,
+            REPLAY=replay,
+            BLOCK=triton.next_power_of_2(self.max_bs + 1),
+            num_warps=1,
+        )
+        gdn_metadata.spec_query_start_loc = self.spec_query_start_loc[: num_decodes + 1]
+        gdn_metadata.num_accepted_tokens = self.num_accepted_tokens[:num_decodes]
 
     def _build_gdn_capture_metadata(self, bs: int):
         if self.use_spec_decode:

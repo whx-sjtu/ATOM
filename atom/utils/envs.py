@@ -967,6 +967,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # serial one at verify windows >= ~12 tokens (measured on gfx950), so
     # "auto" keeps practical MTP windows on the serial route.
     "ATOM_REPLAYSSM_ROUTE": lambda: os.getenv("ATOM_REPLAYSSM_ROUTE", "auto").lower(),
+    # Spec decode: write the linear-attention spec masks, query start loc and
+    # accepted-count padding, and advance the ReplaySSM record cursor, in one
+    # launch instead of six. Same values. Read at builder construction.
+    "ATOM_GDN_FUSED_SPEC_TAIL": lambda: _flag_env("ATOM_GDN_FUSED_SPEC_TAIL"),
     # "fp32" | "fp16" | "bf16".  Storage dtype of the KDA temporal state pool,
     # whose per-token traffic dominates KDA decode; the recurrence itself
     # always accumulates in fp32.  fp16 over bf16 when narrowing: the state is
