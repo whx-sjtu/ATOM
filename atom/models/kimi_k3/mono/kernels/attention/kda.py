@@ -802,11 +802,25 @@ def attnres(c, task, sg, on, tls):
     stamp(on, tls, c["tid"], 3)
 
 
-def gemv_staging(s: int) -> dict:
+def gemv_staging(s: int, w_ahead: bool = False) -> dict:
     """``gemv_groups``' staging for an s-row step (``KdaPreBuild.gemv_unit`` /
     ``x_ahead``): from three token groups on, a column group a unit with x
-    four units ahead; else two groups a unit with x one ahead."""
-    return {"gemv_unit": 1, "x_ahead": 4} if groups(s) >= 3 else {}
+    four units ahead; else two groups a unit with x one ahead.
+
+    ``w_ahead`` (``ATOM_MONO_K1_W_AHEAD``): at two groups whose second holds at
+    most ``W_AHEAD_TAIL`` rows, the weights two column groups ahead. A wave's
+    loads complete in issue order (vmcnt), so an x load issued after a unit's
+    weights, stored (waited for) ``x_ahead`` - 1 units on, waits for them too:
+    the weights stay in flight their two column groups (2 G units) only with x
+    2 G - 1 ahead, more only costs VGPRs. Only there does that fit them (the
+    short group's x is one 16 B chunk a thread); elsewhere it spills."""
+    g = groups(s)
+    if w_ahead and g == 2 and s - TG <= W_AHEAD_TAIL:
+        return {"gemv_unit": 1, "w_ahead": 2, "x_ahead": 2 * g - 1}
+    return {"gemv_unit": 1, "x_ahead": 4} if g >= 3 else {}
+
+
+W_AHEAD_TAIL = 4
 
 
 def xu_row(unit):

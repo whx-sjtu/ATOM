@@ -45,6 +45,7 @@ from aiter.dist.parallel_state import (
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
+from atom.distributed.group_agreement import group_agree
 from atom.models.kimi_k3.mono.config import (
     MAX_ROWS,
     Dims,
@@ -129,7 +130,13 @@ def _lean_k1(key: k1.KdaPreBuild) -> k1.KdaPreBuild | None:
     (``KdaPreBuild.gemv_unit``: half the weights in flight, slower where
     ``kda.gemv_staging`` keeps two groups, so only where those do not fit), or
     at one already x a unit less ahead (``x_ahead``: K4's 7 and 9 batches
-    spilled at four). The same sums either way."""
+    spilled at four). One with its weights two units ahead
+    (``ATOM_MONO_K1_W_AHEAD``) falls back to the staging it replaced. The same
+    sums either way."""
+    if key.w_ahead > 1:
+        fields = k1.KdaPreBuild.__dataclass_fields__
+        staging = {f: fields[f].default for f in ("gemv_unit", "x_ahead")}
+        return replace(key, w_ahead=1, **{**staging, **k1.gemv_staging(key.tokens)})
     if key.gemv_unit > 1:
         return replace(key, gemv_unit=1)
     if key.x_ahead > 1:
@@ -182,14 +189,27 @@ def _lean_width(built: WidthBuild, spilled: list) -> WidthBuild | None:
     )
 
 
+def _agree_k1_w_ahead(group) -> bool:
+    """``ATOM_MONO_K1_W_AHEAD``, the same on every TP rank: the ranks' K1
+    builds must be one schedule."""
+    requested = envs.ATOM_MONO_K1_W_AHEAD
+    if group_agree(requested, group):
+        return True
+    if group_agree(not requested, group):
+        return False
+    raise RuntimeError("ATOM_MONO_K1_W_AHEAD differs across TP ranks")
+
+
 class K3MonoDecodeRunner:
     """Binds every rank's weights and buffers, or none: a rank that cannot is a
     refusal every rank agrees on before anything collective."""
 
     max_rows = MAX_ROWS
+    k1_w_ahead = False
 
     def __init__(self, model, drafter=None, metadata_builder=None) -> None:
         group = get_tp_group().cpu_group
+        self.k1_w_ahead = _agree_k1_w_ahead(group)
         bind_agreed(lambda: self._bind(model, drafter, metadata_builder), group)
         peer_bytes = k2.peer_bytes(self.max_rows)
         if self.ix is not None:
@@ -431,7 +451,7 @@ class K3MonoDecodeRunner:
                 write_idx=p.kda.write_idx,
                 replay_cap=self.replay_cap,
                 replay_window=window,
-                **k1.gemv_staging(rows),
+                **k1.gemv_staging(rows, self.k1_w_ahead),
             )
             for p in self.plans
             if p.mono
