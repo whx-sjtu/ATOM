@@ -914,6 +914,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_CONV1D_TILED_PREFILL": lambda: (
         os.getenv("ATOM_CONV1D_TILED_PREFILL", "0") == "1"
     ),
+    # Kimi-K3 KDA prefill reads and writes the recurrent state in the slot pool
+    # directly (FlashKDA's paged state_cache) instead of gathering it, copying
+    # it K-first and scattering the final state back. Steps with a state fork
+    # or interior checkpoints keep the gather path. Bit-identical. Off by default.
+    "ATOM_KDA_PREFILL_PAGED_STATE": lambda: (
+        os.getenv("ATOM_KDA_PREFILL_PAGED_STATE", "0") == "1"
+    ),
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT": lambda: (
         os.getenv("ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT", "1") == "1"
     ),

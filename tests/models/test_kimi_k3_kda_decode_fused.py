@@ -315,16 +315,31 @@ def test_wave_fallback_logs_geometry_once(modules, monkeypatch, caplog, rank, en
         report.cache_clear()
 
 
+@pytest.mark.parametrize("paged", ["0", "1"])
 @pytest.mark.parametrize("prefill", [False, True])
-def test_prefill_and_empty_steps_keep_existing_behavior(modules, monkeypatch, prefill):
+def test_prefill_and_empty_steps_keep_existing_behavior(
+    modules, monkeypatch, prefill, paged
+):
+    monkeypatch.setenv("ATOM_KDA_PREFILL_PAGED_STATE", paged)
     c = layer_case(modules, monkeypatch)
     c.meta.num_prefills, c.meta.num_decodes = int(prefill), 0
     monkeypatch.setattr(
         modules.ops, "gather_kda_initial_state", lambda s, *args: s[:3].clone()
     )
+    taken = []
     monkeypatch.setattr(
-        c.attn, "_run_kda", lambda q, k, v, g, b, s, *args: (torch.full_like(q, 3), s)
+        c.attn,
+        "_run_kda",
+        lambda q, k, v, g, b, s, *args: taken.append("gather")
+        or (torch.full_like(q, 3), s),
+    )
+    monkeypatch.setattr(
+        c.attn,
+        "_run_kda_paged",
+        lambda q, *args: taken.append("paged") or torch.full_like(q, 3),
     )
     out = c.attn._forward_impl(c.hidden)
     assert not c.calls.fused and len(c.calls.conv) == int(prefill)
     torch.testing.assert_close(out, torch.full_like(out, 3 if prefill else 0))
+    # The stub's FlashKDA flags are MagicMocks, so FlashKDA reads as enabled.
+    assert taken == (["paged" if paged == "1" else "gather"] if prefill else [])
