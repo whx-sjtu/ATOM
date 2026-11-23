@@ -849,6 +849,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSPARK_FUSED_MARKOV_SAMPLE": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_MARKOV_SAMPLE", "1") == "1"
     ),
+    # DSA MTP verify: skip the step's dense persistent MLA plan when no layer
+    # decodes off it (no dense MLA layer in the target or a non-block drafter).
+    # Off by default.
+    "ATOM_MLA_SKIP_UNREAD_DENSE_PLAN": lambda: _flag_env(
+        "ATOM_MLA_SKIP_UNREAD_DENSE_PLAN"
+    ),
     # Build the Kimi-K3 DSpark block's DCP-sharded MLA metadata (positions,
     # slots, ctx_lens, kv_indptr, pad-tail kv_indices) in one Triton program
     # instead of ~20 torch launches. Same values; "0" restores the torch path.
