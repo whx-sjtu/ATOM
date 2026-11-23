@@ -666,9 +666,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of the step (mono/runner.py finish_step) instead of the GPU hanging. Use
     # with --enforce-eager.
     "ATOM_MONO_DEBUG": lambda: os.getenv("ATOM_MONO_DEBUG", "0") == "1",
-    # Kimi K3 K1: the GEMV's x rows through cached memory (an XCD's L2 serves
-    # its CTAs) instead of the uncached plain region (KdaPreBuild.x_cached).
-    "ATOM_MONO_K1_X_CACHED": lambda: os.getenv("ATOM_MONO_K1_X_CACHED", "0") == "1",
     # gfx950 mono mailbox retry spacing in s_sleep units (1..127, unset: 16).
     # Read and checked by atom/mono/polling.py at import, which needs no ATOM
     # import; 1 restores the pre-backoff polling (ROCm/ATOM#3369).

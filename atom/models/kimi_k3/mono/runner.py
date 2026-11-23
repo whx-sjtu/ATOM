@@ -45,7 +45,6 @@ from aiter.dist.parallel_state import (
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-from atom.distributed.group_agreement import group_agree
 from atom.models.kimi_k3.mono.config import (
     MAX_ROWS,
     Dims,
@@ -183,26 +182,14 @@ def _lean_width(built: WidthBuild, spilled: list) -> WidthBuild | None:
     )
 
 
-def _agree_k1_x_cached(group) -> bool:
-    """``ATOM_MONO_K1_X_CACHED``, the same on every TP rank."""
-    requested = envs.ATOM_MONO_K1_X_CACHED
-    if group_agree(requested, group):
-        return True
-    if group_agree(not requested, group):
-        return False
-    raise RuntimeError("ATOM_MONO_K1_X_CACHED differs across TP ranks")
-
-
 class K3MonoDecodeRunner:
     """Binds every rank's weights and buffers, or none: a rank that cannot is a
     refusal every rank agrees on before anything collective."""
 
     max_rows = MAX_ROWS
-    x_cached = False
 
     def __init__(self, model, drafter=None, metadata_builder=None) -> None:
         group = get_tp_group().cpu_group
-        self.x_cached = _agree_k1_x_cached(group)
         bind_agreed(lambda: self._bind(model, drafter, metadata_builder), group)
         peer_bytes = k2.peer_bytes(self.max_rows)
         if self.ix is not None:
@@ -422,12 +409,6 @@ class K3MonoDecodeRunner:
         # a plain decode's accepted-token counts (`plan.state_slots`): fixed, so
         # a captured step reads them at one address
         self.ones = torch.ones(MAX_ROWS, dtype=torch.int32, device=self.device)
-        # K1's x rows, cached (``KdaPreBuild.x_cached``); unread without
-        self.x_rows = torch.empty(
-            MAX_ROWS * k1.HIDDEN * 2 if self.x_cached else 16,
-            dtype=torch.uint8,
-            device=self.device,
-        )
 
     # ---------------------------------------------------------------- builds
     def _k1_keys(self, rows: int, qlen: int) -> dict[int, k1.KdaPreBuild]:
@@ -450,7 +431,6 @@ class K3MonoDecodeRunner:
                 write_idx=p.kda.write_idx,
                 replay_cap=self.replay_cap,
                 replay_window=window,
-                x_cached=self.x_cached,
                 **k1.gemv_staging(rows),
             )
             for p in self.plans
@@ -692,7 +672,7 @@ class K3MonoDecodeRunner:
             "x_dbg": 0 if taps is None else p(taps["x"]),
             "proj_dbg": 0 if taps is None else p(taps["proj"]),
             "scratch": p(self.scratch), "plain": p(self.plain),
-            "layer": plan.layer_id, "tl": 0, "xc": p(self.x_rows),
+            "layer": plan.layer_id, "tl": 0,
         })  # fmt: skip
         # the caller's stream: a FlyDSL launcher left to its default submits on
         # the NULL stream outside a graph capture
