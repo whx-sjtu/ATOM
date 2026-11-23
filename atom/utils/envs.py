@@ -598,12 +598,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_DCP_SPARSE_PREFILL_NONPS", "1") == "1"
     ),
     # DCP sparse decode: kernel that merges the exchanged top-k candidates into
-    # this rank's owned KV slots. "atom" (default) is atom/model_ops/
-    # dcp_topk_merge.py reading the all-gather's layout as it lands; "aiter" is
-    # flydsl_dcp_topk_merge behind a transposing copy. Same output bit for bit.
+    # this rank's owned KV slots. "aiter" (default) is flydsl_dcp_topk_merge;
+    # "atom" is atom/model_ops/dcp_topk_merge.py. Same output bit for bit.
     # "atom:<threads>:<radix bits>" (e.g. "atom:1024:11,11,10") picks its
     # block size and radix passes.
-    "ATOM_DCP_TOPK_MERGE": lambda: os.getenv("ATOM_DCP_TOPK_MERGE", "atom"),
+    "ATOM_DCP_TOPK_MERGE": lambda: os.getenv("ATOM_DCP_TOPK_MERGE", "aiter"),
     # DCP sparse decode local top-k (stable, k = index_topk over the rank's
     # logits): "auto" is aiter's width/rows dispatch; "split" and "oneblock"
     # force its FlyDSL multi-CTA or one-block kernel.
