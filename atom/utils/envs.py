@@ -604,6 +604,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DMLA_MLA_HEAD_SPLIT": lambda: (
         os.getenv("ATOM_DMLA_MLA_HEAD_SPLIT", "0") == "1"
     ),
+    # Sparse DCP decode on the one-row-a-workgroup template: skip aiter's split
+    # reduce. Every work item of that template holds a whole row and writes o
+    # and the LSE itself, so the reduce has no partials and only costs a launch;
+    # outputs are bit-identical. Rebuilt plans keep it. Off by default.
+    "ATOM_DMLA_MLA_NO_REDUCE": lambda: (
+        os.getenv("ATOM_DMLA_MLA_NO_REDUCE", "0") == "1"
+    ),
     # Unquantized BF16 attn_res in decode steps: take a layer's B+1 candidates
     # in one tile (BL = next_pow2(B+1), at most 16) instead of two at a time.
     # Prefill keeps the two-candidate tile. BL follows the layer and the step

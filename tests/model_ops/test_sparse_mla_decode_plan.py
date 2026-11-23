@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import contextlib
 import json
 import logging
 import math
@@ -57,7 +58,11 @@ def runtime():
         "PERSISTENT_WORK_BUFFERS": WORK,
         "_MLA_SPLIT_BUDGET_AUTO": -1,
         "_mla_seg_meta_kwargs": dict,
-        "envs": SimpleNamespace(ATOM_MLA_PAGE_SIZE=1, ATOM_DMLA_MLA_HEAD_SPLIT=False),
+        "envs": SimpleNamespace(
+            ATOM_MLA_PAGE_SIZE=1,
+            ATOM_DMLA_MLA_HEAD_SPLIT=False,
+            ATOM_DMLA_MLA_NO_REDUCE=False,
+        ),
         "triton": SimpleNamespace(next_power_of_2=lambda n: 1 << (n - 1).bit_length()),
         "logger": logging.getLogger(__name__),
     }
@@ -125,13 +130,21 @@ def runtime():
                 lse[row] = scores.logsumexp(-1)
         return out, lse
 
+    reduce_skips = []
+
+    def skipping_reduce(skip):
+        reduce_skips.append(skip)
+        return contextlib.nullcontext()
+
     ns.update(
         get_mla_metadata_v1=planner,
         get_mla_metadata_info_v1=sizes,
         decode_update_mla_metadata_v1=planner,
         patch_work_kv_ranges=patch,
         mla_decode_fwd=launch,
+        _skipping_mla_decode_reduce=skipping_reduce,
         calls=calls,
+        reduce_skips=reduce_skips,
     )
     return ns
 
@@ -448,6 +461,24 @@ def test_head_split_plan_falls_back_without_the_layers_row_tensors(runtime):
     torch.testing.assert_close(lse, expected_lse)
 
 
+@pytest.mark.parametrize("no_reduce", [False, True])
+@pytest.mark.parametrize("head_split", [False, True])
+@pytest.mark.parametrize("max_q", [1, 8])
+def test_no_reduce_covers_only_the_builders_template(
+    runtime, no_reduce, head_split, max_q
+):
+    runtime["envs"].ATOM_DMLA_MLA_NO_REDUCE = no_reduce
+    runtime["envs"].ATOM_DMLA_MLA_HEAD_SPLIT = head_split
+    _, md, layer = setup(runtime, 16, max_q)
+    selection(md, 16, 1)
+    q, kv = torch.randn(16, 64, 8).bfloat16(), torch.randn(97, 1, 8).bfloat16()
+    layer._forward_decode(q, kv, md, return_lse=True)
+    # A rebuilt plan may split rows over workgroups and keeps the reduce.
+    layer._forward_decode(q[:, :32], kv, md, return_lse=True)
+    assert len(runtime["calls"]) == 2
+    assert runtime["reduce_skips"] == [no_reduce, False]
+
+
 def test_whole_row_plan_is_not_reused_for_a_multiple_of_its_heads(runtime):
     _, md, layer = setup(runtime, 16, heads=16)
     selection(md, 16, 1)
@@ -557,7 +588,7 @@ def test_fallback_sizes_for_consumers_with_more_workgroups(runtime):
     md.__dict__.update(builder.set_mla_persistent_worker_buffers(16, 1))
     selection(md, 16, 2)
     original = md.work_info_set.clone()
-    buffers, groups = layer._sparse_dcp_decode_work_buffers(
+    buffers, groups, whole_row_items = layer._sparse_dcp_decode_work_buffers(
         md,
         torch.empty(16, 64, 8, dtype=fp8),
         torch.empty(97, 1, 8, dtype=fp8),
@@ -566,7 +597,7 @@ def test_fallback_sizes_for_consumers_with_more_workgroups(runtime):
         md.sparse_kv_last_page_lens,
         "",
     )
-    assert groups == 1
+    assert groups == 1 and not whole_row_items
     assert buffers[1].numel() == 513 and md.work_indptr.numel() == 257
     expected = runtime["get_mla_metadata_info_v1"](
         16, 1, 64, fp8, fp8, is_sparse=False, fast_mode=True
@@ -788,3 +819,78 @@ def test_native_decode_and_graph_against_direct_attention(
             lse[:rows][live], expected_lse[live], atol=0.02, rtol=0.01
         )
     assert len(builds) == 1
+
+
+@pytest.mark.skipif(
+    not torch.version.hip or not torch.cuda.is_available(), reason="requires ROCm GPU"
+)
+@pytest.mark.parametrize("max_q,rows", [(1, 16), (8, 128), (1, 64)])
+@pytest.mark.parametrize("heads", [64, 96])
+@pytest.mark.parametrize("head_split", [False, True])
+def test_native_decode_without_reduce_is_bit_identical(
+    max_q, rows, heads, head_split, monkeypatch
+):
+    from aiter import get_mla_metadata_info_v1
+
+    from atom.model_ops import attention_mla
+    from atom.model_ops.attentions import aiter_mla
+
+    dtype = torch.float8_e4m3fn
+    monkeypatch.setenv("ATOM_DMLA_MLA_HEAD_SPLIT", "1" if head_split else "0")
+    sizes = get_mla_metadata_info_v1(rows, 1, heads, dtype, dtype, is_sparse=True)
+    ns = {
+        "Builder": aiter_mla.AiterMLAMetadataBuilder,
+        "Attention": attention_mla.MLAAttention,
+    }
+    _, md, layer = setup(ns, rows, max_q, dtype, "cuda", sizes, heads=heads)
+    plan_name = "sparse_mtp_dcp_decode_plan" if max_q > 1 else "sparse_dcp_decode_plan"
+    if getattr(md, plan_name) is None:
+        pytest.skip("runtime does not qualify this native plan geometry")
+    reduces = []
+    reduce = attention_mla._aiter_mla._mla_decode_reduce_v1_dispatch
+
+    def counted(*a, **kw):
+        reduces.append(1)
+        return reduce(*a, **kw)
+
+    monkeypatch.setattr(
+        attention_mla._aiter_mla, "_mla_decode_reduce_v1_dispatch", counted
+    )
+    empty = torch.empty
+
+    def poisoned(*a, **kw):
+        out = empty(*a, **kw)
+        return out.fill_(math.nan) if out.is_floating_point() else out
+
+    torch.manual_seed(5)
+    q = (torch.randn(rows + 2, heads, 576, device="cuda") / 4).to(dtype)
+    kv = (torch.randn(97, 1, 576, device="cuda") / 4).to(dtype)
+    layer.scale = 576**-0.5
+    selection(md, rows, 1, "cuda")
+    outs = {}
+    for no_reduce in (False, True):
+        monkeypatch.setenv("ATOM_DMLA_MLA_NO_REDUCE", "1" if no_reduce else "0")
+        # Anything the decode leaves unwritten reads NaN.
+        monkeypatch.setattr(torch, "empty", poisoned)
+        outs[no_reduce] = layer._forward_decode(q, kv, md, return_lse=True)
+        monkeypatch.setattr(torch, "empty", empty)
+        torch.cuda.synchronize()
+    assert len(reduces) == 1
+    live = md.dcp_sparse_kv_indptr.diff() > 0
+    assert torch.isfinite(outs[True][0][:rows][live].float()).all()
+    assert torch.isfinite(outs[True][1][:rows][live]).all()
+    for got, want in zip(outs[True], outs[False], strict=True):
+        torch.testing.assert_close(got, want, rtol=0, atol=0, equal_nan=True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out, lse = layer._forward_decode(q, kv, md, return_lse=True)
+    assert len(reduces) == 1
+    out[:rows][live] = math.nan
+    lse[:rows][live] = math.nan
+    graph.replay()
+    torch.testing.assert_close(
+        out[:rows][live], outs[False][0][:rows][live], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        lse[:rows][live], outs[False][1][:rows][live], rtol=0, atol=0
+    )

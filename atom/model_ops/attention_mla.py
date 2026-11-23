@@ -2,10 +2,13 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial as functools_partial
 from typing import ClassVar, Protocol
 
+import aiter.mla as _aiter_mla
 import torch
 import triton
 import triton.language as tl
@@ -111,6 +114,43 @@ from atom.utils.region_graph import eager_region, prefill_token_graph_capture
 # `min(num_clusters, cap * batch_size)` parts, and a negative cap means uncapped
 # -- as many parts as the machine has clusters (v1_2_device.cuh:894).
 _MLA_SPLIT_BUDGET_AUTO = -1
+
+_empty_reduce_skip = threading.local()
+
+
+def _gate_mla_decode_reduce() -> bool:
+    """Route aiter's persistent decode reduce through `_empty_reduce_skip`, once.
+    False, with nothing changed, if this aiter has no such seam."""
+    reduce = getattr(_aiter_mla, "_mla_decode_reduce_v1_dispatch", None)
+    if reduce is None:
+        return False
+    if not getattr(reduce, "atom_gated", False):
+
+        def gated(*args, **kwargs):
+            if not getattr(_empty_reduce_skip, "on", False):
+                reduce(*args, **kwargs)
+
+        gated.atom_gated = True
+        _aiter_mla._mla_decode_reduce_v1_dispatch = gated
+        logger.info(
+            "ATOM_DMLA_MLA_NO_REDUCE is on: sparse DCP decode on the whole-row "
+            "template runs without aiter's split reduce."
+        )
+    return True
+
+
+@contextmanager
+def _skipping_mla_decode_reduce(skip: bool):
+    """This thread's aiter decode calls run without their split reduce: only for
+    plans whose work items all write o and the LSE themselves (no partials)."""
+    if not skip or not _gate_mla_decode_reduce():
+        yield
+        return
+    _empty_reduce_skip.on = True
+    try:
+        yield
+    finally:
+        _empty_reduce_skip.on = False
 
 
 def indexer_qk_rope_quant_and_cache(
@@ -2939,8 +2979,10 @@ class MLAAttention(nn.Module):
     def _sparse_dcp_decode_work_buffers(
         self, attn_metadata, q, kv_buffer, qptr, kvptr, last, work_prefix
     ):
-        """The step's work buffers for q, and the head groups their plan splits
-        each q row into (`ATOM_DMLA_MLA_HEAD_SPLIT`); 1 if it plans whole rows."""
+        """The step's work buffers for q, the head groups their plan splits
+        each q row into (`ATOM_DMLA_MLA_HEAD_SPLIT`; 1 if it plans whole rows),
+        and whether they are the builder's one-row-a-workgroup template, whose
+        work items never split a row."""
         buffers = tuple(
             getattr(attn_metadata, f"{work_prefix}{name}")
             for name in PERSISTENT_WORK_BUFFERS
@@ -3011,7 +3053,7 @@ class MLAAttention(nn.Module):
                 work_prefix=work_prefix,
                 work_buffers=buffers,
             )
-        return buffers, groups
+        return buffers, groups, reuse
 
     def decode_is_persistent(self) -> bool:
         """Whether this layer's aiter decode runs the persistent kernel over the
@@ -3177,15 +3219,18 @@ class MLAAttention(nn.Module):
 
             decode_work_buffers = None
             head_groups = 1
+            whole_row_items = False
             if use_persistent_mode and self.is_sparse_mla and self.dcp_world_size > 1:
-                decode_work_buffers, head_groups = self._sparse_dcp_decode_work_buffers(
-                    attn_metadata,
-                    q,
-                    kv_buffer,
-                    paged_cu_seqlens_q,
-                    paged_kv_indptr,
-                    paged_kv_last_page_lens,
-                    work_prefix="sparse_mtp_" if is_sparse_mtp else "",
+                decode_work_buffers, head_groups, whole_row_items = (
+                    self._sparse_dcp_decode_work_buffers(
+                        attn_metadata,
+                        q,
+                        kv_buffer,
+                        paged_cu_seqlens_q,
+                        paged_kv_indptr,
+                        paged_kv_last_page_lens,
+                        work_prefix="sparse_mtp_" if is_sparse_mtp else "",
+                    )
                 )
             if head_groups > 1:
                 # Each row's heads as head_groups consecutive rows; o follows q.
@@ -3260,34 +3305,37 @@ class MLAAttention(nn.Module):
                 )
 
             seg_kv_buffer_4d = kv_buffer.view(-1, page_size, 1, q.shape[-1])
-            _, final_lse = mla_decode_fwd(
-                q,
-                seg_kv_buffer_4d,
-                o,
-                paged_cu_seqlens_q,
-                paged_kv_indptr,
-                paged_kv_indices,
-                paged_kv_last_page_lens,
-                max_q_len,
-                page_size=page_size,
-                # The seg/asm decode path runs with a single kv split; the
-                # page_size=1 persistent path keeps 16 splits (metadata-derived).
-                num_kv_splits=None if self.use_seg_mla else num_kv_splits,
-                sm_scale=self.scale,
-                work_meta_data=work_meta_data,
-                work_indptr=work_indptr,
-                work_info_set=work_info_set,
-                reduce_indptr=reduce_indptr,
-                reduce_final_map=reduce_final_map,
-                reduce_partial_map=reduce_partial_map,
-                q_scale=self._q_scale,
-                kv_scale=self._k_scale,
-                return_lse=return_lse,
-                g_kv_indptr=g_kv_indptr,
-                cp_world_size=cp_world_size,
-                cp_rank=cp_rank,
-                causal=causal,
-            )
+            with _skipping_mla_decode_reduce(
+                whole_row_items and envs.ATOM_DMLA_MLA_NO_REDUCE
+            ):
+                _, final_lse = mla_decode_fwd(
+                    q,
+                    seg_kv_buffer_4d,
+                    o,
+                    paged_cu_seqlens_q,
+                    paged_kv_indptr,
+                    paged_kv_indices,
+                    paged_kv_last_page_lens,
+                    max_q_len,
+                    page_size=page_size,
+                    # The seg/asm decode path runs with a single kv split; the
+                    # page_size=1 persistent path keeps 16 splits (metadata-derived).
+                    num_kv_splits=None if self.use_seg_mla else num_kv_splits,
+                    sm_scale=self.scale,
+                    work_meta_data=work_meta_data,
+                    work_indptr=work_indptr,
+                    work_info_set=work_info_set,
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    q_scale=self._q_scale,
+                    kv_scale=self._k_scale,
+                    return_lse=return_lse,
+                    g_kv_indptr=g_kv_indptr,
+                    cp_world_size=cp_world_size,
+                    cp_rank=cp_rank,
+                    causal=causal,
+                )
             if head_groups > 1:
                 o = o.view(B, -1, o.shape[-1])
                 if final_lse is not None:
