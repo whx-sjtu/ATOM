@@ -52,6 +52,10 @@ from atom.model_ops.kimi_k3.attention_residual import (
     ColumnTail,
     materialize_column_output,
 )
+from atom.model_ops.kimi_k3.flash_kda_tuning import (
+    apply_env_flash_kda_schedules,
+    balanced_chunks_per_seg,
+)
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -1702,9 +1706,7 @@ class KimiKDAAttention(nn.Module):
         cu_seqlens: torch.Tensor | None,
         output_final_state: bool,
     ):
-        from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
-
-        return chunk_kimi_delta_attn(
+        return self._chunk_kda(
             q=q,
             k=k,
             v=v,
@@ -1732,6 +1734,42 @@ class KimiKDAAttention(nn.Module):
             state_v_first=True,
         )
 
+    def _chunk_kda(self, **kwargs):
+        """``chunk_kimi_delta_attn`` under the FlashKDA schedule switches; with
+        ``ATOM_KDA_PREFILL_SEG_BALANCE``, a multi-sequence FlashKDA call goes
+        straight to ``flash_kda_fwd`` at ``balanced_chunks_per_seg``'s segment
+        length, which the wrapper does not forward."""
+        from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
+
+        apply_env_flash_kda_schedules()
+        cu = kwargs["cu_seqlens"]
+        if envs.ATOM_KDA_PREFILL_SEG_BALANCE and cu is not None and cu.shape[0] > 2:
+            from aiter.ops.triton._triton_kernels.kimi_delta_attn import flash_kda
+
+            q, v = kwargs["q"], kwargs["v"]
+            flags = (
+                "use_qk_l2norm_in_kernel",
+                "use_gate_in_kernel",
+                "use_beta_sigmoid_in_kernel",
+            )
+            if flash_kda.AITER_FDA_ENABLE and flash_kda.flash_kda_supported(
+                q=q,
+                v=v,
+                chunk_size=flash_kda.FLASH_KDA_CHUNK,
+                safe_gate=kwargs["safe_gate"],
+                lower_bound=kwargs["lower_bound"],
+                A_log=kwargs["A_log"],
+                **{f: kwargs[f] for f in flags},
+            ):
+                cps = balanced_chunks_per_seg(cu, q.shape[2], v.shape[-1])
+                if cps is not None:
+                    for f in (*flags, "safe_gate"):
+                        del kwargs[f]
+                    return flash_kda.flash_kda_fwd(
+                        scale=q.shape[-1] ** -0.5, chunks_per_seg=cps, **kwargs
+                    )
+        return chunk_kimi_delta_attn(**kwargs)
+
     def _paged_prefill(self, kda_metadata, ssm_state) -> bool:
         """Whether this prefill runs on the slot pool in place
         (``ATOM_KDA_PREFILL_PAGED_STATE``). A fork reads one slot and writes
@@ -1753,9 +1791,7 @@ class KimiKDAAttention(nn.Module):
     def _run_kda_paged(self, q, k, v, g, beta, kda_metadata, ssm_state):
         """`_run_kda` with the state read from and written back to
         ``ssm_state[state_indices]`` by the kernels themselves."""
-        from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
-
-        out, _ = chunk_kimi_delta_attn(
+        out, _ = self._chunk_kda(
             q=q,
             k=k,
             v=v,
