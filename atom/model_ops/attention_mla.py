@@ -76,6 +76,7 @@ from atom.model_ops.dcp_ops import dcp_all_gather_prefill_query_heads
 from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import use_triton_gemm
+from atom.model_ops.rotary_embedding import NoPositionalRotaryEmbedding
 from atom.model_ops.sparse_mla_work_plan import patch_work_kv_ranges
 from atom.model_ops.triton_fused_mla_ctx_kv import fused_mla_ctx_norm_rope_cache
 from atom.model_ops.triton_fused_qkv_quant import (
@@ -86,6 +87,7 @@ from atom.model_ops.triton_mla_absorb_qpack import (
     mla_absorb_q_pack,
     mla_absorb_q_pack_supports,
 )
+from atom.model_ops.triton_mla_q_tail_cache import mla_q_tail_and_cache
 from atom.model_ops.utils import (
     dynamic_per_batched_tensor_quant,
     get_and_maybe_dequant_weights,
@@ -223,6 +225,9 @@ if fused_qk_rope_concat_and_cache_mla_seg is not None:
     )
 mla_absorb_q_pack = mark_trace(
     mla_absorb_q_pack, prefix="k_up_proj_q_pack", torch_compile=False
+)
+mla_q_tail_and_cache = mark_trace(
+    mla_q_tail_and_cache, prefix="rope_and_kv_cache", torch_compile=False
 )
 mla_prefill_fwd = mark_trace(mla_prefill_fwd, prefix="mla_prefill", torch_compile=False)
 mla_decode_fwd = mark_trace(mla_decode_fwd, prefix="mla_decode", torch_compile=False)
@@ -748,6 +753,10 @@ class MLAAttention(nn.Module):
         self.one_scale = torch.tensor(1.0, dtype=torch.float32)
         self._k_scale = self.one_scale
         self._q_scale = self.one_scale
+        # The rope is the identity, so the absorb path's rope op is two casts.
+        self._q_tail_cache = envs.ATOM_MLA_Q_TAIL_CACHE and isinstance(
+            self.rotary_emb, NoPositionalRotaryEmbedding
+        )
         # A device copy for write_context_kv_latent's fused store, which reads
         # the scale from a Triton pointer. The scales above are host tensors --
         # the aiter store kernels take them as host scalars -- and a host
@@ -3710,40 +3719,58 @@ class MLAAttention(nn.Module):
                     # DCP: q_out is head all-gathered, so every rank must compute
                     # Q RoPE for all tokens (incl. slot=-1 non-owned). Non-DCP
                     # keeps the default (early-return on padded tokens).
-                    fused_qk_rope_concat_and_cache_mla(
-                        # Absorbing into q_out, this op is wanted only for the
-                        # rope half and the KV write: a one-row stand-in keeps
-                        # it off q_nope, and the absorb below overwrites the
-                        # nope half it stores. shortcut: that nope store is one
-                        # wasted FP8 q_out[..., :L] write; drop it once the
-                        # absorb kernel also writes the rope half, or aiter's
-                        # q_nope_prestored writer runs off gfx1250.
-                        (
-                            q_rope.new_empty(self.kv_lora_rank).expand(
-                                *q_rope.shape[:2], -1
-                            )
-                            if absorb_into_q_out
-                            else q_nope
-                        ),
-                        q_rope,
-                        k_nope,
-                        k_rope,
-                        kv_cache.view(
-                            kv_cache.shape[0],
-                            -1,
-                            self.kv_lora_rank + self.qk_rope_head_dim,
-                        ),
-                        q_out_write,
-                        write_slot_mapping,
-                        self._k_scale,
-                        self._q_scale,
-                        positions,
-                        self.rotary_emb.cos_cache,
-                        self.rotary_emb.sin_cache,
-                        is_neox=self.rotary_emb.is_neox_style,
-                        is_nope_first=True,
-                        compute_all_q_rope=self.dcp_world_size > 1,
-                    )
+                    if absorb_into_q_out and self._q_tail_cache:
+                        mla_q_tail_and_cache(
+                            q_rope,
+                            k_nope,
+                            k_rope,
+                            kv_cache.view(
+                                kv_cache.shape[0],
+                                -1,
+                                self.kv_lora_rank + self.qk_rope_head_dim,
+                            ),
+                            q_out_write,
+                            write_slot_mapping,
+                            self._k_scale,
+                            self._q_scale,
+                        )
+                    else:
+                        fused_qk_rope_concat_and_cache_mla(
+                            # Absorbing into q_out, this op is wanted only for
+                            # the rope half and the KV write: a one-row
+                            # stand-in keeps it off q_nope, and the absorb
+                            # below overwrites the nope half it stores.
+                            # shortcut: that nope store is one wasted FP8
+                            # q_out[..., :L] write; drop it once the absorb
+                            # kernel also writes the rope half, or aiter's
+                            # q_nope_prestored writer runs off gfx1250. Under
+                            # an identity rotary ATOM_MLA_Q_TAIL_CACHE drops it.
+                            (
+                                q_rope.new_empty(self.kv_lora_rank).expand(
+                                    *q_rope.shape[:2], -1
+                                )
+                                if absorb_into_q_out
+                                else q_nope
+                            ),
+                            q_rope,
+                            k_nope,
+                            k_rope,
+                            kv_cache.view(
+                                kv_cache.shape[0],
+                                -1,
+                                self.kv_lora_rank + self.qk_rope_head_dim,
+                            ),
+                            q_out_write,
+                            write_slot_mapping,
+                            self._k_scale,
+                            self._q_scale,
+                            positions,
+                            self.rotary_emb.cos_cache,
+                            self.rotary_emb.sin_cache,
+                            is_neox=self.rotary_emb.is_neox_style,
+                            is_nope_first=True,
+                            compute_all_q_rope=self.dcp_world_size > 1,
+                        )
                     if absorb_into_q_out:
                         mla_absorb_q_pack(
                             q_nope.transpose(0, 1),
