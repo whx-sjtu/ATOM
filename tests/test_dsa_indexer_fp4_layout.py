@@ -236,7 +236,8 @@ def test_native_bindings_keep_mfma_allocator_byte_types(backend):
         for node in ast.walk(ast.parse(path.read_text()))
         if isinstance(node, ast.FunctionDef) and node.name == "build_kv_cache_tensor"
     )
-    namespace = {"MLA_ROWS": "mla"}
+    # No impl on this module, so the token-graph layout check is skipped.
+    namespace = {"MLA_ROWS": "mla", "MLAAttention": type("MLAAttention", (), {})}
     exec(  # noqa: S102 -- runs production binding without GPU backend imports
         compile(ast.Module(body=[bind], type_ignores=[]), str(path), "exec"), namespace
     )
