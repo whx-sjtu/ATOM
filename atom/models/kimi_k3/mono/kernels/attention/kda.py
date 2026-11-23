@@ -281,6 +281,33 @@ class KdaPreBuild:
     # that spilled (``runner._lean_width``)
     x_ahead: int = field(default=1, metadata={"sym": "a"})
     kda0: int = field(default=0, metadata={"sym": "k0"})  # the first KDA task's CTA
+    # a timing bench's ablation (``ABLATE_*`` bits; wrong outputs), 0 serving.
+    # Only a build that sets it names it (``symbol``)
+    ablate: int = field(default=0, metadata={"sym": "ab"})
+    # column-group units a ``gemv_groups`` unit's weights are issued ahead of
+    # its MFMAs (held in VGPRs meanwhile). One leaves a CTA one unit's weights
+    # in flight, a load round trip a unit: the GEMV past its x a latency chain
+    w_ahead: int = field(default=1, metadata={"sym": "wa"})
+
+
+# ``KdaPreBuild.ablate``: a path compiled away, its cost read off the time left
+ABLATE_KDA = 1  # no KDA tasks: the launch ends with the GEMV
+ABLATE_WEIGHTS = 2  # the GEMV's weight operands zeros, never loaded
+ABLATE_ATTN = 4  # no AttnRes, and the GEMV waits for no x (XRDY)
+ABLATE_X = 8  # the GEMV's x rows zeros, never loaded (their LDS staging kept)
+
+# fields a build names only off their default, so a serving build's symbol (and
+# LLVM's register choice with it) is the one it had before they existed
+_UNNAMED_DEFAULT = {"ablate": 0, "w_ahead": 1}
+
+
+def symbol(key: KdaPreBuild) -> str:
+    """``key``'s kernel symbol (``_UNNAMED_DEFAULT``)."""
+    sym = symbol_params(key)
+    for f, off in _UNNAMED_DEFAULT.items():
+        if getattr(key, f) == off:
+            del sym[KdaPreBuild.__dataclass_fields__[f].metadata["sym"]]
+    return kernel_symbol("k3_mono_kda_pre", **sym)
 
 
 ABI = KernelAbi(
@@ -615,6 +642,8 @@ def gemv_loads(c, rg, chunks, paired: bool = False):
     lane, wave = c["lane"], c["wave"]
     # bounded: the last task's rows past ``FUSED`` are not in the weight,
     # and a buffer load past num_records returns zero
+    if const_expr(c["ablate"] & ABLATE_WEIGHTS):
+        return [[fx.Vector.filled(4, 0, fx.Int32) for _ in range(4)] for _ in chunks]
     r_w = rsrc(c["args"]["w_in"], FUSED * HIDDEN * 2)
     row0 = fx.min(rg, GEMV_TASKS - 1) * ROWS
     return [
@@ -627,8 +656,9 @@ def gemv_loads(c, rg, chunks, paired: bool = False):
 def await_x(c):
     """Every slice's x ready. Hoisted out of the staging so that slabbing it
     does not re-poll the same mailboxes once a slab."""
-    if c["tid"] < NA:
-        c["poll"]([(c["xrdy"], c["tid"], 1)])
+    if const_expr(not c["ablate"] & ABLATE_ATTN):  # noqa: SIM102
+        if c["tid"] < NA:
+            c["poll"]([(c["xrdy"], c["tid"], 1)])
     gpu.barrier()
 
 
@@ -660,6 +690,8 @@ def x_chunk(c, i0: int, ni: int, e):
     local column 0)."""
     cols = ni * KGROUP
     t, k = e // (cols // 8), e % (cols // 8) * 8
+    if const_expr(c["ablate"] & ABLATE_X):
+        return fx.Vector.filled(4, 0, fx.Int32), c["xl"] + (t * c["xrow"] + k) // 2
     v = fx.Vector(
         bo.buffer_load(
             rsrc(c["xbuf"]),
@@ -690,8 +722,9 @@ def x_wave_stage(c, i0: int, ni: int):
     already in flight. No barrier here: the caller's, past every wave's
     weights, publishes the rows."""
     s, lane = c["S"], c["lane"]
-    if lane < NA:
-        c["poll"]([(c["xrdy"], lane, 1)])
+    if const_expr(not c["ablate"] & ABLATE_ATTN):  # noqa: SIM102
+        if lane < NA:
+            c["poll"]([(c["xrdy"], lane, 1)])
     words = x_words(s, ni)
     n = (words + 63) // 64
     # X_BATCH loads in flight, then their stores: a store after each load
@@ -769,11 +802,25 @@ def attnres(c, task, sg, on, tls):
     stamp(on, tls, c["tid"], 3)
 
 
-def gemv_staging(s: int) -> dict:
+def gemv_staging(s: int, w_ahead: bool = False) -> dict:
     """``gemv_groups``' staging for an s-row step (``KdaPreBuild.gemv_unit`` /
     ``x_ahead``): from three token groups on, a column group a unit with x
-    four units ahead; else two groups a unit with x one ahead."""
-    return {"gemv_unit": 1, "x_ahead": 4} if groups(s) >= 3 else {}
+    four units ahead; else two groups a unit with x one ahead.
+
+    ``w_ahead`` (``ATOM_MONO_K1_W_AHEAD``): at two groups whose second holds at
+    most ``W_AHEAD_TAIL`` rows, the weights two column groups ahead. A wave's
+    loads complete in issue order (vmcnt), so an x load issued after a unit's
+    weights, stored (waited for) ``x_ahead`` - 1 units on, waits for them too:
+    the weights stay in flight their two column groups (2 G units) only with x
+    2 G - 1 ahead, more only costs VGPRs. Only there does that fit them (the
+    short group's x is one 16 B chunk a thread); elsewhere it spills."""
+    g = groups(s)
+    if w_ahead and g == 2 and s - TG <= W_AHEAD_TAIL:
+        return {"gemv_unit": 1, "w_ahead": 2, "x_ahead": 2 * g - 1}
+    return {"gemv_unit": 1, "x_ahead": 4} if g >= 3 else {}
+
+
+W_AHEAD_TAIL = 4
 
 
 def xu_row(unit):
@@ -788,6 +835,8 @@ def units_kg(unit):
 
 def x_unit_loads(c, i0, n):
     """A thread's chunks of column groups i0 .. i0 + n of the (group's) x rows."""
+    if const_expr(c["ablate"] & ABLATE_X):
+        return [fx.Vector.filled(4, 0, fx.Int32) for _ in range(-(-c["S"] * n * KGROUP // 8 // THREADS))]
     return gemv.rows_loads(c["tid"], c["xbuf"], c["S"], n * KGROUP, HIDDEN, i0 * KGROUP)
 
 
@@ -822,10 +871,12 @@ def gemv_groups(c, gi):
             gemv_loads(c, rg1, range(i0, i0 + n), paired=True),
         ]
 
-    ops = {0: unit_ops(0)}
+    wa = min(c["w_ahead"], len(kunits))
+    ops = {k: unit_ops(k) for k in range(wa)}
     # every group's slices ready (XRDY, NA a group)
-    if c["tid"] < NA * G:
-        c["poll"]([(c["xrdy"], c["tid"], 1)])
+    if const_expr(not c["ablate"] & ABLATE_ATTN):  # noqa: SIM102
+        if c["tid"] < NA * G:
+            c["poll"]([(c["xrdy"], c["tid"], 1)])
     gpu.barrier()
 
     def x_of(u):
@@ -838,8 +889,8 @@ def gemv_groups(c, gi):
 
     def multiply(u, buf):
         k, g = units[u]
-        if const_expr(g == 0 and k + 1 < len(kunits)):
-            ops[k + 1] = unit_ops(k + 1)
+        if const_expr(g == 0 and k + wa < len(kunits)):
+            ops[k + wa] = unit_ops(k + wa)
         cu = {**group_view(c, g), "xl": buf, "xrow": row}
         acc0[g] = gemv_slab(cu, ops[k][0], kunits[k][1], acc0[g])
         acc1[g] = gemv_slab(cu, ops[k][1], kunits[k][1], acc1[g])
@@ -1663,7 +1714,7 @@ def build(key: KdaPreBuild):
         tls: fx.Array[fx.Int64, TL_POINTS, 16]
 
     keyed = key_tuple(key, _SOURCES)
-    name = kernel_symbol("k3_mono_kda_pre", **symbol_params(key))
+    name = symbol(key)
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def kda_pre(
@@ -1746,6 +1797,8 @@ def build(key: KdaPreBuild):
             "rwin": key.replay_window,
             "unit": key.gemv_unit,
             "x_ahead": key.x_ahead,
+            "ablate": key.ablate,
+            "w_ahead": key.w_ahead,
             "vloc": kl.vloc.ptr,
             "ol": kl.ol.ptr,
             "onl": kl.onl.ptr,
@@ -1791,7 +1844,7 @@ def build(key: KdaPreBuild):
         # token group g's AttnRes on CTAs 56 g ..: the groups side by side; the
         # GEMV waits for every group's x (XRDY, NA a group) before its first
         # unit (``gemv_groups``)
-        for g in range_constexpr(G):
+        for g in range_constexpr(G if not key.ablate & ABLATE_ATTN else 0):
             if (bid >= NA * g) & (bid < NA * (g + 1)):
                 attnres(group_view(c, g), bid - NA * g, group_rows(s, g), on, tls)
         if const_expr(G > 1):  # noqa: SIM102
@@ -1852,7 +1905,8 @@ def build(key: KdaPreBuild):
                 stamp(on, tls, tid, 5)
                 gemv_finish(c, rg1, acc1)
                 stamp(on, tls, tid, 6)
-        kda_tasks(c, on, tls)
+        if const_expr(not key.ablate & ABLATE_KDA):
+            kda_tasks(c, on, tls)
         stamp_flush(on, tls, tl, tid, bid, TL_POINTS)
 
     @flyc.jit
