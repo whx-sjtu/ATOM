@@ -53,6 +53,10 @@ from atom.model_ops.kimi_k3.attention_residual import (
     materialize_column_output,
     zero_addends,
 )
+from atom.model_ops.kimi_k3.flash_kda_tuning import (
+    apply_env_flash_kda_schedules,
+    balanced_chunks_per_seg,
+)
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -1703,9 +1707,7 @@ class KimiKDAAttention(nn.Module):
         cu_seqlens: torch.Tensor | None,
         output_final_state: bool,
     ):
-        from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
-
-        return chunk_kimi_delta_attn(
+        return self._chunk_kda(
             q=q,
             k=k,
             v=v,
@@ -1732,6 +1734,86 @@ class KimiKDAAttention(nn.Module):
             # K-first and decode reads it transposed.
             state_v_first=True,
         )
+
+    def _chunk_kda(self, **kwargs):
+        """``chunk_kimi_delta_attn`` under the FlashKDA schedule switches; with
+        ``ATOM_KDA_PREFILL_SEG_BALANCE``, a multi-sequence FlashKDA call goes
+        straight to ``flash_kda_fwd`` at ``balanced_chunks_per_seg``'s segment
+        length, which the wrapper does not forward."""
+        from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
+
+        apply_env_flash_kda_schedules()
+        cu = kwargs["cu_seqlens"]
+        if envs.ATOM_KDA_PREFILL_SEG_BALANCE and cu is not None and cu.shape[0] > 2:
+            from aiter.ops.triton._triton_kernels.kimi_delta_attn import flash_kda
+
+            q, v = kwargs["q"], kwargs["v"]
+            flags = (
+                "use_qk_l2norm_in_kernel",
+                "use_gate_in_kernel",
+                "use_beta_sigmoid_in_kernel",
+            )
+            if flash_kda.AITER_FDA_ENABLE and flash_kda.flash_kda_supported(
+                q=q,
+                v=v,
+                chunk_size=flash_kda.FLASH_KDA_CHUNK,
+                safe_gate=kwargs["safe_gate"],
+                lower_bound=kwargs["lower_bound"],
+                A_log=kwargs["A_log"],
+                **{f: kwargs[f] for f in flags},
+            ):
+                cps = balanced_chunks_per_seg(cu, q.shape[2], v.shape[-1])
+                if cps is not None:
+                    for f in (*flags, "safe_gate"):
+                        del kwargs[f]
+                    return flash_kda.flash_kda_fwd(
+                        scale=q.shape[-1] ** -0.5, chunks_per_seg=cps, **kwargs
+                    )
+        return chunk_kimi_delta_attn(**kwargs)
+
+    def _paged_prefill(self, kda_metadata, ssm_state) -> bool:
+        """Whether this prefill runs on the slot pool in place
+        (``ATOM_KDA_PREFILL_PAGED_STATE``). A fork reads one slot and writes
+        another, and interior checkpoints need the heads' final states, so
+        both keep the gather path; end checkpoints read the pool either way."""
+        ckpt = getattr(kda_metadata, "ssm_checkpoints", None)
+        if (
+            not envs.ATOM_KDA_PREFILL_PAGED_STATE
+            or getattr(kda_metadata, "has_state_fork", True)
+            or (ckpt is not None and "kda_tokens" in ckpt)
+            or ssm_state.dtype != torch.float32
+            or not ssm_state[0].is_contiguous()
+        ):
+            return False
+        from aiter.ops.triton._triton_kernels.kimi_delta_attn import flash_kda
+
+        return bool(flash_kda.AITER_FDA_ENABLE)
+
+    def _run_kda_paged(self, q, k, v, g, beta, kda_metadata, ssm_state):
+        """`_run_kda` with the state read from and written back to
+        ``ssm_state[state_indices]`` by the kernels themselves."""
+        out, _ = self._chunk_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta.float(),
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True,
+            safe_gate=self._kda_gate_lower_bound is not None,
+            lower_bound=self._kda_gate_lower_bound,
+            cu_seqlens=kda_metadata.non_spec_query_start_loc,
+            state_v_first=True,
+            out=torch.empty_like(v),
+            state_cache=ssm_state,
+            state_indices=kda_metadata.non_spec_state_indices_tensor,
+            has_initial_state=kda_metadata.has_initial_state,
+        )
+        return out
 
     def _prefill_kda(self, q, k, v, gate, beta, initial, cu, ckpt):
         """The prefill recurrence, plus each interior checkpoint's head.
@@ -1776,7 +1858,11 @@ class KimiKDAAttention(nn.Module):
         state_indices = kda_metadata.non_spec_state_indices_tensor
         query_start_loc = kda_metadata.non_spec_query_start_loc
         ckpt = getattr(kda_metadata, "ssm_checkpoints", None)
-        if ckpt is not None and "kda_tokens" in ckpt:
+        if initial is None:
+            # `_paged_prefill`: the kernels wrote the final states into the pool.
+            kda_out = self._run_kda_paged(q, k, v, gate, beta, kda_metadata, ssm_state)
+            head_states = ssm_state
+        elif ckpt is not None and "kda_tokens" in ckpt:
             kda_out, last_state, head_states = self._prefill_kda(
                 q, k, v, gate, beta, initial, query_start_loc, ckpt
             )
@@ -1785,10 +1871,11 @@ class KimiKDAAttention(nn.Module):
                 q, k, v, gate, beta, initial, query_start_loc, True
             )
             head_states = last_state
-        # last_state already has ssm_state's dtype (fla preserves the
-        # initial_state dtype; the gathered initial is allocated as such),
-        # so no .to() cast is needed.
-        ssm_state[state_indices] = last_state
+        if initial is not None:
+            # last_state already has ssm_state's dtype (fla preserves the
+            # initial_state dtype; the gathered initial is allocated as such),
+            # so no .to() cast is needed.
+            ssm_state[state_indices] = last_state
         if ckpt is not None:
             from atom.model_ops.fla_ops.state_checkpoint import write_state_checkpoints
 
@@ -1985,8 +2072,12 @@ class KimiKDAAttention(nn.Module):
             # replacing the gather + separate zero-write.
             from atom.model_ops.kimi_k3 import gather_kda_initial_state
 
-            initial = gather_kda_initial_state(
-                ssm_state, state_indices_in, kda_metadata.has_initial_state
+            initial = (
+                None
+                if self._paged_prefill(kda_metadata, ssm_state)
+                else gather_kda_initial_state(
+                    ssm_state, state_indices_in, kda_metadata.has_initial_state
+                )
             )
             kda_out = self._settle_prefill(
                 q,
@@ -2336,8 +2427,12 @@ class KimiKDAAttention(nn.Module):
         # replacing the gather + separate zero-write.
         from atom.model_ops.kimi_k3 import gather_kda_initial_state
 
-        initial = gather_kda_initial_state(
-            ssm_state, state_indices_in, kda_metadata.has_initial_state
+        initial = (
+            None
+            if self._paged_prefill(kda_metadata, ssm_state)
+            else gather_kda_initial_state(
+                ssm_state, state_indices_in, kda_metadata.has_initial_state
+            )
         )
         kda_out = self._settle_prefill(
             q,

@@ -987,6 +987,38 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_K3_KDA_FUSED_DECODE": lambda: (
         os.getenv("ATOM_KIMI_K3_KDA_FUSED_DECODE", "1").lower() == "1"
     ),
+    # Prefill causal conv1d (channel-last, no prefix caching) with a
+    # [tokens x channels] tile per program instead of the 8-token row kernel.
+    # Bit-identical output at Kimi-K3's shape (width 4, no bias); off by default.
+    "ATOM_CONV1D_TILED_PREFILL": lambda: (
+        os.getenv("ATOM_CONV1D_TILED_PREFILL", "0") == "1"
+    ),
+    # Kimi-K3 KDA prefill reads and writes the recurrent state in the slot pool
+    # directly (FlashKDA's paged state_cache) instead of gathering it, copying
+    # it K-first and scattering the final state back. Steps with a state fork
+    # or interior checkpoints keep the gather path. Bit-identical. Off by default.
+    "ATOM_KDA_PREFILL_PAGED_STATE": lambda: (
+        os.getenv("ATOM_KDA_PREFILL_PAGED_STATE", "0") == "1"
+    ),
+    # Kimi-K3 KDA prefill with several sequences sizes FlashKDA's segments on
+    # the step's total chunks rather than its longest sequence
+    # (flash_kda_tuning.balanced_chunks_per_seg). One-sequence steps are
+    # unchanged; multi-sequence steps segment differently, which changes
+    # numerics. Off by default.
+    "ATOM_KDA_PREFILL_SEG_BALANCE": lambda: (
+        os.getenv("ATOM_KDA_PREFILL_SEG_BALANCE", "0") == "1"
+    ),
+    # gfx950 FlashKDA pass A always on its wide tile (BW=64, 4 warps), which
+    # FlashKDA reserves for grids above 2 blocks per CU. Same per-element
+    # arithmetic, bit-identical. Off by default.
+    "ATOM_KDA_PREFILL_K2AB_WIDE": lambda: (
+        os.getenv("ATOM_KDA_PREFILL_K2AB_WIDE", "0") == "1"
+    ),
+    # gfx950 FlashKDA pass B as the prefetching scan (FlashKDA's gfx1250
+    # default). Changes numerics (scan schedule). Off by default.
+    "ATOM_KDA_PREFILL_SCAN_PREFETCH": lambda: (
+        os.getenv("ATOM_KDA_PREFILL_SCAN_PREFETCH", "0") == "1"
+    ),
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT": lambda: (
         os.getenv("ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT", "1") == "1"
     ),
