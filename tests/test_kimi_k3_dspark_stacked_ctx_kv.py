@@ -150,9 +150,14 @@ def test_otherwise_every_layer_projects_its_own(gemms, stacked, projs):
     assert [kv.shape for kv in written] == [(N, KV)] * LAYERS
 
 
-@pytest.mark.parametrize("flag, allocated", [("", False), ("1", True)])
-def test_the_stack_is_allocated_only_when_asked(monkeypatch, flag, allocated):
-    monkeypatch.setenv("ATOM_DSPARK_STACKED_CTX_KV_GEMM", flag)
+@pytest.mark.parametrize(
+    "flag, allocated", [(None, True), ("1", True), ("0", False), ("", False)]
+)
+def test_the_stack_is_on_by_default(monkeypatch, flag, allocated):
+    if flag is None:
+        monkeypatch.delenv("ATOM_DSPARK_STACKED_CTX_KV_GEMM", raising=False)
+    else:
+        monkeypatch.setenv("ATOM_DSPARK_STACKED_CTX_KV_GEMM", flag)
     from atom.utils import envs
 
     assert bool(envs.ATOM_DSPARK_STACKED_CTX_KV_GEMM) is allocated

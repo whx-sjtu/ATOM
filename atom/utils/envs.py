@@ -595,14 +595,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # QREP decode of a NoPE layer: one kernel absorbs W_K into the FP8 q_out,
     # stores the rope half and writes the step's K, in place of the W_K bmm and
     # fused_qk_rope_concat_and_cache_mla. The nope half rounds once instead of
-    # through bf16, moving about 3% of its e4m3 codes one step. Off by default.
-    "ATOM_DMLA_DECODE_QTAIL": lambda: os.getenv("ATOM_DMLA_DECODE_QTAIL", "0") == "1",
+    # through bf16, moving about 3% of its e4m3 codes one step. On by default;
+    # 0 keeps the W_K bmm and the aiter rope op.
+    "ATOM_DMLA_DECODE_QTAIL": lambda: os.getenv("ATOM_DMLA_DECODE_QTAIL", "1") == "1",
     # Sparse DCP decode: split each query row's heads over 16-head virtual rows
     # when the template then still has one row a workgroup, so a small decode
     # occupies heads/16 times as many CUs. Changes the kernel, hence the
-    # accumulation order. Off by default.
+    # accumulation order. On by default; 0 plans whole rows.
     "ATOM_DMLA_MLA_HEAD_SPLIT": lambda: (
-        os.getenv("ATOM_DMLA_MLA_HEAD_SPLIT", "0") == "1"
+        os.getenv("ATOM_DMLA_MLA_HEAD_SPLIT", "1") == "1"
     ),
     # Sparse DCP decode on the one-row-a-workgroup template: skip aiter's split
     # reduce. Every work item of that template holds a whole row and writes o
@@ -623,9 +624,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # layer, the step kind and the gather, not the batch, so outputs stay batch
     # invariant, but the decode candidate reduction order changes and BF16
     # outputs can move by one ulp.
-    # Off by default.
+    # On by default; 0 keeps the two-candidate tile.
     "ATOM_DMLA_ATTN_RES_TILE": lambda: (
-        os.getenv("ATOM_DMLA_ATTN_RES_TILE", "0") == "1"
+        os.getenv("ATOM_DMLA_ATTN_RES_TILE", "1") == "1"
     ),
     # DCP sparse prefill: use the non-persistent fp8 gqa64 MLA kernel, which
     # needs no work metadata. On by default; needs an aiter with ROCm/aiter#6132.
@@ -635,9 +636,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Sparse DCP decode under ATOM_DMLA_DECODE_QTAIL: the q tail kernel also
     # gives the step template's work items this layer's key ranges, the stores
     # of patch_work_kv_ranges, so the layer launches no patch. Bit-identical.
-    # Off by default.
+    # On by default; 0 launches the patch.
     "ATOM_DMLA_QTAIL_PLAN_PATCH": lambda: (
-        os.getenv("ATOM_DMLA_QTAIL_PLAN_PATCH", "0") == "1"
+        os.getenv("ATOM_DMLA_QTAIL_PLAN_PATCH", "1") == "1"
     ),
     # DCP sparse decode: kernel that merges the exchanged top-k candidates into
     # this rank's owned KV slots. "aiter" (default) is flydsl_dcp_topk_merge;
@@ -921,9 +922,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Kimi-K3 DSpark context rows: one GEMM over every layer's kv rows of a bf16
     # fused_qkv_a_proj, stacked into a weight copy at model construction.
-    # Off by default.
+    # Changes the accumulation order. On by default; 0 keeps the per-layer GEMMs.
     "ATOM_DSPARK_STACKED_CTX_KV_GEMM": lambda: _flag_env(
-        "ATOM_DSPARK_STACKED_CTX_KV_GEMM"
+        "ATOM_DSPARK_STACKED_CTX_KV_GEMM", "1"
     ),
     # Kimi-K3 DSpark draft: its MLA layers' BF16 W_K absorb bmm of <= 64 rows per
     # head on gfx950 takes an explicit Triton tile instead of aiter's untuned
@@ -1028,9 +1029,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the step's total chunks rather than its longest sequence
     # (flash_kda_tuning.balanced_chunks_per_seg). One-sequence steps are
     # unchanged; multi-sequence steps segment differently, which changes
-    # numerics. Off by default.
+    # numerics. On by default; 0 keeps FlashKDA's segment length.
     "ATOM_KDA_PREFILL_SEG_BALANCE": lambda: (
-        os.getenv("ATOM_KDA_PREFILL_SEG_BALANCE", "0") == "1"
+        os.getenv("ATOM_KDA_PREFILL_SEG_BALANCE", "1") == "1"
     ),
     # gfx950 FlashKDA pass A always on its wide tile (BW=64, 4 warps), which
     # FlashKDA reserves for grids above 2 blocks per CU. Same per-element
@@ -1039,9 +1040,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_KDA_PREFILL_K2AB_WIDE", "1") == "1"
     ),
     # gfx950 FlashKDA pass B as the prefetching scan (FlashKDA's gfx1250
-    # default). Changes numerics (scan schedule). Off by default.
+    # default). Changes numerics (scan schedule). On by default; 0 keeps the
+    # plain scan.
     "ATOM_KDA_PREFILL_SCAN_PREFETCH": lambda: (
-        os.getenv("ATOM_KDA_PREFILL_SCAN_PREFETCH", "0") == "1"
+        os.getenv("ATOM_KDA_PREFILL_SCAN_PREFETCH", "1") == "1"
     ),
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT": lambda: (
         os.getenv("ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT", "1") == "1"
@@ -1329,8 +1331,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # On those row-sharded steps, run the MoE router and latent down projection
     # on each rank's rows and gather them, instead of on every row per rank.
+    # On by default; 0 keeps them on every row (the GEMM's row count changes,
+    # and with it possibly its rounding).
     "ATOM_KIMI_K3_MOE_LATENT_ROW_SHARD": lambda: (
-        os.getenv("ATOM_KIMI_K3_MOE_LATENT_ROW_SHARD", "0") == "1"
+        os.getenv("ATOM_KIMI_K3_MOE_LATENT_ROW_SHARD", "1") == "1"
     ),
     # Eager prefill: drop the device row count from aiter's fused_moe when the
     # host already knows every row is real (`_fused_moe_row_count`). Same

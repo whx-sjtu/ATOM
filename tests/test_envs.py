@@ -474,10 +474,27 @@ def test_otel_version_environment(monkeypatch):
     assert _get_envs().ATOM_TRACE_VERSION == "build-test"
 
 
-@pytest.mark.parametrize("name", ["ATOM_DMLA_MLA_NO_REDUCE", "ATOM_DMLA_WV_BMM_TILE"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "ATOM_DMLA_MLA_NO_REDUCE",
+        "ATOM_DMLA_WV_BMM_TILE",
+        "ATOM_DMLA_MLA_HEAD_SPLIT",
+        "ATOM_DMLA_DECODE_QTAIL",
+        "ATOM_DMLA_ATTN_RES_TILE",
+    ],
+)
 def test_dmla_decode_switches_default_on(monkeypatch, name):
     """The adopted DMLA decode switches are on unless set to 0."""
     monkeypatch.delenv(name, raising=False)
     assert getattr(_get_envs(), name) is True
     monkeypatch.setenv(name, "0")
     assert getattr(_get_envs(), name) is False
+
+
+def test_dmla_qtail_plan_patch_default_on(monkeypatch):
+    """The bit-exact q tail plan patch is on unless set to 0."""
+    monkeypatch.delenv("ATOM_DMLA_QTAIL_PLAN_PATCH", raising=False)
+    assert _get_envs().ATOM_DMLA_QTAIL_PLAN_PATCH is True
+    monkeypatch.setenv("ATOM_DMLA_QTAIL_PLAN_PATCH", "0")
+    assert _get_envs().ATOM_DMLA_QTAIL_PLAN_PATCH is False

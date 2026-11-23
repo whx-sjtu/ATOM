@@ -107,7 +107,7 @@ class _Stub(nn.Module):
 @pytest.fixture(autouse=True)
 def stub_block_parts(monkeypatch):
     monkeypatch.setenv("ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS", "0")
-    monkeypatch.delenv("ATOM_KIMI_K3_MOE_LATENT_ROW_SHARD", raising=False)
+    monkeypatch.setenv("ATOM_KIMI_K3_MOE_LATENT_ROW_SHARD", "0")
     empty_like = torch.empty_like
 
     def poisoned_empty_like(*args, **kwargs):
@@ -533,6 +533,13 @@ def _merge_front(monkeypatch, blocks):
         block.front_proj.merged_weight = merged
     gemm = _logs("front_rows", lambda x, weight, otype: x @ weight.t())
     monkeypatch.setattr(kimi, "tgemm", SimpleNamespace(mm=gemm))
+
+
+def test_latent_row_shard_is_on_unless_0(monkeypatch):
+    monkeypatch.delenv("ATOM_KIMI_K3_MOE_LATENT_ROW_SHARD", raising=False)
+    assert kimi.envs.ATOM_KIMI_K3_MOE_LATENT_ROW_SHARD
+    monkeypatch.setenv("ATOM_KIMI_K3_MOE_LATENT_ROW_SHARD", "0")
+    assert not kimi.envs.ATOM_KIMI_K3_MOE_LATENT_ROW_SHARD
 
 
 @pytest.mark.parametrize("layer_num", [4, 5], ids=["block-closes", "mid-block"])

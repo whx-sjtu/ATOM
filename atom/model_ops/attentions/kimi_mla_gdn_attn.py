@@ -811,6 +811,12 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         self._stage_draft_ctx_slots(batch, lengths, running_tokens, group)
         return built
 
+    # Every 256 rows from 1024 to 4096. The largest stays under 8192 rows, from
+    # which an eager prefill row-shards its MoE (a recording never does) and
+    # splits its KDA in_proj, and its BF16 hidden rows fit one AITER custom
+    # all-reduce (64 MiB by default: 4681 rows of 7168).
+    prefill_token_graph_sizes = (256, 512, *range(1024, 4097, 256))
+
     @property
     def supports_token_graph(self) -> bool:
         """Record native Kimi's target layers when every MLA path is supported.
