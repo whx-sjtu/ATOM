@@ -147,11 +147,12 @@ def test_opus_decode_flattens_queries_and_preserves_planes(
     assert logits.shape == (rows, 33) and next_n == 1 and count == rows
     assert local_ends is windows
     gathered, merged_tables, actual_out, actual_ptr, actual_counts, kw = seen["merge"]
+    assert gathered.shape == (rows, world * topk)
     if merge_impl == "aiter":
-        assert gathered.shape == (rows, world * topk) and not kw
+        assert not kw
     else:
-        # the all-gather's own [W * rows, k_loc], no transposing copy
-        assert gathered.shape == (world * rows, topk) and kw["layout"] == "plane"
+        # the last-dim all-gather's own [rows, W * k_loc]
+        assert kw["layout"] == "row"
         want = (512, (8, 8, 8, 8)) if ":" in merge_impl else (1024, (11, 11, 10))
         assert (kw["threads"], kw["radix"]) == want
     assert torch.equal(merged_tables, tables[:rows])

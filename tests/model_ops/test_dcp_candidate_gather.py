@@ -31,6 +31,10 @@ def exchange():
         "PRESHUFFLE": "preshuffle",
         "MFMA": "mfma",
         "_AG_CUSTOM_DTYPES": (torch.float32, torch.float16, torch.bfloat16),
+        # The paths stubbed below: aiter's local top-k dispatch and merge.
+        "envs": SimpleNamespace(
+            ATOM_DCP_LOCAL_TOPK="auto", ATOM_DCP_TOPK_MERGE="aiter"
+        ),
     }
     exec(  # noqa: S102 -- exercises production host code without GPU imports
         compile(ast.Module(body=functions, type_ignores=[]), str(path), "exec"),
