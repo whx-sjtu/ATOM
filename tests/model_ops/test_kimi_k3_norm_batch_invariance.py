@@ -88,6 +88,12 @@ def test_bf16_attn_res_tile_follows_the_layer_in_decode(
     assert [c[2] for c in configs] == tiles
 
 
+def test_bf16_attn_res_tile_keeps_two_under_a_column_gather(monkeypatch):
+    _step(monkeypatch, one_tile=True)
+    configs = [_attn_res_bf16_config(c, gathered=True) for c in (2, 3, 5, 9, 17)]
+    assert configs == [(8, 2, 2)] * 5
+
+
 def test_bf16_attn_res_tile_needs_a_step(monkeypatch):
     monkeypatch.setenv("ATOM_DMLA_ATTN_RES_TILE", "1")
     no_step = SimpleNamespace(context=None)

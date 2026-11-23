@@ -564,11 +564,13 @@ _ATTN_RES_BF16_CONFIG = (8, 2, 2)
 _ATTN_RES_BF16_MAX_TILE = 16
 
 
-def _attn_res_bf16_config(candidates: int):
+def _attn_res_bf16_config(candidates: int, gathered: bool = False):
     # Keyed on the step kind, never on T: prefill keeps one layout at every T,
-    # and at prefill T the one-tile layout is slower from B=4 on.
+    # and at prefill T the one-tile layout is slower from B=4 on. A
+    # column-gathered mix keeps two candidates a tile, so its bank tiles still
+    # run while the peers' columns arrive.
     nw, ns, bl = _ATTN_RES_BF16_CONFIG
-    if envs.ATOM_DMLA_ATTN_RES_TILE:
+    if envs.ATOM_DMLA_ATTN_RES_TILE and not gathered:
         context = get_forward_context().context
         if context is not None and not context.is_prefill:
             bl = min(_ATTN_RES_BF16_MAX_TILE, triton.next_power_of_2(candidates))
@@ -675,7 +677,7 @@ def _apply_attn_res_impl(
     pref = torch.empty_like(ps) if do_add else ps
 
     nw, ns, bl = (
-        _attn_res_bf16_config(Bp)
+        _attn_res_bf16_config(Bp, gather is not None)
         if ps.dtype == torch.bfloat16 and quant_dtype is None
         else _pick_attn_res_config(T)
     )
