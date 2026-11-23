@@ -59,7 +59,7 @@ def test_opus_decode_flattens_queries_and_preserves_planes(
     monkeypatch.setattr(dcp_ops, "get_dcp_world_size", lambda: world)
     monkeypatch.setattr(dcp_ops, "get_dcp_group", lambda: object())
     monkeypatch.setattr(
-        dcp_ops, "dcp_all_gather", lambda group, x, dim: x.repeat(world, 1)
+        dcp_ops, "dcp_all_gather", lambda group, x, dim: torch.cat([x] * world, dim)
     )
     # Run the real dispatcher and adapter on CPU; only their allocations and
     # GPU kernels are replaced. No GPU is needed to verify these arguments.
