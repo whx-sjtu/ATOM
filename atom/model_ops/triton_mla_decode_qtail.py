@@ -30,12 +30,18 @@ import triton.language as tl
 _BLOCK_N = 128
 
 
-def mla_decode_qtail_supports(nope_head_dim: int, rope_head_dim: int, kv_lora_rank: int) -> bool:
+def mla_decode_qtail_supports(
+    nope_head_dim: int, rope_head_dim: int, kv_lora_rank: int
+) -> bool:
     """``tl.arange`` over P, PE and L compiles only for powers of two, and the
     column blocks have no tail mask."""
-    return all(
-        d == triton.next_power_of_2(d) for d in (nope_head_dim, rope_head_dim, kv_lora_rank)
-    ) and kv_lora_rank % _BLOCK_N == 0
+    return (
+        all(
+            d == triton.next_power_of_2(d)
+            for d in (nope_head_dim, rope_head_dim, kv_lora_rank)
+        )
+        and kv_lora_rank % _BLOCK_N == 0
+    )
 
 
 @triton.jit
@@ -165,8 +171,8 @@ def mla_decode_qtail(
         assert x.stride(-1) == 1
     if t == 0:
         return
-    block_m = max(16, min(64, triton.next_power_of_2(t)))
-    _mla_decode_qtail_kernel[(triton.cdiv(t, block_m), h, l // _BLOCK_N)](
+    block_m = max(16, min(64, 1 << (t - 1).bit_length()))
+    _mla_decode_qtail_kernel[(-(-t // block_m), h, l // _BLOCK_N)](
         q_nope,
         q_pe,
         w_k,

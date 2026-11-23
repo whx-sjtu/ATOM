@@ -6,6 +6,7 @@ from __future__ import annotations
 import ast
 import base64
 import json
+import logging
 import math
 from itertools import pairwise
 from pathlib import Path
@@ -26,6 +27,7 @@ BUILD = {
     "_persistent_work_buffer_sizes",
     "_active_work_indptr",
     "_sparse_dcp_decode_plan",
+    "_sparse_dcp_decode_template",
     "set_mla_persistent_worker_buffers",
     "_set_mla_persistent_worker_buffers_sparse_mtp",
 }
@@ -55,8 +57,9 @@ def runtime():
         "PERSISTENT_WORK_BUFFERS": WORK,
         "_MLA_SPLIT_BUDGET_AUTO": -1,
         "_mla_seg_meta_kwargs": dict,
-        "envs": SimpleNamespace(ATOM_MLA_PAGE_SIZE=1),
+        "envs": SimpleNamespace(ATOM_MLA_PAGE_SIZE=1, ATOM_DMLA_MLA_HEAD_SPLIT=False),
         "triton": SimpleNamespace(next_power_of_2=lambda n: 1 << (n - 1).bit_length()),
+        "logger": logging.getLogger(__name__),
     }
     ns["get_mla_decode_shape_support"] = lambda *a, **kw: SimpleNamespace(
         native=True, supported=True
@@ -101,10 +104,11 @@ def runtime():
         for tensor in (wmd, ri, rfm, rpm):
             tensor.fill_(len(calls))
 
-    def patch(info, wi, ptr, rows):
+    def patch(info, wi, ptr, rows, groups=1):
         count = int(wi[-1])
         ids = info[:count, 0].long()
         assert count <= rows and (ids < rows).all()
+        ids //= groups
         info[:count, 4] = ptr[ids] - ptr[0]
         info[:count, 5] = ptr[ids + 1] - ptr[0]
 
@@ -163,13 +167,19 @@ def setup(
         for name, (shape, dt) in zip(WORK, sizes)
     }
     ptr = torch.arange(rows + 1, dtype=torch.int32, device=device)
+    # Static per-token buffers, sized like the runner's max_num_batched_tokens.
+    tokens = max(rows, 256)
     for name, value in {
         "cu_seqlens_q": ptr,
-        "sparse_cu_seqlens_q": ptr,
+        "sparse_cu_seqlens_q": torch.arange(
+            tokens + 1, dtype=torch.int32, device=device
+        ),
         "kv_indptr": ptr * 16,
         "sparse_kv_indptr": ptr * 8,
         "kv_last_page_lens": torch.ones(rows, dtype=torch.int32, device=device),
-        "sparse_kv_last_page_lens": torch.ones(rows, dtype=torch.int32, device=device),
+        "sparse_kv_last_page_lens": torch.ones(
+            tokens, dtype=torch.int32, device=device
+        ),
     }.items():
         var[name] = SimpleNamespace(gpu=value)
     builder.model_runner = SimpleNamespace(forward_vars=var)
@@ -206,6 +216,8 @@ def setup(
         scale=0.25,
         _q_scale=torch.ones(1, device=device),
         _k_scale=torch.ones(1, device=device),
+        _head_group_indptr=torch.arange(257, dtype=torch.int32, device=device),
+        _head_group_last_page_lens=torch.ones(256, dtype=torch.int32, device=device),
     )
     layer._pad_decode_query_heads = lambda x: x
     layer._restore_decode_query_heads = lambda x, _: x
@@ -389,6 +401,64 @@ def test_three_owners_and_shared_layers_reuse_one_builder_plan(runtime, max_q, r
     assert len(runtime["calls"]) == 1
 
 
+@pytest.mark.parametrize("max_q,rows", [(1, 16), (8, 64), (1, 64)])
+def test_head_split_plans_16_head_rows_that_match_whole_rows(runtime, max_q, rows):
+    runtime["envs"].ATOM_DMLA_MLA_HEAD_SPLIT = True
+    _, md, layer = setup(runtime, rows, max_q)
+    plan = getattr(
+        md, "sparse_mtp_dcp_decode_plan" if max_q > 1 else "sparse_dcp_decode_plan"
+    )
+    call = runtime["calls"][0]
+    assert plan[:2] == (rows * 4, 16) and plan[4] == 4
+    assert call[0] == 16 and torch.equal(call[1], torch.arange(rows * 4 + 1))
+    torch.manual_seed(7)
+    q, kv = torch.randn(rows + 2, 64, 8).bfloat16(), torch.randn(97, 1, 8).bfloat16()
+    for owner in range(3):
+        selection(md, rows, owner)
+        for owns in (True, False):
+            layer.owns_sparse_indexer = owns
+            out, lse = layer._forward_decode(q, kv, md, return_lse=True)
+            assert out.shape == (rows + 2, 64, 4) and lse.shape == (rows + 2, 64)
+            expected, expected_lse = reference(q[:rows], kv, md, 4, layer.scale)
+            torch.testing.assert_close(
+                out[:rows], expected.bfloat16(), atol=0.016, rtol=0.01
+            )
+            torch.testing.assert_close(lse[:rows], expected_lse)
+    assert len(runtime["calls"]) == 1
+
+
+@pytest.mark.parametrize("rows,heads", [(65, 64), (16, 40), (16, 16)])
+def test_head_split_keeps_whole_rows_it_cannot_split(runtime, rows, heads):
+    runtime["envs"].ATOM_DMLA_MLA_HEAD_SPLIT = True
+    _, md, _ = setup(runtime, rows, heads=heads)
+    assert md.sparse_dcp_decode_plan == (rows, heads, torch.bfloat16, torch.bfloat16, 1)
+    assert runtime["calls"][0][0] == heads
+
+
+def test_head_split_plan_falls_back_without_the_layers_row_tensors(runtime):
+    runtime["envs"].ATOM_DMLA_MLA_HEAD_SPLIT = True
+    _, md, layer = setup(runtime, 16)
+    del layer._head_group_indptr, layer._head_group_last_page_lens
+    selection(md, 16, 2)
+    q, kv = torch.randn(16, 64, 8).bfloat16(), torch.randn(97, 1, 8).bfloat16()
+    out, lse = layer._forward_decode(q, kv, md, return_lse=True)
+    assert len(runtime["calls"]) == 2 and runtime["calls"][-1][0] == 64
+    expected, expected_lse = reference(q, kv, md, 4, layer.scale)
+    torch.testing.assert_close(out, expected.bfloat16(), atol=0.016, rtol=0.01)
+    torch.testing.assert_close(lse, expected_lse)
+
+
+def test_whole_row_plan_is_not_reused_for_a_multiple_of_its_heads(runtime):
+    _, md, layer = setup(runtime, 16, heads=16)
+    selection(md, 16, 1)
+    q, kv = torch.randn(16, 64, 8).bfloat16(), torch.randn(97, 1, 8).bfloat16()
+    out, lse = layer._forward_decode(q, kv, md, return_lse=True)
+    assert len(runtime["calls"]) == 2 and runtime["calls"][-1][0] == 64
+    expected, expected_lse = reference(q, kv, md, 4, layer.scale)
+    torch.testing.assert_close(out, expected.bfloat16(), atol=0.016, rtol=0.01)
+    torch.testing.assert_close(lse, expected_lse)
+
+
 @pytest.mark.parametrize(
     "change",
     ["folded", "unknown", "unsupported", "q_dtype", "kv_dtype", "heads", "rows"],
@@ -487,7 +557,7 @@ def test_fallback_sizes_for_consumers_with_more_workgroups(runtime):
     md.__dict__.update(builder.set_mla_persistent_worker_buffers(16, 1))
     selection(md, 16, 2)
     original = md.work_info_set.clone()
-    buffers = layer._sparse_dcp_decode_work_buffers(
+    buffers, groups = layer._sparse_dcp_decode_work_buffers(
         md,
         torch.empty(16, 64, 8, dtype=fp8),
         torch.empty(97, 1, 8, dtype=fp8),
@@ -496,6 +566,7 @@ def test_fallback_sizes_for_consumers_with_more_workgroups(runtime):
         md.sparse_kv_last_page_lens,
         "",
     )
+    assert groups == 1
     assert buffers[1].numel() == 513 and md.work_indptr.numel() == 257
     expected = runtime["get_mla_metadata_info_v1"](
         16, 1, 64, fp8, fp8, is_sparse=False, fast_mode=True
@@ -635,16 +706,18 @@ def test_decode_ubatch_publishes_the_plan(runtime):
 @pytest.mark.skipif(
     not torch.version.hip or not torch.cuda.is_available(), reason="requires ROCm GPU"
 )
-@pytest.mark.parametrize("max_q,rows", [(1, 16), (8, 128), (8, 256)])
+@pytest.mark.parametrize("max_q,rows", [(1, 16), (8, 128), (8, 256), (1, 64)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("head_split", [False, True])
 def test_native_decode_and_graph_against_direct_attention(
-    max_q, rows, dtype, monkeypatch
+    max_q, rows, dtype, head_split, monkeypatch
 ):
     from aiter import get_mla_decode_shape_support, get_mla_metadata_info_v1
 
     from atom.model_ops import attention_mla
     from atom.model_ops.attentions import aiter_mla
 
+    monkeypatch.setenv("ATOM_DMLA_MLA_HEAD_SPLIT", "1" if head_split else "0")
     sizes = get_mla_metadata_info_v1(rows, 1, 64, dtype, dtype, is_sparse=True)
     ns = {
         "Builder": aiter_mla.AiterMLAMetadataBuilder,
@@ -665,16 +738,19 @@ def test_native_decode_and_graph_against_direct_attention(
     if plan is None:
         pytest.skip("runtime does not qualify this native plan geometry")
     prefix = "sparse_mtp_" if max_q > 1 else ""
+    planned, heads, *_, groups = plan
+    assert groups == (4 if head_split and rows * 4 <= 256 else 1)
+    assert (planned, heads) == (rows * groups, 64 // groups)
     wi = getattr(md, prefix + "work_indptr")
-    assert int(wi[-1]) == rows and int((wi[1:] - wi[:-1]).max()) == 1
+    assert int(wi[-1]) == planned and int((wi[1:] - wi[:-1]).max()) == 1
     probability_scale = None
     if dtype == torch.float8_e4m3fn:
         support = get_mla_decode_shape_support(
-            64, 1, dtype, dtype, persistent=True, return_lse=True, page_size=1
+            heads, 1, dtype, dtype, persistent=True, return_lse=True, page_size=1
         )
         probability_scale = native_fp8_probability_scale(support, dtype, dtype)
         if probability_scale is not None:
-            assert (getattr(md, prefix + "work_info_set")[:rows, 1] == -1).all()
+            assert (getattr(md, prefix + "work_info_set")[:planned, 1] == -1).all()
     monkeypatch.setattr(
         attention_mla,
         "get_mla_metadata_v1",

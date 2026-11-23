@@ -24,13 +24,15 @@ _PLAN_SPLIT_COEF = 1.2
 
 
 @triton.jit
-def _patch_work_kv_ranges(work_info, items, kv_indptr, BLOCK: tl.constexpr):
+def _patch_work_kv_ranges(
+    work_info, items, kv_indptr, GROUPS: tl.constexpr, BLOCK: tl.constexpr
+):
     # aiter's MlaWorkInfo (csrc/include/mla.h) is eight int32: batch_idx (the
     # row) at 0, kv_start and kv_end at 4, 5.
     item = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     live = item < tl.load(items)
     info = work_info + item * 8
-    row = tl.load(info, mask=live, other=0)
+    row = tl.load(info, mask=live, other=0) // GROUPS
     # The planner counts KV from the indptr's first entry.
     first = tl.load(kv_indptr)
     tl.store(info + 4, tl.load(kv_indptr + row, mask=live) - first, mask=live)
@@ -42,6 +44,7 @@ def patch_work_kv_ranges(
     work_indptr: torch.Tensor,
     kv_indptr: torch.Tensor,
     rows: int,
+    head_groups: int = 1,
 ) -> None:
     """Give each work item of a whole-row plan over ``rows`` query rows its
     row's range in ``kv_indptr``.
@@ -51,13 +54,16 @@ def patch_work_kv_ranges(
     the plan's own item count (``work_indptr[-1]``) bounds the patch. aiter's
     persistent MLA kernel takes a row's keys from its work item alone, not
     from the indptr it is passed.
+
+    A plan over head groups has ``head_groups`` consecutive rows a ``kv_indptr``
+    row, each holding an equal share of its heads; they share its keys.
     """
     assert work_info_set.dtype == torch.int32 and work_info_set.shape[-1] == 8, (
         "aiter's MlaWorkInfo layout changed: work_info_set is "
         f"{tuple(work_info_set.shape)} {work_info_set.dtype}, the patch writes [*, 8] int32"
     )
     _patch_work_kv_ranges[(-(-rows // BLOCK),)](
-        work_info_set, work_indptr[-1:], kv_indptr, BLOCK=BLOCK
+        work_info_set, work_indptr[-1:], kv_indptr, GROUPS=head_groups, BLOCK=BLOCK
     )
 
 

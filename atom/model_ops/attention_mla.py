@@ -87,6 +87,10 @@ from atom.model_ops.triton_mla_absorb_qpack import (
     mla_absorb_q_pack,
     mla_absorb_q_pack_supports,
 )
+from atom.model_ops.triton_mla_decode_qtail import (
+    mla_decode_qtail,
+    mla_decode_qtail_supports,
+)
 from atom.model_ops.triton_mla_q_tail_cache import mla_q_tail_and_cache
 from atom.model_ops.utils import (
     dynamic_per_batched_tensor_quant,
@@ -1443,6 +1447,31 @@ class MLAAttention(nn.Module):
                         W_V_dcp, dtype=dtypes.fp8
                     )
         self._configure_dcp_prefill_routes()
+        log_cls = type(self)
+        if (
+            envs.ATOM_DMLA_DECODE_QTAIL
+            and self._decode_qtail_enabled
+            and not getattr(log_cls, "_decode_qtail_logged", False)
+        ):
+            log_cls._decode_qtail_logged = True
+            logger.info(
+                "ATOM_DMLA_DECODE_QTAIL is on: QREP decode writes q_out and K in "
+                "one kernel."
+            )
+        if (
+            envs.ATOM_DMLA_MLA_HEAD_SPLIT
+            and self.is_sparse_mla
+            and self.dcp_world_size > 1
+        ):
+            # A head-split decode plan's rows each hold one query and one page-1
+            # page; the plan's items carry the keys. Templates plan <= 256 rows.
+            device = self.W_K.device
+            self._head_group_indptr = torch.arange(
+                257, dtype=torch.int32, device=device
+            )
+            self._head_group_last_page_lens = torch.ones(
+                256, dtype=torch.int32, device=device
+            )
 
     def _configure_dcp_prefill_routes(self):
         """Bind fixed projection/absorb choices after weights and scales exist."""
@@ -1453,6 +1482,15 @@ class MLAAttention(nn.Module):
             and not self.kv_shuffled
             and _runs_on_gfx950()
             and mla_absorb_q_pack_supports(self.qk_nope_head_dim, self.kv_lora_rank)
+        )
+        self._decode_qtail_enabled = (
+            self._absorb_q_pack_enabled
+            and isinstance(self.rotary_emb, NoPositionalRotaryEmbedding)
+            and not self.use_seg_mla
+            and not self._fused_q_head_pad
+            and mla_decode_qtail_supports(
+                self.qk_nope_head_dim, self.qk_rope_head_dim, self.kv_lora_rank
+            )
         )
         head_major = (
             self.pbm_enabled
@@ -2901,6 +2939,8 @@ class MLAAttention(nn.Module):
     def _sparse_dcp_decode_work_buffers(
         self, attn_metadata, q, kv_buffer, qptr, kvptr, last, work_prefix
     ):
+        """The step's work buffers for q, and the head groups their plan splits
+        each q row into (`ATOM_DMLA_MLA_HEAD_SPLIT`); 1 if it plans whole rows."""
         buffers = tuple(
             getattr(attn_metadata, f"{work_prefix}{name}")
             for name in PERSISTENT_WORK_BUFFERS
@@ -2910,10 +2950,11 @@ class MLAAttention(nn.Module):
         )
         plan = getattr(attn_metadata, plan_name, None)
         reuse = False
+        groups = 1
         if plan is not None:
-            rows, heads, dtype_q, dtype_kv = plan
+            rows, heads, dtype_q, dtype_kv, groups = plan
             support = get_mla_decode_shape_support(
-                q.shape[1],
+                heads,
                 1,
                 q.dtype,
                 kv_buffer.dtype,
@@ -2924,15 +2965,25 @@ class MLAAttention(nn.Module):
             reuse = (
                 support.supported is True
                 and support.native
-                and (q.shape[1], q.dtype, kv_buffer.dtype) == (heads, dtype_q, dtype_kv)
-                and rows <= q.shape[0]
-                and rows + 1 <= kvptr.numel()
+                and groups * heads == q.shape[1]
+                and (
+                    groups == 1
+                    or (
+                        q.is_contiguous()
+                        and rows % groups == 0
+                        and hasattr(self, "_head_group_indptr")
+                    )
+                )
+                and (q.dtype, kv_buffer.dtype) == (dtype_q, dtype_kv)
+                and rows <= q.shape[0] * groups
+                and rows // groups + 1 <= kvptr.numel()
             )
             if reuse:
                 # Shared layers read the preceding owner's indptr. Patch here
                 # too, so a differing draft/folded consumer cannot leave it stale.
-                patch_work_kv_ranges(buffers[2], buffers[1], kvptr, rows)
+                patch_work_kv_ranges(buffers[2], buffers[1], kvptr, rows, groups)
             else:
+                groups = 1
                 # A fallback must not overwrite the next native layer's template.
                 # Its head fold/occupancy can require larger buffers than that plan.
                 sizes = get_mla_metadata_info_v1(
@@ -2960,7 +3011,7 @@ class MLAAttention(nn.Module):
                 work_prefix=work_prefix,
                 work_buffers=buffers,
             )
-        return buffers
+        return buffers, groups
 
     def decode_is_persistent(self) -> bool:
         """Whether this layer's aiter decode runs the persistent kernel over the
@@ -3125,8 +3176,9 @@ class MLAAttention(nn.Module):
             is_sparse_mtp = self.is_sparse_mla and attn_metadata.max_seqlen_q > 1
 
             decode_work_buffers = None
+            head_groups = 1
             if use_persistent_mode and self.is_sparse_mla and self.dcp_world_size > 1:
-                decode_work_buffers = self._sparse_dcp_decode_work_buffers(
+                decode_work_buffers, head_groups = self._sparse_dcp_decode_work_buffers(
                     attn_metadata,
                     q,
                     kv_buffer,
@@ -3135,6 +3187,13 @@ class MLAAttention(nn.Module):
                     paged_kv_last_page_lens,
                     work_prefix="sparse_mtp_" if is_sparse_mtp else "",
                 )
+            if head_groups > 1:
+                # Each row's heads as head_groups consecutive rows; o follows q.
+                q = q.view(-1, q.shape[1] // head_groups, q.shape[-1])
+                o = o.view(q.shape[0], q.shape[1], o.shape[-1])
+                paged_cu_seqlens_q = self._head_group_indptr[: q.shape[0] + 1]
+                paged_kv_indptr = paged_cu_seqlens_q
+                paged_kv_last_page_lens = self._head_group_last_page_lens[: q.shape[0]]
 
             if not use_persistent_mode:
                 work_meta_data = None
@@ -3229,6 +3288,10 @@ class MLAAttention(nn.Module):
                 cp_rank=cp_rank,
                 causal=causal,
             )
+            if head_groups > 1:
+                o = o.view(B, -1, o.shape[-1])
+                if final_lse is not None:
+                    final_lse = final_lse.view(B, -1)
 
         o = self._restore_decode_query_heads(o, num_heads_q)
         if final_lse is not None:
@@ -3597,7 +3660,14 @@ class MLAAttention(nn.Module):
                 and context.is_prefill
                 and self._absorb_into_q_out(kv_cache, attn_metadata.dtype_q)
             )
-            if absorb_into_q_out:
+            decode_qtail = (
+                use_qrep
+                and not context.is_prefill
+                and envs.ATOM_DMLA_DECODE_QTAIL
+                and self._decode_qtail_enabled
+                and self._absorb_into_q_out(kv_cache, attn_metadata.dtype_q)
+            )
+            if absorb_into_q_out or decode_qtail:
                 q_nope, q_rope = self._q_proj_and_k_up_proj(
                     q, x_scale=q_scale, group=use_qrep, k_up_proj=False
                 )
@@ -3714,6 +3784,21 @@ class MLAAttention(nn.Module):
                         self.rotary_emb.cos_cache,
                         self.rotary_emb.sin_cache,
                         is_neox=self.rotary_emb.is_neox_style,
+                    )
+                elif decode_qtail:
+                    # Every row's Q, as compute_all_q_rope below; K only at the
+                    # rank-owned (non-negative) slots.
+                    mla_decode_qtail(
+                        q_nope,
+                        q_rope,
+                        self.W_K_qrep,
+                        q_out_write,
+                        k_nope,
+                        k_rope,
+                        kv_cache,
+                        write_slot_mapping,
+                        self._q_scale,
+                        self._k_scale,
                     )
                 else:
                     # DCP: q_out is head all-gathered, so every rank must compute

@@ -258,6 +258,24 @@ def test_patch_stops_at_the_plans_last_item(cache_dtype, rows, heads):
     assert torch.equal(info[:items, 5], kvptr[planned + 1])
 
 
+@pytest.mark.parametrize("rows,groups", [(16, 6), (42, 6), (64, 4), (300, 1)])
+def test_head_group_rows_share_their_query_rows_keys(rows, groups):
+    from atom.model_ops.sparse_mla_work_plan import patch_work_kv_ranges
+
+    gen = torch.Generator(device="cuda").manual_seed(rows)
+    planned = rows * groups
+    info = torch.full((planned + 3, 8), -7, dtype=torch.int32, device="cuda")
+    info[:planned, 0] = torch.arange(planned, device="cuda")
+    items = torch.tensor([0, planned], dtype=torch.int32, device="cuda")
+    counts = torch.randint(0, 300, (rows,), generator=gen, device="cuda")
+    kvptr = torch.cat([counts.new_zeros(1), counts.cumsum(0)]).int() + 5
+    patch_work_kv_ranges(info, items, kvptr, planned, groups)
+    row = torch.arange(planned, device="cuda") // groups
+    assert torch.equal(info[:planned, 4], kvptr[row] - 5)
+    assert torch.equal(info[:planned, 5], kvptr[row + 1] - 5)
+    assert (info[:planned, 6:] == -7).all() and (info[planned:] == -7).all()
+
+
 def test_patch_rejects_a_work_info_width_it_does_not_write():
     """The patch writes MlaWorkInfo fields by offset, so a resized aiter
     struct fails before the kernel writes into the wrong fields."""
