@@ -183,6 +183,8 @@ def _resources(launcher):
 def test_compile_keeps_hand_offs_and_resources(rows, tmp_path, monkeypatch):
     monkeypatch.setenv("ARCH", "gfx950")
     monkeypatch.setenv("FLYDSL_RUNTIME_CACHE_DIR", str(tmp_path))
+    # On a GPU host importing aiter already initializes CUDA (Triton's arch probe).
+    cuda_was_initialized = torch.cuda.is_initialized()
     arms = {"off": {}, **{n: {n: True} for n in k2.HANDOFFS}}
     arms["all"] = {n: True for n in k2.HANDOFFS}
     seen = {}
@@ -214,5 +216,5 @@ def test_compile_keeps_hand_offs_and_resources(rows, tmp_path, monkeypatch):
     }
     for arm, (_, r) in seen.items():
         assert r["lds"] == r_off["lds"], arm
-    assert not torch.cuda.is_initialized()
+    assert cuda_was_initialized or not torch.cuda.is_initialized()
     print({"rows": rows, **{a: (r["vgpr"], r["lds"]) for a, (_, r) in seen.items()}})

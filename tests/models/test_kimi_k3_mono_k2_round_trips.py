@@ -137,6 +137,8 @@ def test_ug_place_takes_fewer_claims(nu):
 def test_compile_keeps_hand_offs_and_resources(rows, tmp_path, monkeypatch):
     monkeypatch.setenv("ARCH", "gfx950")
     monkeypatch.setenv("FLYDSL_RUNTIME_CACHE_DIR", str(tmp_path))
+    # On a GPU host importing aiter already initializes CUDA (Triton's arch probe).
+    cuda_was_initialized = torch.cuda.is_initialized()
     seen = {}
     for flags in ((False, False), (True, True)):
         key = k2.K2Build(
@@ -158,5 +160,5 @@ def test_compile_keeps_hand_offs_and_resources(rows, tmp_path, monkeypatch):
     (off, r_off), (on, r_on) = seen[(False, False)], seen[(True, True)]
     assert on == off
     assert r_on["lds"] == r_off["lds"]
-    assert not torch.cuda.is_initialized()
+    assert cuda_was_initialized or not torch.cuda.is_initialized()
     print({"rows": rows, "off": r_off, "on": r_on})
