@@ -10,6 +10,7 @@ the same object hierarchy and skips the vision tower/projector tensors.
 
 import logging
 from collections.abc import Callable
+from functools import lru_cache
 from itertools import pairwise
 from typing import ClassVar
 
@@ -25,6 +26,7 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.tuned_gemm import tgemm
 from einops import rearrange
 from torch import nn
@@ -43,6 +45,7 @@ from atom.model_ops.fla_ops.fused_sigmoid_gating import (
     fused_sigmoid_gating_delta_rule_update,
 )
 from atom.model_ops.fla_ops.replayssm import (
+    replayssm_kda_fused_update,
     replayssm_sigmoid_gating_delta_rule,
 )
 from atom.model_ops.kimi_k3.attention_residual import (
@@ -93,6 +96,20 @@ from atom.utils.region_graph import (
     prefill_token_graph_capture,
     token_graph,
 )
+
+
+@lru_cache(maxsize=32)
+def _log_kda_wave_fallback(tp_size, num_seqs, num_heads, num_cus):
+    # Deduplicate the same geometry across layers and repeated steps.
+    logging.getLogger("atom").info(
+        "Fused KDA uses split fallback: one-wave guard "
+        "(tp=%d, padded_requests=%d, local_heads=%d, programs=%d, CUs=%d).",
+        tp_size,
+        num_seqs,
+        num_heads,
+        num_seqs * num_heads,
+        num_cus,
+    )
 
 
 def _text_config(config):
@@ -1758,7 +1775,42 @@ class KimiKDAAttention(nn.Module):
         # Otherwise the plain contiguous copy runs and f_b_proj quantizes (or
         # not) exactly as before.
         f_a_view = tail[..., nlh : nlh + hd]
-        if self.fuse_f_a_quant:
+        # One program serves each sequence/head; the one-wave guard is an
+        # admission policy, not a kernel legality constraint. Use the padded
+        # request bucket so replay never changes the selected path.
+        num_seqs = 0
+        if kda_metadata.num_prefills == 0 and getattr(kda_metadata, "replayssm", False):
+            num_seqs = kda_metadata.num_decodes or kda_metadata.num_spec_decodes
+        fused = (
+            envs.ATOM_KIMI_K3_KDA_FUSED_DECODE
+            and num_seqs > 0
+            and (kda_metadata.num_decodes > 0) != (kda_metadata.num_spec_decodes > 0)
+            and hd == 128
+            and self.conv_kernel_size == 4
+            and self.activation == "silu"
+            and self.f_b_proj.quant_type == QuantType.No
+            and self.f_b_proj.bias is None
+            and qkvg.dtype == conv_state.dtype == torch.bfloat16
+            and self.f_b_proj.weight.dtype == torch.bfloat16
+            and self.f_b_proj.weight.shape == (lp, hd)
+            and self.f_b_proj.weight.is_contiguous()
+            and ssm_state.shape[1:] == (nlh, hd, hd)
+            and ssm_state.stride()[1:] == (hd * hd, hd, 1)
+            and 1 <= kda_metadata.replayssm_max_query_len <= 8
+            and conv_state.shape[-1] >= 2 + kda_metadata.replayssm_max_query_len
+            and cache.replay_buf_k.shape[2] >= 2 * kda_metadata.replayssm_max_query_len
+            and get_gfx_runtime() == "gfx950"
+            and 0 < num_seqs * nlh
+        )
+        if fused:
+            num_cus = get_cu_num()
+            if num_seqs * nlh > num_cus:
+                if self.tp_rank == 0:
+                    _log_kda_wave_fallback(self.tp_size, num_seqs, nlh, num_cus)
+                fused = False
+        if fused:
+            gate = None
+        elif self.fuse_f_a_quant:
             from atom.model_ops.kimi_k3 import strided_per_token_quant
 
             f_a, f_a_scale = strided_per_token_quant(f_a_view, dtypes.fp8)
@@ -1771,7 +1823,8 @@ class KimiKDAAttention(nn.Module):
                 f_a_view.shape, dtype=f_a_view.dtype, device=f_a_view.device
             )
             gate = self.f_b_proj(f_a.copy_(f_a_view))
-        gate = rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim)
+        if gate is not None:
+            gate = rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim)
         # Prefill returns its own contiguous output. Allocate this buffer only
         # for decode/spec-decode, where the recurrence writes into it directly.
         if kda_metadata.num_prefills <= 0:
@@ -1844,6 +1897,43 @@ class KimiKDAAttention(nn.Module):
             )
             assert kda_out.is_contiguous(), "KDA output must be contiguous for o_norm"
             out = kda_out.squeeze(0)
+        elif fused:
+            if kda_metadata.num_decodes > 0:
+                cu, accepted = query_start_loc, None
+                conv_idx, conv_idx_in = state_indices, state_indices_in
+            else:
+                cu = kda_metadata.spec_query_start_loc
+                accepted = kda_metadata.num_accepted_tokens
+                # Only column zero is live under ReplaySSM, even for a fork.
+                conv_idx = kda_metadata.spec_state_indices_tensor[:, 0]
+                spec_in = kda_metadata.spec_state_indices_in_tensor
+                conv_idx_in = None if spec_in is None else spec_in[:, 0]
+            replayssm_kda_fused_update(
+                mixed_qkv,
+                f_a_view,
+                beta,
+                conv_state,
+                conv_weights,
+                self.f_b_proj.weight,
+                self.A_log,
+                self.dt_bias,
+                ckpt=ssm_state,
+                buf_k=cache.replay_buf_k,
+                buf_u=cache.replay_buf_u,
+                buf_g=cache.replay_buf_g,
+                write_pos=kda_metadata.write_pos,
+                slot_idx=kda_metadata.slot_idx[:num_seqs],
+                cu_seqlens=cu[: num_seqs + 1],
+                max_query_len=kda_metadata.replayssm_max_query_len,
+                conv_state_indices=conv_idx[:num_seqs],
+                conv_state_indices_in=(
+                    None if conv_idx_in is None else conv_idx_in[:num_seqs]
+                ),
+                num_accepted_tokens=accepted,
+                o=out,
+                lower_bound=self._kda_gate_lower_bound,
+                fork_slots=kda_metadata.replayssm_fork_slots,
+            )
         elif kda_metadata.num_decodes > 0:
             # Slice the per-token cache-slot indices once (used for both the
             # conv update and the fused recurrence below).
