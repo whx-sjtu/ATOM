@@ -1027,6 +1027,7 @@ class ModelRunner:
             else None
         )
         self._served = None
+        self._verify_one_broadcast = envs.ATOM_SPEC_VERIFY_ONE_BROADCAST
         self._init_forward_vars_ring()
         self._init_h2d_publication()
         self.forward_done_event = torch.cuda.Event()
@@ -3466,6 +3467,8 @@ class ModelRunner:
                 logits, batch, spec_decode_metadata, rows=logprob_rows
             )
         constraints = TokenConstraints.apply(self, batch, logits, spec_decode_metadata)
+        # Whether every TP rank already emits rank 0's ids.
+        ids_agreed = False
         if spec_decode_metadata is None:
             # The LM head emitted one row per row the step FORWARDED, which a
             # decode keeps at `running_bs` for the draft pass that follows it
@@ -3532,6 +3535,7 @@ class ModelRunner:
             if lossless is not None and not all_greedy:
                 ratio = lossless.verify_inputs(bs, temperatures, top_ks, top_ps)
             target_token_ids = None
+            broadcast_with_bonus = False
             # Only exact match on a sampled batch reads the target's own draw.
             if not all_greedy and ratio is None:
                 target_token_ids = self.sampler.sample_verification_tokens(
@@ -3548,7 +3552,13 @@ class ModelRunner:
                     ),
                 )
                 if target_token_ids.numel() and get_tp_group().world_size > 1:
-                    target_token_ids = get_tp_group().broadcast(target_token_ids, src=0)
+                    broadcast_with_bonus = self._verify_one_broadcast and not (
+                        pcp_is_enabled() or sp_is_enabled()
+                    )
+                    if not broadcast_with_bonus:
+                        target_token_ids = get_tp_group().broadcast(
+                            target_token_ids, src=0
+                        )
             bonus_token_ids = self.sampler(
                 logits=bonus_logits,
                 temperatures=temperatures,
@@ -3557,6 +3567,21 @@ class ModelRunner:
                 all_greedy=all_greedy,
                 needs_independent_noise=needs_independent_noise or not all_greedy,
             )
+            if broadcast_with_bonus:
+                if (
+                    bonus_token_ids.dtype == target_token_ids.dtype
+                    and bonus_token_ids.ndim == 1
+                ):
+                    # Every rank then verifies rank 0's two draws, as rank 0
+                    # does, so the ids it emits need no broadcast below.
+                    rows = target_token_ids.shape[0]
+                    both = get_tp_group().broadcast(
+                        torch.cat((target_token_ids, bonus_token_ids)), src=0
+                    )
+                    target_token_ids, bonus_token_ids = both[:rows], both[rows:]
+                    ids_agreed = True
+                else:
+                    target_token_ids = get_tp_group().broadcast(target_token_ids, src=0)
             sampled_tokens, verdict = self.rejection_sampler.forward(
                 spec_decode_metadata,
                 target_logits,
@@ -3589,6 +3614,7 @@ class ModelRunner:
         if (
             get_tp_group().world_size > 1
             and self._served is None
+            and not ids_agreed
             and _needs_id_sync(
                 self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
             )

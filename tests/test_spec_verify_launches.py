@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 """The MTP verify's launch-saving switches keep its rows, draws and ids:
-host-built verification rows (ATOM_SPEC_VERIFY_HOST_ROWS) and one logits
-gather (ATOM_SPEC_VERIFY_ONE_GATHER). These run on CPU."""
+host-built verification rows (ATOM_SPEC_VERIFY_HOST_ROWS), one logits gather
+(ATOM_SPEC_VERIFY_ONE_GATHER) and one TP broadcast
+(ATOM_SPEC_VERIFY_ONE_BROADCAST). These run on CPU."""
 
 from types import MethodType, SimpleNamespace
 from unittest import mock
@@ -155,7 +156,7 @@ def test_the_verification_draw_takes_host_rows_without_a_device_lookup(monkeypat
 TARGET_ROWS, BONUS_ROWS = torch.tensor([0, 1, 3]), torch.tensor([2, 4])
 
 
-def _verify_step(monkeypatch, *, rank, one_gather, received=None):
+def _verify_step(monkeypatch, *, rank, one_gather, one_broadcast, received=None):
     """One sampled verify step on TP rank ``rank`` of two. Rank 1 draws
     different ids than rank 0 and receives, from its k-th broadcast, what
     rank 0 sent in its k-th (``received``). Returns the emitted ids, what
@@ -224,6 +225,7 @@ def _verify_step(monkeypatch, *, rank, one_gather, received=None):
         forward_done_event=mock.Mock(),
         _served=None,
         structured_output=None,
+        _verify_one_broadcast=one_broadcast,
     )
     logits = torch.arange(5 * 8, dtype=torch.float32).view(5, 8)
     with pytest.raises(Emitted) as emitted:
@@ -261,13 +263,35 @@ def _two_ranks(monkeypatch, **flags):
 
 
 @pytest.mark.parametrize("one_gather", [False, True])
-def test_every_rank_emits_rank_zeros_ids(monkeypatch, no_pcp, one_gather):
-    ids0, ids1, sent0, draws0, draws1 = _two_ranks(monkeypatch, one_gather=one_gather)
-    reference, _, _, reference_draws, _ = _two_ranks(monkeypatch, one_gather=False)
+@pytest.mark.parametrize("one_broadcast", [False, True])
+def test_every_rank_emits_rank_zeros_ids(
+    monkeypatch, no_pcp, one_gather, one_broadcast
+):
+    ids0, ids1, sent0, draws0, draws1 = _two_ranks(
+        monkeypatch, one_gather=one_gather, one_broadcast=one_broadcast
+    )
+    reference, _, _, reference_draws, _ = _two_ranks(
+        monkeypatch, one_gather=False, one_broadcast=False
+    )
     assert torch.equal(ids0, reference) and torch.equal(ids1, reference)
     # Both draws, on every rank, in the same order and from the same rows.
     for draws in (draws0, draws1):
         assert [kind for kind, _ in draws] == ["verification", "bonus"]
         for (_, rows), (_, expected) in zip(draws, reference_draws):
             assert torch.equal(rows, expected)
-    assert len(sent0) == 2
+    if one_broadcast:
+        assert len(sent0) == 1
+        assert sent0[0].tolist() == [5, 6, 7, 1, 2]
+    else:
+        assert len(sent0) == 2
+
+
+def test_one_broadcast_stands_down_under_pcp(monkeypatch, no_pcp):
+    monkeypatch.setattr(mods.runner, "pcp_is_enabled", lambda: True)
+    monkeypatch.setattr(
+        mods.runner,
+        "get_pcp_group",
+        lambda: SimpleNamespace(broadcast=lambda tensor, src: tensor),
+    )
+    _, sent, _ = _verify_step(monkeypatch, rank=0, one_gather=False, one_broadcast=True)
+    assert [t.tolist() for t in sent] == [[5, 6, 7], [[5, 6, 1], [7, 2, 0]]]

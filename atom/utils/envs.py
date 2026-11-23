@@ -924,6 +924,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # host-built index of both, instead of one each. Same rows. Read at drafter
     # construction.
     "ATOM_SPEC_VERIFY_ONE_GATHER": lambda: _flag_env("ATOM_SPEC_VERIFY_ONE_GATHER"),
+    # MTP verify of a sampled batch under TP: broadcast rank 0's verification
+    # and bonus draws together, so every rank verifies the same two draws and
+    # emits rank 0's ids without the second broadcast. Every rank still makes
+    # both draws. Same ids and verdict. Read at runner construction.
+    "ATOM_SPEC_VERIFY_ONE_BROADCAST": lambda: _flag_env(
+        "ATOM_SPEC_VERIFY_ONE_BROADCAST"
+    ),
     # Lossless speculative sampling: the DSpark draft samples its block from q
     # and the verify accepts by the probability ratio (u * q < p). Off by
     # default; needs an aiter with ROCm/aiter#6954 under TP; where it arms,
