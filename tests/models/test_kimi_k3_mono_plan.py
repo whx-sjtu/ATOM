@@ -502,6 +502,8 @@ def test_only_the_unpaired_k2_build_names_its_early_pairing():
     from atom.models.kimi_k3.mono.kernels import layer as k2
 
     key = k2.K2Build(tokens=25, nblocks=3)
-    assert k2.symbol(key) == "_ZN4atom27k3_mono_k2_s25_nb3_r1_g0_t0E"
+    assert k2.symbol(key) == "_ZN4atom42k3_mono_k2_s25_nb3_r1_q1_sp0_dk0_up0_g0_t0E"
     lean = replace(key, early_paired=False)
-    assert k2.symbol(lean) == "_ZN4atom31k3_mono_k2_s25_nb3_r1_ep0_g0_t0E"
+    assert (
+        k2.symbol(lean) == "_ZN4atom46k3_mono_k2_s25_nb3_r1_q1_sp0_dk0_up0_ep0_g0_t0E"
+    )
