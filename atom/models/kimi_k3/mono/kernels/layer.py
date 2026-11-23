@@ -165,7 +165,7 @@ HANDOFFS = ("latq_first", "batch_polls", "route_parts", "ln_sq")
 _SYM = {f.name: f.metadata.get("sym") for f in fields(K2Build)}
 # past this width the latent lands after the route, so gathering it first
 # only delays the route table (``latq_first``)
-LATQ_FIRST_ROWS = 10
+LATQ_FIRST_ROWS = 15
 
 
 def handoffs_at(rows: int, on) -> dict:
