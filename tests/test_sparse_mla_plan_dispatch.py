@@ -385,6 +385,11 @@ def test_work_plan_reuses_its_initialized_granularity(dcp, block, topk, expected
         for n in builder.body
         if isinstance(n, ast.FunctionDef) and n.name == "_sparse_prefill_work_plan"
     )
+    aiter_plan = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_aiter_sparse_prefill_plan"
+    )
     counts, plans = [], []
 
     def power(value):
@@ -417,10 +422,12 @@ def test_work_plan_reuses_its_initialized_granularity(dcp, block, topk, expected
         "PERSISTENT_WORK_BUFFERS": WORK,
         "_MLA_SPLIT_BUDGET_AUTO": -1,
         "get_mla_metadata_v1": lambda *a, **k: plans.append(k["kv_granularity"]),
+        # aiter's planner; test_sparse_mla_row_plan covers the whole-row plan
+        "envs": SimpleNamespace(ATOM_MLA_SPARSE_PREFILL_ROW_PLAN=False),
     }
     exec(  # noqa: S102 - execute the production initializer field and plan builder
         compile(
-            ast.Module(body=init_granularity + [plan], type_ignores=[]),
+            ast.Module(body=init_granularity + [aiter_plan, plan], type_ignores=[]),
             str(path),
             "exec",
         ),

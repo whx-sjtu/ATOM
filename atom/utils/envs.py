@@ -613,6 +613,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DCP_PREFILL_FILTER_WHOLE_ROW": lambda: (
         os.getenv("ATOM_DCP_PREFILL_FILTER_WHOLE_ROW", "0") == "1"
     ),
+    # MLA prefill that absorbs W_K into q_out under an identity (NoPE) rotary:
+    # write only q_out's rope slice and the KV entry, instead of the aiter rope
+    # op storing a stand-in nope half that the absorb overwrites. Same codes.
+    # Off by default.
+    "ATOM_MLA_Q_TAIL_CACHE": lambda: (os.getenv("ATOM_MLA_Q_TAIL_CACHE", "0") == "1"),
+    # DCP sparse prefill step plan: write the one-item-a-row plan
+    # get_mla_metadata_v1 makes when every row holds 1..kv_granularity keys
+    # directly, instead of running aiter's single-workgroup planner over every
+    # row. Same buffers, checked against aiter's once a process. Off by default.
+    "ATOM_MLA_SPARSE_PREFILL_ROW_PLAN": lambda: (
+        os.getenv("ATOM_MLA_SPARSE_PREFILL_ROW_PLAN", "0") == "1"
+    ),
     # GLM-5.2 (glm_moe_dsa): enable the fused indexer qk-rope + fp8-quant + kv-cache
     # kernel (indexer_qk_rope_quant_and_cache), same path DeepSeek-V3.2 uses. GLM's
     # indexer dims (index_head_dim=128, qk_rope_head_dim=64, per_1x128, neox rope) are

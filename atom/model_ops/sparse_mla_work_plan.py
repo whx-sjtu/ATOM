@@ -8,11 +8,19 @@ rank-owned key range changes from one DSA layer to the next, so a layer rewrites
 the items' KV start and end instead of planning again.
 """
 
+import math
+
+import numpy as np
 import torch
 import triton
 import triton.language as tl
 
 BLOCK = 256
+# aiter's v1.2 planner charges every work item 16 blocks on top of its KV
+# blocks at page size 1 (fixed_over_head_num_blocks), and in auto-split mode
+# deals sum_blocks over min(round(1.2 * sqrt(sum_blocks * cus)), cus) parts.
+_PLAN_OVERHEAD_BLOCKS = 16
+_PLAN_SPLIT_COEF = 1.2
 
 
 @triton.jit
@@ -50,4 +58,97 @@ def patch_work_kv_ranges(
     )
     _patch_work_kv_ranges[(-(-rows // BLOCK),)](
         work_info_set, work_indptr[-1:], kv_indptr, BLOCK=BLOCK
+    )
+
+
+@triton.jit
+def _plan_whole_rows(
+    work_info,
+    work_indptr,
+    reduce_indptr,
+    work_meta,
+    kv_indptr,
+    indptr_addr,
+    info_addr,
+    rows,
+    rows_per_cu,
+    num_cu,
+    reduce_size,
+    BLOCK: tl.constexpr,
+):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    live = i < rows
+    first = tl.load(kv_indptr)
+    kv_start = tl.load(kv_indptr + i, mask=live, other=0) - first
+    kv_end = tl.load(kv_indptr + i + 1, mask=live, other=0) - first
+    # MlaWorkInfo: batch_idx, partial_qo_loc, qo_start, qo_end, kv_start,
+    # kv_end, kv_offset, padding.
+    f = tl.arange(0, 8)[None, :]
+    r = i[:, None]
+    info = tl.where(f == 0, r, 0)
+    info = tl.where(f == 1, -1, info)
+    info = tl.where(f == 2, r, info)
+    info = tl.where(f == 3, r + 1, info)
+    info = tl.where(f == 4, kv_start[:, None], info)
+    info = tl.where(f == 5, kv_end[:, None], info)
+    tl.store(work_info + r * 8 + f, info, mask=live[:, None])
+    tl.store(work_indptr + i, tl.minimum(i * rows_per_cu, rows), mask=i <= num_cu)
+    tl.store(reduce_indptr + i, 0, mask=i < reduce_size)
+    if tl.program_id(0) == 0:
+        j = tl.arange(0, 2)
+        tl.store(work_meta + j, tl.where(j == 0, indptr_addr, info_addr))
+
+
+def whole_row_plan_rows_per_cu(
+    host_kv_indptr: np.ndarray, kv_granularity: int, num_cu: int
+) -> int | None:
+    """How many rows each workgroup takes in aiter's fast-mode, auto-split
+    plan over ``host_kv_indptr``'s rows at page size 1, or None where that
+    plan is not one whole-row item a row dealt out evenly: a row with no keys
+    gets no item, one past ``kv_granularity`` splits, and too few rows split
+    over fewer workgroups than ``num_cu``."""
+    rows = host_kv_indptr.shape[0] - 1
+    if rows < 1:
+        return None
+    lens = np.diff(host_kv_indptr)
+    if lens.min() < 1 or lens.max() > kv_granularity:
+        return None
+    unit = 1 + _PLAN_OVERHEAD_BLOCKS
+    sum_blocks = rows * unit
+    if _PLAN_SPLIT_COEF * math.sqrt(sum_blocks * num_cu) < num_cu + 1:
+        return None
+    payload = -(-sum_blocks // num_cu) + _PLAN_OVERHEAD_BLOCKS
+    return payload // unit
+
+
+def plan_whole_rows(
+    kv_indptr: torch.Tensor,
+    rows: int,
+    rows_per_cu: int,
+    work: dict[str, torch.Tensor],
+) -> None:
+    """Write the plan ``get_mla_metadata_v1`` makes for ``rows`` query rows of
+    one token each when ``whole_row_plan_rows_per_cu`` gives ``rows_per_cu``:
+    item i is row i whole, workgroups take consecutive runs of rows, nothing
+    is reduced. ``work`` holds aiter's six plan buffers; the reduce maps are
+    left as they are, as aiter leaves them for a plan without splits."""
+    work_indptr = work["work_indptr"]
+    info = work["work_info_set"]
+    reduce_indptr = work["reduce_indptr"]
+    assert info.dtype == torch.int32 and info.shape[-1] == 8
+    num_cu = work_indptr.numel() - 1
+    span = max(rows, num_cu + 1, reduce_indptr.numel())
+    _plan_whole_rows[(-(-span // BLOCK),)](
+        info,
+        work_indptr,
+        reduce_indptr,
+        work["work_meta_data"].view(torch.int64),
+        kv_indptr,
+        work_indptr.data_ptr(),
+        info.data_ptr(),
+        rows,
+        rows_per_cu,
+        num_cu,
+        reduce_indptr.numel(),
+        BLOCK=BLOCK,
     )
