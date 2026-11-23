@@ -1496,6 +1496,51 @@ def _herd_sees_own_rows(parallel_config: FusedMoEParallelConfig) -> bool:
     )
 
 
+# ATOM_MOE_ELIDE_FULL_ROW_COUNT's eager prefill passes: `elided`, and `kept`
+# (not every row was real, so fused_moe still got the count).
+ELIDE_ROW_COUNT_STATS = {"elided": 0, "kept": 0}
+
+
+def _fused_moe_row_count(
+    count_gpu: torch.Tensor | None, rows: int
+) -> torch.Tensor | None:
+    """The row count aiter's fused_moe gets, or None under
+    ATOM_MOE_ELIDE_FULL_ROW_COUNT when an eager prefill's host count already
+    says all `rows` are real: fused_moe then runs the same rows through its
+    whole-batch paths (the fused adaptive sort, an unzeroed POST_REDUCE
+    partial buffer). A recording keeps the count, as its replays may pad.
+    The first elided and the first kept pass are logged, the rest counted in
+    `ELIDE_ROW_COUNT_STATS`."""
+    if (
+        count_gpu is None
+        or not envs.ATOM_MOE_ELIDE_FULL_ROW_COUNT
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return count_gpu
+    context = get_forward_context().context
+    if context is None or not context.is_prefill:
+        return count_gpu
+    stats = ELIDE_ROW_COUNT_STATS
+    if context.scheduled_tokens != rows:
+        if not stats["kept"]:
+            logger.info(
+                "ATOM_MOE_ELIDE_FULL_ROW_COUNT: kept fused_moe's row count on a "
+                "%d-row prefill pass with %d scheduled tokens (logged once)",
+                rows,
+                context.scheduled_tokens,
+            )
+        stats["kept"] += 1
+        return count_gpu
+    if not stats["elided"]:
+        logger.info(
+            "ATOM_MOE_ELIDE_FULL_ROW_COUNT: fused_moe runs a %d-row eager "
+            "prefill without its row count (logged once)",
+            rows,
+        )
+    stats["elided"] += 1
+    return None
+
+
 def _herd_routing(layer: torch.nn.Module) -> bool:
     """DeepSeek-V4's sqrtsoftplus top-k or Kimi-K3's sigmoid grouped top-k over
     one group: the routings HERD serves, both folding the routed scale in."""
@@ -2559,7 +2604,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 doweight_stage1=apply_router_weight_on_input,
                 bias1=layer.w13_bias,
                 bias2=layer.w2_bias,
-                num_local_tokens=scheduled_tokens_gpu,
+                num_local_tokens=(
+                    scheduled_tokens_gpu
+                    if herd_topk
+                    else _fused_moe_row_count(scheduled_tokens_gpu, x.shape[0])
+                ),
                 output=out,
                 **moe_extra_args,
             )
