@@ -437,6 +437,8 @@ def test_public_forward_reaches_the_prefill_and_checkpoint_writer(
         ssm_conv_state_len=3,
     )
     context = SimpleNamespace(
+        tr_graph=None,
+        in_hipgraph=False,
         attn_metadata=SimpleNamespace(kda_metadata=metadata),
         kv_cache_data={"layer_0": SimpleNamespace(k_cache=conv_storage, v_cache=pool)},
     )
@@ -489,6 +491,110 @@ def test_public_forward_reaches_the_prefill_and_checkpoint_writer(
     torch.testing.assert_close(output, fused[:, :2], rtol=0, atol=0)
     torch.testing.assert_close(pool, expected_pool, rtol=0, atol=0)
     torch.testing.assert_close(conv, expected_conv, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("bucket", [9, 10, 16], ids=["exact", "short-pad", "long-pad"])
+@pytest.mark.parametrize("kind", ["none", "end", "mixed"])
+def test_token_graph_prefill_writes_the_checkpoints_an_eager_step_does(
+    kind, bucket, monkeypatch, k3_modules, cpu_checkpoint_writer
+):
+    """A recorded prefill bucket runs its recurrence as a live region on the
+    step's metadata. Its targets are published after the forward like an eager
+    step's, so the region writes the same states and conv windows, and its live
+    rows match; pad rows keep the bucket's height."""
+    model = k3_modules.model
+    fused = torch.arange(16 * 13, dtype=torch.float32).reshape(16, 13).bfloat16()
+    fused = fused[:, :11]
+    ckpt = None
+    if kind != "none":
+        values = (
+            ([1, 0], [6, 7], [3, 4], [0, 1], [1, 0], [0, 0])
+            if kind == "mixed"
+            else ([0], [7], [4], [1], [0], [0])
+        )
+        ckpt = {
+            key: torch.tensor(value, dtype=torch.int32)
+            for key, value in zip(
+                ("rows", "slots", "offs", "is_end", "runtime", "h_rows"), values
+            )
+        }
+        if kind == "mixed":
+            ckpt.update(
+                kda_tokens=torch.tensor([*range(9), 4, 5, 6]),
+                kda_rows=torch.tensor([0, 1, 1], dtype=torch.int32),
+                kda_cu=torch.tensor([0, 4, 9, 12], dtype=torch.int32),
+            )
+    monkeypatch.setattr(
+        model, "causal_conv1d_fn", lambda x, *a, **kw: x.T.split(2, dim=-1)
+    )
+    monkeypatch.setattr(
+        k3_modules.initial,
+        "gather_kda_initial_state",
+        lambda state, slots, has: state.index_select(0, slots),
+    )
+
+    def run(q, k, v, gate, beta, initial, offsets, final):
+        assert final and len(initial) + 1 == offsets.numel()
+        assert q.shape[1] >= int(offsets[-1])
+        states = initial + torch.arange(len(initial)).reshape(-1, 1, 1, 1) + 100
+        return q.contiguous(), states
+
+    def step(forward):
+        layer = object.__new__(model.KimiKDAAttention)
+        torch.nn.Module.__init__(layer)
+        layer.layer_name, layer.layer_num = "layer_0", 0
+        layer.local_proj_size, layer.num_local_heads, layer.head_dim = 2, 1, 2
+        layer.fuse_f_a_quant, layer.activation, layer.conv_weight = False, "silu", None
+        layer._split_in_proj = False
+        layer.in_proj = lambda x, **kw: fused[: len(x)]
+        layer.f_b_proj = lambda x: x.new_zeros((len(x), 2))
+        layer.o_norm = lambda x, gate, **kw: x
+        layer.o_proj = lambda x: x
+        layer._run_kda = run
+        pool = torch.full((8, 1, 2, 2), -9.0)
+        pool[2], pool[3] = 20, 30
+        conv_storage = torch.full((8, 5, 6), -5.0, dtype=torch.bfloat16)
+        metadata = SimpleNamespace(
+            num_actual_tokens=9,
+            num_prefills=2,
+            num_decodes=0,
+            num_spec_decodes=0,
+            non_spec_state_indices_tensor=torch.tensor([0, 1]),
+            non_spec_state_indices_in_tensor=torch.tensor([2, 3]),
+            non_spec_query_start_loc=torch.tensor([0, 4, 9], dtype=torch.int32),
+            has_initial_state=torch.tensor([True, True]),
+            ssm_checkpoints=ckpt,
+            ssm_conv_state_len=3,
+        )
+        context = SimpleNamespace(
+            context=SimpleNamespace(is_dummy_run=False),
+            attn_metadata=SimpleNamespace(kda_metadata=metadata),
+            kv_cache_data={
+                "layer_0": SimpleNamespace(k_cache=conv_storage, v_cache=pool)
+            },
+        )
+        monkeypatch.setattr(model, "get_forward_context", lambda: context)
+        monkeypatch.setattr(
+            model,
+            "get_current_atom_config",
+            lambda: SimpleNamespace(
+                compilation_config=SimpleNamespace(
+                    static_forward_context={"layer_0": layer}
+                )
+            ),
+        )
+        return forward(layer), pool, conv_storage
+
+    eager = step(lambda layer: layer._forward_impl(torch.zeros(9, 2)))
+    graph = step(
+        lambda layer: layer._forward_prefill_split(torch.zeros(bucket, 2), None)
+    )
+    assert graph[0].shape == (bucket, 2)
+    torch.testing.assert_close(graph[0][:9], eager[0], rtol=0, atol=0)
+    for got, want in zip(graph[1:], eager[1:]):
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+    if kind != "none":
+        assert graph[1][7].eq(120).all()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashKDA needs a GPU")
