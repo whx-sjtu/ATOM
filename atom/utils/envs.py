@@ -670,6 +670,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Read and checked by atom/mono/polling.py at import, which needs no ATOM
     # import; 1 restores the pre-backoff polling (ROCm/ATOM#3369).
     "ATOM_MONO_POLL_SLEEP_UNITS": lambda: os.getenv("ATOM_MONO_POLL_SLEEP_UNITS"),
+    # Decode steps the scheduler built while a KV connector transfer it
+    # dispatched had not reported terminal run the production path, not mono
+    # (mono/runtime/kv_hold.py; ROCm/ATOM#3369). Each mono bucket then records
+    # a production graph as well. Off: mono runs beside the copies.
+    "ATOM_MONO_HOLD_FOR_KV_TRANSFER": lambda: (
+        os.getenv("ATOM_MONO_HOLD_FOR_KV_TRANSFER", "0") == "1"
+    ),
     # The lmcache server beside this engine runs tools/lmcache_producer_ready,
     # which gives the server the same variable. Kimi-K3 mono serves lmcache_mp
     # only with it (kimi_k3/mono/config.py `config_refusal`). "1" only, as the

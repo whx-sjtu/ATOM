@@ -125,6 +125,7 @@ from atom.model_ops.rejection_sampler import RELAXED_TOP_N, RejectionSampler
 from atom.model_ops.required_channel import DeviceChannel
 from atom.model_ops.sampler import SAMPLER_EPS, sampler_from_config
 from atom.models.registry import mono_decode_installers
+from atom.mono.runtime.kv_hold import MONO_OFF_PHASE, MonoStepRouter
 from atom.mono.runtime.step_override import StepOverrideModel
 from atom.sampling_params import RequiredChannel
 from atom.spec_decode.drafter import Drafter
@@ -1011,6 +1012,10 @@ class ModelRunner:
                 drafter,
                 metadata_builder=self.attn_metadata_builder,
             )
+        # Mono held off while KV transfers are in flight (`kv_hold`).
+        self._mono_router = MonoStepRouter(
+            self.model, envs.ATOM_MONO_HOLD_FOR_KV_TRANSFER, log=self.rank == 0
+        )
         # The installed model's own head output, where it has one: its
         # forward's logits, or a verify's token ids and verdict (`_head_output`).
         self.compute_head = getattr(self.model, "compute_head", None)
@@ -3146,7 +3151,15 @@ class ModelRunner:
             # prefill, or a decode no request graph serves (enforce_eager / DP
             # peer prefill / bs above the largest captured graph). Either may
             # still replay a token graph (`ForwardMode.token_graph`).
-            with record_function(label):
+            hold = (
+                self._mono_router.eager_hold(batch, is_prefill)
+                if self._mono_router.active
+                else None
+            )
+            with (
+                record_function(label),
+                self._mono_router.held_off(hold) if hold else nullcontext(),
+            ):
                 if forward_mode.running_tokens > forward_mode.scheduled_tokens:
                     input_ids, positions = self._padded_inputs(forward_mode)
                 # The multimodal runtime owns request leases and span scatter.
@@ -3307,9 +3320,18 @@ class ModelRunner:
                 graph_key = request_bucket(
                     running_bs, forward_context.attn_metadata.max_seqlen_q
                 )
+                phase = (
+                    self._mono_router.graph_phase(
+                        batch,
+                        graph_key,
+                        self.req_graph.has(graph_key, MONO_OFF_PHASE),
+                    )
+                    if self._mono_router.active
+                    else None
+                )
                 # The head output the capture recorded (`_head_output`), or
                 # None.
-                head = self.req_graph.replay(key=graph_key)
+                head = self.req_graph.replay(key=graph_key, phase=phase)
                 hidden_states = self.forward_vars["outputs"][:running_tokens]
                 # Drafter aux buffers (if any) refresh on replay: their in-place
                 # copy ops were captured into the graph.
@@ -4447,6 +4469,18 @@ class ModelRunner:
                         self.req_graph.record(
                             full_forward, key=request_bucket(bs, max_q_len)
                         )
+                        # A mono bucket also records the production path, which
+                        # a step replays while KV transfers are in flight.
+                        if self._mono_router.active and self._mono_router.note_capture(
+                            request_bucket(bs, max_q_len)
+                        ):
+                            with self._mono_router.held_off():
+                                full_forward()
+                                self.req_graph.record(
+                                    full_forward,
+                                    key=request_bucket(bs, max_q_len),
+                                    phase=MONO_OFF_PHASE,
+                                )
                     torch.cuda.synchronize()
                     # After the sync: the warmup forward's kernels must have
                     # completed before the window closes, or they spill into the

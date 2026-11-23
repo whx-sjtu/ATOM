@@ -65,6 +65,14 @@ class MonoDecodeModel(nn.Module):
 
         self._mono = LazyRunner(_build_runner, "Kimi-K3 mono decode")
         self._declines: set[str] = set()
+        # Set by the model runner around a step mono must not serve, from
+        # scheduler metadata only (`mono.runtime.kv_hold`); the reason the
+        # step is declined under.
+        self.hold_off: str | None = None
+        # The last forward: whether it ran mono, and why not (capture reads
+        # both to know which buckets need a production recording as well).
+        self.last_served = False
+        self.last_decline: str | None = None
 
     def _qlen(self, input_ids, intermediate_tensors, inputs_embeds) -> int | None:
         """This step's uniform query length if mono serves it, else None.
@@ -72,6 +80,8 @@ class MonoDecodeModel(nn.Module):
         A step turned away says so once per distinct reason: mono serving
         nothing and mono serving everything look the same from the outside.
         """
+        if self.hold_off is not None:
+            return self._declined(self.hold_off)
         if intermediate_tensors is not None or inputs_embeds is not None:
             return self._declined("pipeline or embedding input")
         context = get_forward_context()
@@ -83,6 +93,7 @@ class MonoDecodeModel(nn.Module):
         return qlen if qlen is not None else self._declined(why)
 
     def _declined(self, why: str) -> None:
+        self.last_decline = why
         if why not in self._declines:
             self._declines.add(why)
             logger.info("Kimi-K3 mono decode declined a step: %s", why)
@@ -98,6 +109,9 @@ class MonoDecodeModel(nn.Module):
         # collective: the runner and this step's kernels are built on every
         # rank, so the row count and the query length must be TP-uniform
         served = qlen is not None and self._mono.ready(input_ids.numel(), qlen)
+        self.last_served = served
+        if qlen is not None and not served:
+            self.last_decline = f"{input_ids.numel()}-row width not built"
         if served:
             return self._mono_forward(input_ids, positions, qlen)
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)

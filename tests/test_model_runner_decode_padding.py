@@ -65,6 +65,7 @@ def test_runner_model_height_and_sampling_rows(
     runner._detailed_label_suffix = lambda batch: ""
     runner._tr_hybrid_active = lambda: token_graph
     runner._dynamic_chunking = runner_module.DynamicChunkingWorker(runner)
+    runner._mono_router = runner_module.MonoStepRouter(None, enabled=False)
     ids = torch.full((32,), -99, dtype=torch.int32)
     ids[:scheduled] = torch.arange(1, scheduled + 1)
     pos = torch.full((32,), -99, dtype=torch.int64)
