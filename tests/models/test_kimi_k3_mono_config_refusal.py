@@ -130,14 +130,33 @@ def test_decode_context_parallelism_is_served(servable):
 
 
 @pytest.mark.parametrize("connector", ["lmcache_mp", "lmcache_offload", "multi"])
-def test_lmcache_mp_can_run_beside_k3_and_shared_dsa_mono(servable, connector):
+def test_lmcache_mp_can_run_beside_k3_and_shared_dsa_mono(
+    servable, monkeypatch, connector
+):
     from atom.mono.dsa_indexer.dispatch import config_refusal as dsa_refusal
 
+    monkeypatch.setattr(k3_config.envs, "ATOM_LMCACHE_PRODUCER_READY", True)
     atom_config = _atom_config()
     atom_config.kv_transfer_config = {"kv_connector": connector}
     expected = None if connector == "lmcache_mp" else f"KV connector {connector}"
     assert config_refusal(atom_config) == expected
     assert dsa_refusal(atom_config) == expected
+
+
+@pytest.mark.parametrize("name", ["lmcache_mp", " LMCache_MP "])
+def test_lmcache_mp_without_the_servers_producer_ready_gate_is_refused(
+    servable, monkeypatch, name
+):
+    # the server's GPU wait on the producer fence would spin on a CU that a
+    # mono step still queued ahead of the fence needs
+    monkeypatch.setattr(k3_config.envs, "ATOM_LMCACHE_PRODUCER_READY", False)
+    atom_config = _atom_config()
+    atom_config.kv_transfer_config = {"kv_connector": name}
+    assert "producer-ready gate" in config_refusal(atom_config)
+    atom_config.kv_transfer_config = None
+    assert config_refusal(atom_config) is None
+    atom_config.kv_transfer_config = dict(_MOONCAKE_DECODE)
+    assert config_refusal(atom_config) is None
 
 
 def test_other_mono_models_still_refuse_decode_context_parallelism(servable):

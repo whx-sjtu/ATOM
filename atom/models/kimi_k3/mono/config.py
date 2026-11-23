@@ -246,6 +246,13 @@ def config_refusal(atom_config) -> str | None:
         common_refusals(atom_config, Dims, SUPPORTED_TP, refuse_decode_cp=False)
         + resident_grid_refusals(atom_config, _served_connectors(atom_config))
     ) + [
+        (
+            not _lmcache_mp_ungated(atom_config),
+            (
+                "lmcache_mp without the lmcache server's producer-ready gate "
+                "(ATOM_LMCACHE_PRODUCER_READY=1, tools/lmcache_producer_ready)"
+            ),
+        ),
         # the KDA recurrence reads and writes fp32 state in place; a narrower
         # pool would be read as fp32 rather than converted
         (
@@ -333,10 +340,10 @@ def config_refusal(atom_config) -> str | None:
 
 
 def _served_connectors(atom_config) -> tuple[str, ...]:
-    """The KV connectors served beside the kernels: bounded LMCache MP copies,
-    and Mooncake, when it is the
-    P/D decode of a deployment without decode CP, whose receives are NIC
-    writes into the pools this rank already holds.
+    """The KV connectors served beside the kernels: bounded LMCache MP copies
+    (behind the producer-ready gate, `_lmcache_mp_ungated`), and Mooncake,
+    when it is the P/D decode of a deployment without decode CP, whose
+    receives are NIC writes into the pools this rank already holds.
 
     Mooncake's consumer queues GPU work of its own only for a model that hands
     it a slot scatter (DeepSeek-V4's compressor staging) or for a DCP landing
@@ -353,3 +360,18 @@ def _served_connectors(atom_config) -> tuple[str, ...]:
     ):
         return ("lmcache_mp", "mooncake")
     return ("lmcache_mp",)
+
+
+def _lmcache_mp_ungated(atom_config) -> bool:
+    """LMCache MP beside an lmcache server that does not gate its GPU wait on
+    this engine's producer fence. That wait is a kernel spinning on a CU until
+    the fence signals, and the fence can be recorded behind a mono step whose
+    CTAs need every CU: the step is never placed whole, so neither finishes."""
+    from atom.kv_transfer.disaggregation import KVConnectorFactory
+
+    kv = getattr(atom_config, "kv_transfer_config", None)
+    try:
+        name = KVConnectorFactory.canonical_name(kv.get("kv_connector"))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return name == "lmcache_mp" and not envs.ATOM_LMCACHE_PRODUCER_READY

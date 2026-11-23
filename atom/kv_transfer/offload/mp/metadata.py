@@ -25,3 +25,6 @@ class MPOffloadMetadata(LMCacheOffloadMetadata):
         super().__init__()
         self.requests: list[MPReqMeta] = []
         self.token_drops: tuple = ()
+        # A transfer was dispatched and not yet reported terminal when the
+        # scheduler built this step (`mono.runtime.kv_hold`). Not work.
+        self.transfers_live = False

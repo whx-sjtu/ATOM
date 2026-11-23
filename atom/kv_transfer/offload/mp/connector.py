@@ -185,7 +185,14 @@ class LMCacheMPConnectorScheduler(KVConnectorSchedulerBase):
         return self._require_impl().get_num_new_matched_tokens(seq)
 
     def build_connector_meta(self) -> Any:
-        return self._require_impl().build_connector_meta()
+        impl = self._require_impl()
+        metadata = impl.build_connector_meta()
+        # After this step's dispatch: its own transfers count. Read by the
+        # model runner to hold resident-grid mono steps off (`kv_hold`).
+        live = getattr(impl, "_live_transfers", None)
+        if metadata is not None:
+            metadata.transfers_live = bool(live()) if callable(live) else False
+        return metadata
 
     def update_state_after_alloc(self, seq: Any) -> None:
         self._require_impl().update_state_after_alloc(seq)
