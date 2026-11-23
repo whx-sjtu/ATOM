@@ -296,6 +296,11 @@ class KdaPreBuild:
     # its MFMAs (held in VGPRs meanwhile). One leaves a CTA one unit's weights
     # in flight, a load round trip a unit: the GEMV past its x a latency chain
     w_ahead: int = field(default=1, metadata={"sym": "wa"})
+    # a ``gemv_groups`` wave loads its own chunks' x straight into its MFMA
+    # operands (``x_wave_loads``) instead of the CTA staging every unit
+    # through LDS: a wave reads only its own columns, so the staging's per-unit
+    # store and barrier tie every wave to the slowest one's loads
+    x_direct: bool = field(default=False, metadata={"sym": "xd"})
 
 
 # ``KdaPreBuild.ablate``: a path compiled away, its cost read off the time left
@@ -306,7 +311,7 @@ ABLATE_X = 8  # the GEMV's x rows zeros, never loaded (their LDS staging kept)
 
 # fields a build names only off their default, so a serving build's symbol (and
 # LLVM's register choice with it) is the one it had before they existed
-_UNNAMED_DEFAULT = {"ablate": 0, "x_cached": False, "w_ahead": 1}
+_UNNAMED_DEFAULT = {"ablate": 0, "x_cached": False, "w_ahead": 1, "x_direct": False}
 
 
 def symbol(key: KdaPreBuild) -> str:
@@ -849,6 +854,42 @@ def x_unit_loads(c, i0, n):
     return gemv.rows_loads(c["tid"], c["xbuf"], c["S"], n * KGROUP, HIDDEN, i0 * KGROUP, x_cm(c))
 
 
+def x_wave_loads(c, i0, n):
+    """This wave's MFMA x operands of column groups i0 .. i0 + n of the
+    (group's) x rows (``x_direct``): ``gemv_slab``'s from LDS, the same bits --
+    lane token row lane % 16 (the last past S), slab q's 8 columns from 32 q +
+    (lane / 16) 8 of its chunk."""
+    if const_expr(c["ablate"] & ABLATE_X):
+        return [[fx.Vector.filled(4, 0, fx.Int32) for _ in range(4)] for _ in range(n)]
+    lane, wave = c["lane"], c["wave"]
+    t = fx.min(lane % ROWS, c["S"] - 1)
+    r_x = rsrc(c["xbuf"])
+    out = []
+    for j in range(n):
+        k = (i0 + j) * KGROUP + wave * KCH + (lane // ROWS) * 8
+        out.append([
+            fx.Vector(
+                bo.buffer_load(
+                    r_x, (t * HIDDEN + k + 32 * q) // 2, vec_width=4, dtype=T.i32,
+                    cache_modifier=x_cm(c),
+                )
+            )
+            for q in range(4)
+        ])
+    return out
+
+
+def gemv_regs(ops, xs, ni: int, acc):
+    """``gemv_slab`` with the x operands in registers (``x_wave_loads``): the
+    same MFMAs in the same order."""
+    for j in range_constexpr(ni):
+        for q in range_constexpr(4):
+            acc = mfma_bf16(
+                ops[j][q].bitcast(fx.BFloat16), xs[j][q].bitcast(fx.BFloat16), acc
+            )
+    return acc
+
+
 def x_unit_store(c, xs, n, buf):
     """``x_unit_loads(c, ..)``' chunks (n column groups) into LDS rows of
     ``xu_row`` at ``buf``: ``c`` the same group's view."""
@@ -887,6 +928,30 @@ def gemv_groups(c, gi):
         if c["tid"] < NA * G:
             c["poll"]([(c["xrdy"], c["tid"], 1)])
     gpu.barrier()
+
+    def x_regs(u):
+        k, g = units[u]
+        return x_wave_loads(group_view(c, g), *kunits[k])
+
+    if const_expr(c["x_direct"]):
+        # x ``x_ahead`` units ahead in this wave's registers, no CTA barrier
+        # past the XRDY one: a wave waits only for its own loads
+        n_u, ahead = len(units), c["x_ahead"]
+        xs = {u: x_regs(u) for u in range(min(ahead, n_u))}
+        for u in range_constexpr(n_u):
+            k, g = units[u]
+            if const_expr(u + ahead < n_u):
+                xs[u + ahead] = x_regs(u + ahead)
+            if const_expr(g == 0 and k + wa < len(kunits)):
+                ops[k + wa] = unit_ops(k + wa)
+            xu = xs.pop(u)
+            acc0[g] = gemv_regs(ops[k][0], xu, kunits[k][1], acc0[g])
+            acc1[g] = gemv_regs(ops[k][1], xu, kunits[k][1], acc1[g])
+        stamp(c["on"], c["tls"], c["tid"], 5)
+        for g in range_constexpr(G):
+            gemv_finish(group_view(c, g), rg0, acc0[g])
+            gemv_finish(group_view(c, g), rg1, acc1[g])
+        return
 
     def x_of(u):
         k, g = units[u]
@@ -1810,6 +1875,7 @@ def build(key: KdaPreBuild):
             "ablate": key.ablate,
             "x_cached": key.x_cached,
             "w_ahead": key.w_ahead,
+            "x_direct": key.x_direct,
             "vloc": kl.vloc.ptr,
             "ol": kl.ol.ptr,
             "onl": kl.onl.ptr,
