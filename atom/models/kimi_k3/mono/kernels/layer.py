@@ -27,7 +27,7 @@ shared gate/up GEMVs issue their weights before they first wait.
                      lnorm (56 .. 83), up (0 .. 55), reduce (200 .. 255)
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -103,6 +103,20 @@ class K2Build:
     down_peek: bool = field(default=False, metadata={"sym": "dk"})
     # ug rounds placed up to the queue's last ones (``run_ug``)
     ug_place: bool = field(default=False, metadata={"sym": "up"})
+    # The hand-off switches (``HANDOFFS``), every one the same sums; a build
+    # names one in its symbol only when it is on. The latent gathered before
+    # the route is waited for (``k2b.load_latq``; the route's bitmaps past
+    # the latent's LDS, ``k2b.mask_lds``).
+    latq_first: bool = field(default=False, metadata={"sym": "lf"})
+    # every pass's pairs in one poll: the route's RLOG and ROUTE, the
+    # AttnRes and final reduces, lnorm (``k2b.stage_lnorm_batched``)
+    batch_polls: bool = field(default=False, metadata={"sym": "bp"})
+    # the router's K parts to every rank's RLOGP, added by the route
+    # (``k2b.route_logits``): no part-to-part hop
+    route_parts: bool = field(default=False, metadata={"sym": "rp"})
+    # lnorm's sums of squares from the owner beside LATG (LSQ): no hop
+    # between a rank's lnorm tasks (``k2b.stage_lnorm_batched``)
+    ln_sq: bool = field(default=False, metadata={"sym": "lq"})
     diag: bool = field(default=False, metadata={"sym": "g"})
     timeline: bool = field(default=False, metadata={"sym": "t"})
 
@@ -147,14 +161,33 @@ ABI = KernelAbi(
 )
 
 
-def peer_layout(s):
-    """K2a's AR and DG regions, then K2b's: name -> (byte offset, bytes)."""
-    pairs = {"ar": k2a.ar_pairs(s), "dg": k2a.dg_pairs(s), **k2b.peer_pairs(s)}
+HANDOFFS = ("latq_first", "batch_polls", "route_parts", "ln_sq")
+_SYM = {f.name: f.metadata.get("sym") for f in fields(K2Build)}
+# past this width the latent lands after the route, so gathering it first
+# only delays the route table (``latq_first``)
+LATQ_FIRST_ROWS = 10
+
+
+def handoffs_at(rows: int, on) -> dict:
+    """The hand-off switches ``on`` (field -> on) a ``rows``-row build takes."""
+    return {**on, "latq_first": bool(on.get("latq_first")) and rows <= LATQ_FIRST_ROWS}
+
+
+def peer_extra(key: K2Build) -> tuple:
+    """The opt-in peer regions ``key`` pushes into (``k2b.EXTRA_PEER``)."""
+    on = {"rlogp": key.route_parts, "lsq": key.ln_sq}
+    return tuple(r for r in k2b.EXTRA_PEER if on[r])
+
+
+def peer_layout(s, extra=()):
+    """K2a's AR and DG regions, then K2b's (``extra``: its opt-in ones past
+    them): name -> (byte offset, bytes)."""
+    pairs = {"ar": k2a.ar_pairs(s), "dg": k2a.dg_pairs(s), **k2b.peer_pairs(s, extra)}
     return pair_layout(pairs.items())
 
 
-def peer_bytes(s):
-    lay = peer_layout(s)
+def peer_bytes(s, extra=()):
+    lay = peer_layout(s, extra)
     return max(o + n for o, n in lay.values())
 
 
@@ -258,6 +291,17 @@ def padding_supported(key: K2Build):
     return key.skip_padding and key.tokens == 64 and key.qlen in (1, 4)
 
 
+def symbol(key: K2Build) -> str:
+    """``key``'s kernel symbol. A hand-off switch is named only when on: the
+    default's symbol is what log readers match, and LLVM's register choice can
+    shift with the symbol alone."""
+    sym = symbol_params(key)
+    for name in HANDOFFS:
+        if not getattr(key, name):
+            del sym[_SYM[name]]
+    return kernel_symbol("k3_mono_k2", **sym)
+
+
 def build(key: K2Build):
     if key in _BUILDS:
         return _BUILDS[key]
@@ -277,8 +321,11 @@ def build(key: K2Build):
     assert s * (k2b.SI + gemv.LDS_PAD) <= sg * (xcols + gemv.LDS_PAD)
     lay = scratch_layout(key)
     plain_lay = plain_layout(key)
-    play = peer_layout(s)
+    extra = peer_extra(key)
+    play = peer_layout(s, extra)
     RouteLds = k2b.route_lds(s)
+    batched_ln = key.batch_polls or key.ln_sq
+    stage_lnorm = k2b.stage_lnorm_batched if batched_ln else k2b.stage_lnorm
 
     @fx.struct
     class EarlyLds:
@@ -295,7 +342,7 @@ def build(key: K2Build):
         attn: AttnLds
         ug: k2b.ug_lds(s)
         down: k2b.down_lds(s)
-        rmask: k2b.mask_lds(s)
+        rmask: k2b.mask_lds(s, key.latq_first)
         rsel: k2b.RouteSelLds
 
     @fx.struct
@@ -304,7 +351,7 @@ def build(key: K2Build):
         tls: fx.Array[fx.Int64, TL_POINTS, 16]
 
     keyed = key_tuple(key, _SOURCES)
-    name = kernel_symbol("k3_mono_k2", **symbol_params(key))
+    name = symbol(key)
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def k2(
@@ -359,7 +406,7 @@ def build(key: K2Build):
         bases = peer_bases(peers, TP_)
         own = load_ptr64(peers, rank)
         peer = {}
-        for region in k2b.PEER_REGIONS + ("ar", "dg"):
+        for region in k2b.PEER_REGIONS + ("ar", "dg") + extra:
             off = play[region][0]
             peer[region] = [preg(b, off, region) for b in bases]
             peer[region + "_own"] = preg(own, off, region)
@@ -383,6 +430,10 @@ def build(key: K2Build):
             "eps": key.eps,
             "out_eps": key.out_eps,
             "ln_eps": key.ln_eps,
+            "latq_first": key.latq_first,
+            "batch_polls": key.batch_polls,
+            "route_parts": key.route_parts,
+            "ln_sq": key.ln_sq,
             "put": mb.put,
             "put_bf": mb.put_bf,
             "put_words": mb.put_words,
@@ -493,12 +544,19 @@ def build(key: K2Build):
             stamp(on, tls, tid, 2)
         # ---- the routed experts
         # the route table first: its bitmaps share LDS with the latent
-        # (``k2b.mask_lds``)
+        # (``k2b.mask_lds``); ``latq_first``: the latent, which lands before
+        # the route, gathered while the route is still coming
         enter_stage("k2.ug")
-        nu = k2b.load_route(c)
-        stamp(on, tls, tid, 11)
-        k2b.load_latq(c)
-        stamp(on, tls, tid, 12)
+        if const_expr(key.latq_first):
+            k2b.load_latq(c)
+            stamp(on, tls, tid, 12)
+            nu = k2b.load_route(c)
+            stamp(on, tls, tid, 11)
+        else:
+            nu = k2b.load_route(c)
+            stamp(on, tls, tid, 11)
+            k2b.load_latq(c)
+            stamp(on, tls, tid, 12)
         if const_expr(skip_padding):
             if nu > 0:
                 k2b.run_ug(c, bid, nu)
@@ -527,12 +585,12 @@ def build(key: K2Build):
         stamp(on, tls, tid, 4)
         enter_stage("k2.lnorm")
         if (bid >= k2b.LN0) & (bid < k2b.LN0 + k2b.LN_TASKS):
-            k2b.stage_lnorm(c, bid - k2b.LN0)
+            stage_lnorm(c, bid - k2b.LN0)
         # a wide step's lnorm tasks' second halves on CTAs 0 .., which wait
         # for LN anyway (up's)
         if const_expr(k2b.ln_halves(c["S"]) > 1):  # noqa: SIM102
             if bid < k2b.LN_TASKS:
-                k2b.stage_lnorm(c, bid, 1)
+                stage_lnorm(c, bid, 1)
         stamp(on, tls, tid, 5)
         enter_stage("k2.up")
         k2b.run_up(c, bid)
