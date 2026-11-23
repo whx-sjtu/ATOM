@@ -609,21 +609,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DCP_LOCAL_TOPK": lambda: os.getenv("ATOM_DCP_LOCAL_TOPK", "auto"),
     # DCP sparse prefill owned-slot filter: each program reads its token's
     # whole top-k row in one tile, and the offset scan runs in one wide block.
-    # Bit-identical output. Off by default.
+    # Bit-identical output. On by default; 0 keeps the tiled kernels.
     "ATOM_DCP_PREFILL_FILTER_WHOLE_ROW": lambda: (
-        os.getenv("ATOM_DCP_PREFILL_FILTER_WHOLE_ROW", "0") == "1"
+        os.getenv("ATOM_DCP_PREFILL_FILTER_WHOLE_ROW", "1") == "1"
     ),
     # MLA prefill that absorbs W_K into q_out under an identity (NoPE) rotary:
     # write only q_out's rope slice and the KV entry, instead of the aiter rope
     # op storing a stand-in nope half that the absorb overwrites. Same codes.
-    # Off by default.
-    "ATOM_MLA_Q_TAIL_CACHE": lambda: (os.getenv("ATOM_MLA_Q_TAIL_CACHE", "0") == "1"),
+    # On by default; 0 keeps the aiter rope op.
+    "ATOM_MLA_Q_TAIL_CACHE": lambda: (os.getenv("ATOM_MLA_Q_TAIL_CACHE", "1") == "1"),
     # DCP sparse prefill step plan: write the one-item-a-row plan
     # get_mla_metadata_v1 makes when every row holds 1..kv_granularity keys
     # directly, instead of running aiter's single-workgroup planner over every
-    # row. Same buffers, checked against aiter's once a process. Off by default.
+    # row. Same buffers, checked against aiter's once a process. On by default;
+    # 0 always plans with aiter.
     "ATOM_MLA_SPARSE_PREFILL_ROW_PLAN": lambda: (
-        os.getenv("ATOM_MLA_SPARSE_PREFILL_ROW_PLAN", "0") == "1"
+        os.getenv("ATOM_MLA_SPARSE_PREFILL_ROW_PLAN", "1") == "1"
     ),
     # GLM-5.2 (glm_moe_dsa): enable the fused indexer qk-rope + fp8-quant + kv-cache
     # kernel (indexer_qk_rope_quant_and_cache), same path DeepSeek-V3.2 uses. GLM's
@@ -659,17 +660,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MONO_K2_DOWN_PEEK": lambda: os.getenv("ATOM_MONO_K2_DOWN_PEEK", "0") == "1",
     # Kimi K2: place the ug rounds before the queue's last two (no claim atomic).
     "ATOM_MONO_K2_UG_PLACE": lambda: os.getenv("ATOM_MONO_K2_UG_PLACE", "0") == "1",
-    # Kimi K2 hand-offs, the same sums: gather the latent before the route
-    # (widths up to ``layer.LATQ_FIRST_ROWS``).
-    "ATOM_MONO_K2_LATQ_FIRST": lambda: os.getenv("ATOM_MONO_K2_LATQ_FIRST", "0") == "1",
+    # Kimi K2 hand-offs, the same sums, each on by default (0 turns it off):
+    # gather the latent before the route (widths up to ``layer.LATQ_FIRST_ROWS``).
+    "ATOM_MONO_K2_LATQ_FIRST": lambda: os.getenv("ATOM_MONO_K2_LATQ_FIRST", "1") == "1",
     # Kimi K2: poll every pass's mailbox pairs in one batch.
-    "ATOM_MONO_K2_BATCH_POLLS": lambda: os.getenv("ATOM_MONO_K2_BATCH_POLLS", "0")
+    "ATOM_MONO_K2_BATCH_POLLS": lambda: os.getenv("ATOM_MONO_K2_BATCH_POLLS", "1")
     == "1",
     # Kimi K2: router K parts to every rank, added by the route.
-    "ATOM_MONO_K2_ROUTE_PARTS": lambda: os.getenv("ATOM_MONO_K2_ROUTE_PARTS", "0")
+    "ATOM_MONO_K2_ROUTE_PARTS": lambda: os.getenv("ATOM_MONO_K2_ROUTE_PARTS", "1")
     == "1",
     # Kimi K2: the latent norm's sums of squares from their owner rank.
-    "ATOM_MONO_K2_LN_SQ": lambda: os.getenv("ATOM_MONO_K2_LN_SQ", "0") == "1",
+    "ATOM_MONO_K2_LN_SQ": lambda: os.getenv("ATOM_MONO_K2_LN_SQ", "1") == "1",
     # GLM-5.2 mono: run the "full" indexer layers (18 of 78) through the fused
     # MonoKernel (atom/models/glm52/mono/kernels/{kernel,layout,op}.py, built
     # with with_indexer=True), which does index Q/K/W projection, paged FP8
@@ -713,8 +714,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # with --enforce-eager.
     "ATOM_MONO_DEBUG": lambda: os.getenv("ATOM_MONO_DEBUG", "0") == "1",
     # Kimi-K3 mono K1: at two token groups with a short second one, the GEMV's
-    # weights two column groups ahead (kda.gemv_staging). Same sums.
-    "ATOM_MONO_K1_W_AHEAD": lambda: os.getenv("ATOM_MONO_K1_W_AHEAD", "0") == "1",
+    # weights two column groups ahead (kda.gemv_staging). Same sums. 0 turns it off.
+    "ATOM_MONO_K1_W_AHEAD": lambda: os.getenv("ATOM_MONO_K1_W_AHEAD", "1") == "1",
     # gfx950 mono mailbox retry spacing in s_sleep units (1..127, unset: 16).
     # Read and checked by atom/mono/polling.py at import, which needs no ATOM
     # import; 1 restores the pre-backoff polling (ROCm/ATOM#3369).
@@ -850,8 +851,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Build the Kimi-K3 DSpark block's DCP-sharded MLA metadata (positions,
     # slots, ctx_lens, kv_indptr, pad-tail kv_indices) in one Triton program
-    # instead of ~20 torch launches. Same values. Read at proposer construction.
-    "ATOM_DSPARK_FUSED_BLOCK_META": lambda: _flag_env("ATOM_DSPARK_FUSED_BLOCK_META"),
+    # instead of ~20 torch launches. Same values; "0" restores the torch path.
+    # Read at proposer construction.
+    "ATOM_DSPARK_FUSED_BLOCK_META": lambda: _flag_env(
+        "ATOM_DSPARK_FUSED_BLOCK_META", "1"
+    ),
     # Lossless speculative sampling: the DSpark draft samples its block from q
     # and the verify accepts by the probability ratio (u * q < p). Off by
     # default; needs an aiter with ROCm/aiter#6954 under TP; where it arms,
@@ -1194,9 +1198,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_KIMI_K3_MOE_LATENT_ROW_SHARD", "0") == "1"
     ),
     # Eager prefill: drop the device row count from aiter's fused_moe when the
-    # host already knows every row is real (`_fused_moe_row_count`).
+    # host already knows every row is real (`_fused_moe_row_count`). Same
+    # outputs. On by default; 0 always passes the count.
     "ATOM_MOE_ELIDE_FULL_ROW_COUNT": lambda: (
-        os.getenv("ATOM_MOE_ELIDE_FULL_ROW_COUNT", "0").lower() == "1"
+        os.getenv("ATOM_MOE_ELIDE_FULL_ROW_COUNT", "1").lower() == "1"
     ),
     # Fuse into a per-rank replica without EPLB. EPLB always fuses it as routed.
     "ATOM_FUSE_SHARED_EXPERT": lambda: (

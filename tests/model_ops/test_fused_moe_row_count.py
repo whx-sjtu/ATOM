@@ -28,15 +28,18 @@ def _step(monkeypatch, moe, context):
 COUNT = torch.tensor([8], dtype=torch.int32)
 
 
-@pytest.mark.parametrize("flag", ["0", None])
-def test_off_by_default(moe, monkeypatch, flag):
-    if flag is None:
-        monkeypatch.delenv("ATOM_MOE_ELIDE_FULL_ROW_COUNT", raising=False)
-    else:
-        monkeypatch.setenv("ATOM_MOE_ELIDE_FULL_ROW_COUNT", flag)
+def test_zero_turns_it_off(moe, monkeypatch):
+    monkeypatch.setenv("ATOM_MOE_ELIDE_FULL_ROW_COUNT", "0")
     _step(monkeypatch, moe, SimpleNamespace(is_prefill=True, scheduled_tokens=8))
     assert moe._fused_moe_row_count(COUNT, 8) is COUNT
     assert moe.ELIDE_ROW_COUNT_STATS == {"elided": 0, "kept": 0}
+
+
+def test_on_by_default(moe, monkeypatch):
+    monkeypatch.delenv("ATOM_MOE_ELIDE_FULL_ROW_COUNT", raising=False)
+    _step(monkeypatch, moe, SimpleNamespace(is_prefill=True, scheduled_tokens=8))
+    assert moe._fused_moe_row_count(COUNT, 8) is None
+    assert moe.ELIDE_ROW_COUNT_STATS == {"elided": 1, "kept": 0}
 
 
 def test_eager_prefill_with_every_row_real_drops_the_count(moe, monkeypatch):
