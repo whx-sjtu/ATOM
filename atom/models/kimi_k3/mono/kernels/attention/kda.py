@@ -292,6 +292,10 @@ class KdaPreBuild:
     # CU of the launch has read the buffer before (a launch starts with its
     # caches invalidated): no reader can hold a stale line
     x_cached: bool = field(default=False, metadata={"sym": "xc"})
+    # column-group units a ``gemv_groups`` unit's weights are issued ahead of
+    # its MFMAs (held in VGPRs meanwhile). One leaves a CTA one unit's weights
+    # in flight, a load round trip a unit: the GEMV past its x a latency chain
+    w_ahead: int = field(default=1, metadata={"sym": "wa"})
 
 
 # ``KdaPreBuild.ablate``: a path compiled away, its cost read off the time left
@@ -300,16 +304,16 @@ ABLATE_WEIGHTS = 2  # the GEMV's weight operands zeros, never loaded
 ABLATE_ATTN = 4  # no AttnRes, and the GEMV waits for no x (XRDY)
 ABLATE_X = 8  # the GEMV's x rows zeros, never loaded (their LDS staging kept)
 
-# fields a build names only when set, so a serving build's symbol (and LLVM's
-# register choice with it) is the one it had before they existed
-_UNNAMED_OFF = ("ablate", "x_cached")
+# fields a build names only off their default, so a serving build's symbol (and
+# LLVM's register choice with it) is the one it had before they existed
+_UNNAMED_DEFAULT = {"ablate": 0, "x_cached": False, "w_ahead": 1}
 
 
 def symbol(key: KdaPreBuild) -> str:
-    """``key``'s kernel symbol (``_UNNAMED_OFF``)."""
+    """``key``'s kernel symbol (``_UNNAMED_DEFAULT``)."""
     sym = symbol_params(key)
-    for f in _UNNAMED_OFF:
-        if not getattr(key, f):
+    for f, off in _UNNAMED_DEFAULT.items():
+        if getattr(key, f) == off:
             del sym[KdaPreBuild.__dataclass_fields__[f].metadata["sym"]]
     return kernel_symbol("k3_mono_kda_pre", **sym)
 
@@ -876,7 +880,8 @@ def gemv_groups(c, gi):
             gemv_loads(c, rg1, range(i0, i0 + n), paired=True),
         ]
 
-    ops = {0: unit_ops(0)}
+    wa = min(c["w_ahead"], len(kunits))
+    ops = {k: unit_ops(k) for k in range(wa)}
     # every group's slices ready (XRDY, NA a group)
     if const_expr(not c["ablate"] & ABLATE_ATTN):  # noqa: SIM102
         if c["tid"] < NA * G:
@@ -893,8 +898,8 @@ def gemv_groups(c, gi):
 
     def multiply(u, buf):
         k, g = units[u]
-        if const_expr(g == 0 and k + 1 < len(kunits)):
-            ops[k + 1] = unit_ops(k + 1)
+        if const_expr(g == 0 and k + wa < len(kunits)):
+            ops[k + wa] = unit_ops(k + wa)
         cu = {**group_view(c, g), "xl": buf, "xrow": row}
         acc0[g] = gemv_slab(cu, ops[k][0], kunits[k][1], acc0[g])
         acc1[g] = gemv_slab(cu, ops[k][1], kunits[k][1], acc1[g])
@@ -1804,6 +1809,7 @@ def build(key: KdaPreBuild):
             "x_ahead": key.x_ahead,
             "ablate": key.ablate,
             "x_cached": key.x_cached,
+            "w_ahead": key.w_ahead,
             "vloc": kl.vloc.ptr,
             "ol": kl.ol.ptr,
             "onl": kl.onl.ptr,
