@@ -574,7 +574,7 @@ def early_loads(c, kind, i, q):
             n,
             ldk=HIDDEN,
             k0=q * klen + k0,
-            paired=True,
+            paired=kind != 2 or c.get("early_paired", True),
         )
         for k0, n in gemv.slabs(klen, min(c["S"], TG))
     ]

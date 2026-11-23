@@ -103,6 +103,11 @@ class K2Build:
     down_peek: bool = field(default=False, metadata={"sym": "dk"})
     # ug rounds placed up to the queue's last ones (``run_ug``)
     ug_place: bool = field(default=False, metadata={"sym": "up"})
+    # the sgu early task's weights loaded paired (``gemv.chunk_ops``): whole
+    # lines, its pairs held to the select at its MFMAs. Unpaired, a slab a
+    # load, for a width that spilled paired (``runner._lean_width``); only
+    # that build's symbol names it (``symbol``)
+    early_paired: bool = field(default=True, metadata={"sym": "ep"})
     diag: bool = field(default=False, metadata={"sym": "g"})
     timeline: bool = field(default=False, metadata={"sym": "t"})
 
@@ -258,6 +263,16 @@ def padding_supported(key: K2Build):
     return key.skip_padding and key.tokens == 64 and key.qlen in (1, 4)
 
 
+def symbol(key: K2Build) -> str:
+    """``key``'s kernel symbol. Only the lean (unpaired) build names ``ep``:
+    the default's symbol is what log readers match, and LLVM's register
+    choice can shift with the symbol alone."""
+    sym = symbol_params(key)
+    if key.early_paired:
+        del sym["ep"]
+    return kernel_symbol("k3_mono_k2", **sym)
+
+
 def build(key: K2Build):
     if key in _BUILDS:
         return _BUILDS[key]
@@ -304,7 +319,7 @@ def build(key: K2Build):
         tls: fx.Array[fx.Int64, TL_POINTS, 16]
 
     keyed = key_tuple(key, _SOURCES)
-    name = kernel_symbol("k3_mono_k2", **symbol_params(key))
+    name = symbol(key)
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def k2(
@@ -383,6 +398,7 @@ def build(key: K2Build):
             "eps": key.eps,
             "out_eps": key.out_eps,
             "ln_eps": key.ln_eps,
+            "early_paired": key.early_paired,
             "put": mb.put,
             "put_bf": mb.put_bf,
             "put_words": mb.put_words,
