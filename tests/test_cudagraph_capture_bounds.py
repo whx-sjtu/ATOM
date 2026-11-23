@@ -10,8 +10,9 @@ forward buffers (sized `max_num_batched_tokens`) and surfaced as a bare
 `could not broadcast input array from shape (1024,) into shape (512,)`.
 """
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from aiter_stub import atom_without_aiter
@@ -193,3 +194,64 @@ def test_memory_guard_skips_a_bucket_any_pcp_rank_cannot_fit(monkeypatch, model_
     )
     assert model_runner.ModelRunner._skip_token_bucket(runner, 1024)
     assert reduced == ["get_pcp_group"]
+
+
+def _bucket_runner(model_runner, own=None, limit=16384):
+    """A runner whose attention builder declares ``own`` prefill buckets and
+    whose warmup forward carries ``limit`` tokens."""
+    runner = SimpleNamespace(
+        attn_metadata_builder=SimpleNamespace(prefill_token_graph_sizes=own),
+        warmup_max_tokens=lambda: limit,
+    )
+    runner.prefill_token_buckets = MethodType(
+        model_runner.ModelRunner.prefill_token_buckets, runner
+    )
+    return runner
+
+
+def test_prefill_buckets_are_the_variable_then_the_backends_then_the_default(
+    monkeypatch, model_runner
+):
+    monkeypatch.delenv("ATOM_TOKEN_GRAPH_SIZES", raising=False)
+    assert _bucket_runner(model_runner).prefill_token_buckets() == [
+        3072,
+        2048,
+        1024,
+        512,
+        256,
+    ]
+    # Largest first, once each, none past what one warmup forward carries.
+    own = _bucket_runner(model_runner, (256, 2304, 4096, 2304, 0), limit=3000)
+    assert own.prefill_token_buckets() == [2304, 256]
+    # Set, even empty, the variable wins over the backend's own.
+    monkeypatch.setenv("ATOM_TOKEN_GRAPH_SIZES", "512,256")
+    assert own.prefill_token_buckets() == [512, 256]
+    monkeypatch.setenv("ATOM_TOKEN_GRAPH_SIZES", "")
+    assert own.prefill_token_buckets() == []
+
+
+def test_prefill_token_graphs_are_recorded_largest_first_and_their_cost_logged(
+    monkeypatch, model_runner
+):
+    # Each bucket's buffers are leading slices of the first recording's.
+    monkeypatch.delenv("ATOM_TOKEN_GRAPH_SIZES", raising=False)
+    runner = _bucket_runner(model_runner, (1024, 4096, 2304))
+    passes, logged = [], []
+    runner.rank = 0
+    runner.running_tokens_per_dp_rank = np.zeros(1, dtype=np.int64)
+    runner.attn_metadata_builder.build_for_token_graph_capture = lambda n: ("md", n)
+    runner._build_capture = lambda build, n: build(n)
+    runner._run_capture_prefill = lambda md, n, mode: passes.append(
+        (n, int(runner.running_tokens_per_dp_rank[0]), mode)
+    )
+    free = iter([10 << 30, 9 << 30])
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (next(free), 0))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(
+        model_runner, "logger", SimpleNamespace(info=lambda f, *a: logged.append(f % a))
+    )
+    model_runner.ModelRunner._record_tr_graphs(runner)
+    assert passes == [(n, n, m) for n in (4096, 2304, 1024) for m in (None, "record")]
+    assert len(logged) == 1
+    assert "free memory -1.00 GiB, torch reserved +0.00 GiB" in logged[0]
