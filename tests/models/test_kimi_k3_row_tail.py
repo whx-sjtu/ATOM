@@ -13,19 +13,23 @@ from aiter_stub import atom_without_aiter
 from torch import nn
 
 kimi = module_dispatch_ops = kimi_k3_ops = sequence_parallel = ubatching = None
+attention_residual = None
 
 
 @pytest.fixture(scope="module", autouse=True)
 def imported_modules():
     global kimi, module_dispatch_ops, kimi_k3_ops, sequence_parallel, ubatching
+    global attention_residual
     with atom_without_aiter() as load:
         kimi = load("atom.models.kimi_k3.model")
         module_dispatch_ops = load("atom.model_ops.module_dispatch_ops")
         kimi_k3_ops = load("atom.model_ops.kimi_k3")
         sequence_parallel = load("atom.distributed.sequence_parallel")
         ubatching = load("atom.utils.tbo.ubatching")
+        attention_residual = load("atom.model_ops.kimi_k3.attention_residual")
         yield
     kimi = module_dispatch_ops = kimi_k3_ops = sequence_parallel = ubatching = None
+    attention_residual = None
 
 
 WORLD, HIDDEN, LATENT, EXPERTS = 8, 16, 8, 4
@@ -581,6 +585,48 @@ def test_latent_row_shard_off_or_unmerged_keeps_the_row_tail_bit_for_bit(
     for (want, want_log), (out, log) in zip(base, logged(forward)):
         assert log == want_log
         assert all(torch.equal(a, b) for a, b in zip(out, want))
+
+
+@pytest.mark.parametrize("latent", ["0", "1"], ids=["latent-off", "latent-on"])
+@pytest.mark.parametrize("skip", ["0", "1"], ids=["zero-row-off", "zero-row-on"])
+def test_row_tail_returns_the_registered_zero_pair(logged, monkeypatch, latent, skip):
+    """The next residual mix reads a zero row only for the registered pair
+    itself, so the row tail must return that pair whichever way the MoE
+    front runs."""
+    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "4")
+    monkeypatch.setenv("ATOM_KIMI_K3_ATTN_RES_SKIP_ZERO_ADDENDS", skip)
+    layers = _layers(BLOCK)
+    _merge_front(monkeypatch, [layer.block_sparse_moe for layer in layers])
+    monkeypatch.setenv("ATOM_KIMI_K3_MOE_LATENT_ROW_SHARD", latent)
+    assert kimi.zero_addends is attention_residual.zero_addends
+    lock, local = threading.Lock(), threading.local()
+
+    def zero_addends(like):
+        # Ranks are threads here and share the one registration.
+        with lock:
+            local.pair = attention_residual.zero_addends(like)
+            local.held = list(attention_residual._ZERO_ADDENDS)
+        return local.pair
+
+    monkeypatch.setattr(kimi, "zero_addends", zero_addends)
+    inputs = _inputs(13)
+
+    def forward(rank):
+        out = layers[rank](None, *(x.clone() for x in inputs))
+        return out, local.pair, local.held
+
+    try:
+        for (out, pair, held), log in logged(forward):
+            assert ("all_gather", 2) in log
+            assert (("front_rows", 2) in log) == (latent == "1")
+            assert out[1] is pair[0] and out[2] is pair[1]
+            assert not out[1].any() and not out[2].any()
+            if skip == "1":
+                assert len(held) == 2 and held[0] is pair[0] and held[1] is pair[1]
+            else:
+                assert not held
+    finally:
+        attention_residual._ZERO_ADDENDS.clear()
 
 
 @pytest.mark.parametrize("tokens", [8, 13, 1027])
