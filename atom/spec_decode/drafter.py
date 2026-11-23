@@ -19,7 +19,7 @@ from atom.distributed.pcp_utils import (
 from atom.model_loader.loader import load_model
 from atom.models.utils import PPMissingLayer
 from atom.spec_decode.draft_graph import DraftGraph
-from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
+from atom.utils import CpuGpuBuffer, envs, resolve_obj_by_qualname
 from atom.utils.forward_context import (
     DPMetadata,
     SpecDecodeMetadata,
@@ -351,13 +351,21 @@ class Drafter(abc.ABC):
             "publication_group": "spec_decode",
             "pin_memory": torch.device(device).type != "cpu",
         }
-        return {
+        buffers = {
             "cu_num_draft_tokens": CpuGpuBuffer(max_bs, dtype=torch.int32, **kwargs),
             "target_logits_indices": CpuGpuBuffer(
                 max_bs * mtp_k, dtype=torch.int64, **kwargs
             ),
             "bonus_logits_indices": CpuGpuBuffer(max_bs, dtype=torch.int64, **kwargs),
         }
+        if envs.ATOM_SPEC_VERIFY_HOST_ROWS:
+            buffers["verify_request_indices"] = CpuGpuBuffer(
+                max_bs * mtp_k, dtype=torch.int64, **kwargs
+            )
+            buffers["verify_temperatures"] = CpuGpuBuffer(
+                max_bs * mtp_k, dtype=torch.float32, **kwargs
+            )
+        return buffers
 
     def _arm_lossless_draft(self) -> "DSparkLossless | None":
         """Arm lossless speculative sampling, or return None and keep the
@@ -922,13 +930,21 @@ class Drafter(abc.ABC):
         var["target_logits_indices"].np[:sum_drafted_tokens] = target_logits_indices
         var["cu_num_draft_tokens"].np[:scheduled_bs] = cu_num_draft_tokens
         var["bonus_logits_indices"].np[:scheduled_bs] = bonus_logits_indices
-        publication_group.set_counts(
-            {
-                "target_logits_indices": sum_drafted_tokens,
-                "cu_num_draft_tokens": scheduled_bs,
-                "bonus_logits_indices": scheduled_bs,
-            }
-        )
+        counts = {
+            "target_logits_indices": sum_drafted_tokens,
+            "cu_num_draft_tokens": scheduled_bs,
+            "bonus_logits_indices": scheduled_bs,
+        }
+        if "verify_request_indices" in var:
+            # The searchsorted of `cu_num_draft_tokens` the verification draw
+            # runs, and the temperatures `prepare_sample` staged at those rows.
+            rows = np.repeat(np.arange(scheduled_bs), num_draft_tokens)
+            temperatures = var["temperatures"].np
+            var["verify_request_indices"].np[:sum_drafted_tokens] = rows
+            var["verify_temperatures"].np[:sum_drafted_tokens] = temperatures[rows]
+            counts["verify_request_indices"] = sum_drafted_tokens
+            counts["verify_temperatures"] = sum_drafted_tokens
+        publication_group.set_counts(counts)
         return num_draft_tokens, sum_drafted_tokens
 
     def calc_spec_decode_metadata(
@@ -957,4 +973,11 @@ class Drafter(abc.ABC):
             ],
             bonus_logits_indices_np=var["bonus_logits_indices"].np[:scheduled_bs],
         )
+        if "verify_request_indices" in var:
+            metadata.verify_request_indices = var["verify_request_indices"].gpu[
+                :sum_drafted_tokens
+            ]
+            metadata.verify_temperatures = var["verify_temperatures"].gpu[
+                :sum_drafted_tokens
+            ]
         return metadata

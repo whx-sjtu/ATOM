@@ -915,6 +915,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MLA_BF16_ABSORB_BMM_CONFIG": lambda: _flag_env(
         "ATOM_MLA_BF16_ABSORB_BMM_CONFIG"
     ),
+    # MTP verify: the host builds each verification row's request index and
+    # temperature with the step's other spec-decode indices, so the sampler's
+    # verification draw skips its arange / searchsorted / gather launches. Same
+    # rows, same values. Read at drafter construction.
+    "ATOM_SPEC_VERIFY_HOST_ROWS": lambda: _flag_env("ATOM_SPEC_VERIFY_HOST_ROWS"),
     # Lossless speculative sampling: the DSpark draft samples its block from q
     # and the verify accepts by the probability ratio (u * q < p). Off by
     # default; needs an aiter with ROCm/aiter#6954 under TP; where it arms,

@@ -349,6 +349,7 @@ that ever changes, so a fusion left inert by an unrecognised layout says so.
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_ENABLE_RELAXED_MTP** | bool | 0 (false) | Accept a draft token when it lands in the target's top 10 within 0.6 of the top logit, instead of requiring the argmax. Intended for quantized MTP heads, whose drafts are right about the region and wrong about the exact winner often enough that strict acceptance throws away usable tokens. Read once at `rejection_sampler` import, so it must be set before the server starts. |
+| **ATOM_SPEC_VERIFY_HOST_ROWS** | bool | 0 (false) | MTP verify of a sampled batch: the host builds each verification row's request index and temperature with the step's other spec-decode indices, and the verification draw takes them instead of running `arange`, `searchsorted` and a temperatures gather on the device. Same rows and values, so the same draw. Read at drafter construction. |
 
 ## Structured output
 

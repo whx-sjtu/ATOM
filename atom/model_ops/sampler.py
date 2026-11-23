@@ -106,21 +106,32 @@ class Sampler(nn.Module):
         temperatures: torch.Tensor,
         top_ks: int | torch.Tensor | None,
         top_ps: float | torch.Tensor | None,
+        *,
+        request_indices: torch.Tensor | None = None,
+        row_temperatures: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Sample each draft-conditioned target row with independent noise.
 
         Accepting a draft when it matches this draw and stopping at the first
         mismatch preserves the target distribution. Sharing noise across rows
         would condition later draws on earlier acceptance decisions.
+
+        ``request_indices`` / ``row_temperatures``, when given, are each row's
+        request and its temperature, already built on the host.
         """
         rows = logits.shape[0]
         if rows == 0:
             return torch.empty(0, device=logits.device, dtype=torch.int32)
-        request_indices = torch.searchsorted(
-            cu_num_draft_tokens,
-            torch.arange(rows, device=logits.device, dtype=cu_num_draft_tokens.dtype),
-            right=True,
-        )
+        if request_indices is None:
+            request_indices = torch.searchsorted(
+                cu_num_draft_tokens,
+                torch.arange(
+                    rows, device=logits.device, dtype=cu_num_draft_tokens.dtype
+                ),
+                right=True,
+            )
+        if row_temperatures is None:
+            row_temperatures = temperatures[request_indices]
 
         def expand(values):
             if not isinstance(values, torch.Tensor) or values.numel() == 1:
@@ -129,7 +140,7 @@ class Sampler(nn.Module):
 
         return self(
             logits,
-            temperatures[request_indices],
+            row_temperatures,
             expand(top_ks),
             expand(top_ps),
             all_greedy=False,

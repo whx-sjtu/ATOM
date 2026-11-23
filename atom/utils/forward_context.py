@@ -117,6 +117,10 @@ class SpecDecodeMetadata:
     # authority for deferred tokens; their CPU staging mirror can be stale.
     target_logits_indices_np: np.ndarray | None = None
     bonus_logits_indices_np: np.ndarray | None = None
+    # Host-built verification rows (ATOM_SPEC_VERIFY_HOST_ROWS): each target
+    # row's request and that request's temperature.
+    verify_request_indices: torch.Tensor | None = None
+    verify_temperatures: torch.Tensor | None = None
 
 
 _uncaptured_decode_shape_warned = False

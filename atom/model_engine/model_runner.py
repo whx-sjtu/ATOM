@@ -3535,6 +3535,12 @@ class ModelRunner:
                     temperatures,
                     top_ks,
                     top_ps,
+                    request_indices=getattr(
+                        spec_decode_metadata, "verify_request_indices", None
+                    ),
+                    row_temperatures=getattr(
+                        spec_decode_metadata, "verify_temperatures", None
+                    ),
                 )
                 if target_token_ids.numel() and get_tp_group().world_size > 1:
                     target_token_ids = get_tp_group().broadcast(target_token_ids, src=0)
