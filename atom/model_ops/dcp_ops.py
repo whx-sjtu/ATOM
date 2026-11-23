@@ -1870,6 +1870,93 @@ def _scan_dcp_metadata_counts_kernel(Indptr, rows, BLOCK: tl.constexpr):
     tl.store(Indptr, 0)
 
 
+# Whole-row variants of the two filter passes. The tiled kernels above walk a
+# 2048-wide row as 16 dependent 128-wide loads, so a 16K-token prefill spends
+# most of each program waiting on load latency (339 us for the count pass,
+# 176 us for the compaction). These load the row as one tile and do the same
+# arithmetic, so their output is bit-identical.
+@triton.jit
+def _count_owned_dcp_prefill_row_kernel(
+    batch_id_per_q_token,  # int32 [num_tokens]
+    topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS]
+    out_counts,  # int32 [num_tokens]
+    out_metadata_counts,  # int32 [num_tokens], max(out_counts, 1)
+    DCP_RANK: tl.constexpr,
+    DCP_WORLD: tl.constexpr,
+    INTERLEAVE: tl.constexpr,
+    NUM_TOPK_TOKENS: tl.constexpr,
+    ROW_BLOCK: tl.constexpr,  # next power of two >= NUM_TOPK_TOKENS
+    ti_stride0: tl.int64,
+    ti_stride1: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    req_id = tl.load(batch_id_per_q_token + token_id)
+    valid_req = req_id >= 0
+    col_id = tl.arange(0, ROW_BLOCK)
+    col_valid = col_id < NUM_TOPK_TOKENS
+    indice = tl.load(
+        topk_indices + token_id * ti_stride0 + col_id * ti_stride1,
+        mask=col_valid,
+        other=-1,
+    )
+    owned = col_valid & valid_req & _dcp_owns(indice, DCP_RANK, DCP_WORLD, INTERLEAVE)
+    count = tl.sum(owned.to(tl.int32))
+    tl.store(out_counts + token_id, count)
+    tl.store(out_metadata_counts + token_id, tl.maximum(count, 1))
+
+
+@triton.jit
+def _compact_filter_dcp_prefill_row_kernel(
+    out_kv_indptr,  # int32 [num_tokens + 1] -- COMPACTED offsets
+    batch_id_per_q_token,  # int32 [num_tokens]
+    topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS]
+    block_table,  # int32 [num_req, max_num_blocks_per_req]
+    out_kv_indices,  # int32 [>= out_kv_indptr[-1]]
+    DCP_RANK: tl.constexpr,
+    DCP_WORLD: tl.constexpr,
+    INTERLEAVE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    NUM_TOPK_TOKENS: tl.constexpr,
+    ROW_BLOCK: tl.constexpr,
+    ti_stride0: tl.int64,
+    ti_stride1: tl.constexpr,
+    bt_stride0: tl.int64,
+    bt_stride1: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    req_id = tl.load(batch_id_per_q_token + token_id)
+    valid_req = req_id >= 0
+    out_kv_start = tl.load(out_kv_indptr + token_id)
+    col_id = tl.arange(0, ROW_BLOCK)
+    col_valid = col_id < NUM_TOPK_TOKENS
+    indice = tl.load(
+        topk_indices + token_id * ti_stride0 + col_id * ti_stride1,
+        mask=col_valid,
+        other=-1,
+    )
+    idx_valid, slot = _owned_dcp_slots(
+        indice,
+        col_valid & valid_req,
+        block_table + req_id * bt_stride0,
+        bt_stride1,
+        DCP_RANK,
+        DCP_WORLD,
+        INTERLEAVE,
+        PAGE_SIZE,
+    )
+    owned_i32 = idx_valid.to(tl.int32)
+    dst = tl.cumsum(owned_i32, axis=0) - owned_i32
+    tl.store(out_kv_indices + out_kv_start + dst, slot, mask=idx_valid)
+    written = tl.sum(owned_i32)
+    # Same dummy slot for an empty row as `_compact_filter_dcp_prefill_kernel`.
+    tl.store(out_kv_indices + out_kv_start, 0, mask=written == 0)
+
+
+# One block covers a whole --max-num-batched-tokens 16384 step; past it the
+# scan carries across blocks. A fixed width keeps it to one compiled variant.
+_DCP_SCAN_BLOCK = 16384
+
+
 def triton_filter_and_convert_dcp_index_prefill(
     dsa_kv_indptr: torch.Tensor,  # int32 [num_tokens + 1] GLOBAL counts
     batch_id_per_q_token: torch.Tensor,  # int32 [num_tokens]
@@ -1884,6 +1971,7 @@ def triton_filter_and_convert_dcp_index_prefill(
     BLOCK_N: int = 128,
     out: torch.Tensor | None = None,
     cp_kv_cache_interleave_size: int = 1,
+    whole_row: bool | None = None,
 ):
     """Filter a sparse-PREFILL top-k down to this rank's owned KV slots.
 
@@ -1893,6 +1981,8 @@ def triton_filter_and_convert_dcp_index_prefill(
     in-place int32 cumsum, order-preserving compaction, and the same
     layer-scoped buffers are reused (they are sized ``max_num_batched_tokens``,
     which bounds the prefill token count too).
+
+    ``whole_row`` picks the whole-row kernels (None: ``ATOM_DCP_PREFILL_FILTER_WHOLE_ROW``).
     """
     assert topk_indices.dtype == torch.int32
     assert topk_indices.shape[1] == NUM_TOPK_TOKENS
@@ -1915,6 +2005,45 @@ def triton_filter_and_convert_dcp_index_prefill(
 
     counts = owned_counts[:num_tokens]
     metadata_counts = out_kv_indptr[1 : num_tokens + 1]
+    if whole_row is None:
+        whole_row = envs.ATOM_DCP_PREFILL_FILTER_WHOLE_ROW
+    if whole_row:
+        row_block = triton.next_power_of_2(NUM_TOPK_TOKENS)
+        _count_owned_dcp_prefill_row_kernel[grid](
+            batch_id_per_q_token_c,
+            topk_indices_c,
+            counts,
+            metadata_counts,
+            dcp_rank,
+            dcp_world_size,
+            cp_kv_cache_interleave_size,
+            NUM_TOPK_TOKENS,
+            row_block,
+            ti_stride0,
+            ti_stride1,
+        )
+        _scan_dcp_metadata_counts_kernel[(1,)](
+            out_kv_indptr, num_tokens, BLOCK=_DCP_SCAN_BLOCK, num_warps=16
+        )
+        _compact_filter_dcp_prefill_row_kernel[grid](
+            out_kv_indptr,
+            batch_id_per_q_token_c,
+            topk_indices_c,
+            block_table_c,
+            out,
+            dcp_rank,
+            dcp_world_size,
+            cp_kv_cache_interleave_size,
+            block_size,
+            NUM_TOPK_TOKENS,
+            row_block,
+            ti_stride0,
+            ti_stride1,
+            bt_stride0,
+            bt_stride1,
+        )
+        return out
+
     _count_owned_dcp_prefill_kernel[grid](
         dsa_kv_indptr_c,
         batch_id_per_q_token_c,

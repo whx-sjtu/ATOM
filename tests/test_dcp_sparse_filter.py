@@ -123,7 +123,7 @@ def _build_prefill_case(seq_lens):
     }
 
 
-def _run_prefill(case, interleave=1):
+def _run_prefill(case, interleave=1, whole_row=False):
     n = case["num_tokens"]
     g = {
         k: torch.from_numpy(v).to(DEV)
@@ -151,6 +151,7 @@ def _run_prefill(case, interleave=1):
             NUM_TOPK_TOKENS=PRE_TOPK,
             out=out_buf,
             cp_kv_cache_interleave_size=interleave,
+            whole_row=whole_row,
         )
         torch.cuda.synchronize()
         per_rank.append(
@@ -163,16 +164,17 @@ def _run_prefill(case, interleave=1):
     return per_rank
 
 
+@pytest.mark.parametrize("whole_row", [False, True], ids=["tiled", "whole-row"])
 @pytest.mark.parametrize("world", [8, 4, 2])  # production ships dcp8; 4/2 untested
 @pytest.mark.parametrize("interleave", [1, 4])  # 4 divides PRE_PAGE=16
 @pytest.mark.parametrize(
     "seq_lens", [[400], [300, 240], [17, 5, 1]], ids=["single", "two-seq", "tiny"]
 )
-def test_prefill_filter(seq_lens, interleave, world):
+def test_prefill_filter(seq_lens, interleave, world, whole_row):
     global PRE_W
     PRE_W = world
     case = _build_prefill_case(np.asarray(seq_lens, dtype=np.int32))
-    per_rank = _run_prefill(case, interleave)
+    per_rank = _run_prefill(case, interleave, whole_row)
 
     bid = case["batch_id_per_q_token"]
     bt = case["block_table"]
@@ -245,3 +247,66 @@ def test_prefill_filter(seq_lens, interleave, world):
     # the zero-owned path must have been exercised -- guard against the empty-row
     # assertions passing vacuously.
     assert n_empty > 0, "expected some rank to own nothing for the early tokens"
+
+
+def _filter_outputs(topk, bid, block_table, rank, world, page, interleave, whole_row):
+    n, num_topk = topk.shape
+    out = torch.full((n * num_topk,), -7, dtype=torch.int32, device=DEV)
+    indptr = torch.full((n + 1,), -7, dtype=torch.int32, device=DEV)
+    counts = torch.full((n,), -7, dtype=torch.int32, device=DEV)
+    triton_filter_and_convert_dcp_index_prefill(
+        torch.zeros(n + 1, dtype=torch.int32, device=DEV),  # unread by both variants
+        bid,
+        topk,
+        block_table,
+        rank,
+        world,
+        page,
+        out_kv_indptr=indptr,
+        owned_counts=counts,
+        NUM_TOPK_TOKENS=num_topk,
+        out=out,
+        cp_kv_cache_interleave_size=interleave,
+        whole_row=whole_row,
+    )
+    torch.cuda.synchronize()
+    total = int(indptr[-1])
+    return indptr, counts, out[:total], out[total:]
+
+
+@pytest.mark.parametrize(
+    "num_tokens, num_topk, interleave",
+    [(4096, 2048, 1), (3000, 384, 4), (17000, 2048, 1)],
+    ids=["prod-topk", "non-pow2-topk", "past-one-scan-block"],
+)
+def test_whole_row_filter_matches_tiled(num_tokens, num_topk, interleave):
+    """The whole-row kernels are a re-tiling of the tiled ones, so every output
+    -- offsets, counts, slots, and the untouched tail -- must be bit-identical,
+    at production top-k, with -1 tails, CUDAGraph pad tokens (req_id -1), and a
+    token count past the scan's single block."""
+    world, page = 8, 64
+    rng = np.random.default_rng(1)
+    seq_lens = np.array([num_tokens // 3, num_tokens - num_tokens // 3 - 5])
+    bid = np.concatenate(
+        [np.repeat(np.arange(2, dtype=np.int32), seq_lens), np.full(5, -1, np.int32)]
+    )
+    ctx = 131072
+    topk = rng.integers(0, ctx, size=(num_tokens, num_topk), dtype=np.int32)
+    # Short causal windows: a -1 tail of random length on a third of the rows.
+    short = rng.random(num_tokens) < 0.33
+    tail = rng.integers(0, num_topk, size=num_tokens)
+    cols = np.arange(num_topk)[None, :]
+    topk[short[:, None] & (cols >= tail[:, None])] = -1
+    max_blocks = ctx // (page * world) + 1
+    block_table = rng.permutation(2 * max_blocks).reshape(2, max_blocks)
+
+    g_topk = torch.from_numpy(topk).to(DEV)
+    g_bid = torch.from_numpy(bid).to(DEV)
+    g_bt = torch.from_numpy(block_table.astype(np.int32)).to(DEV)
+    for rank in (0, 3, 7):
+        args = (g_topk, g_bid, g_bt, rank, world, page, interleave)
+        tiled = _filter_outputs(*args, whole_row=False)
+        whole = _filter_outputs(*args, whole_row=True)
+        for name, a, b in zip(("indptr", "counts", "slots", "tail"), tiled, whole):
+            assert torch.equal(a, b), f"rank {rank}: {name} differs"
+        assert int(tiled[1][-5:].abs().sum()) == 0, "pad tokens must own nothing"

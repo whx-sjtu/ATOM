@@ -607,6 +607,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # logits): "auto" is aiter's width/rows dispatch; "split" and "oneblock"
     # force its FlyDSL multi-CTA or one-block kernel.
     "ATOM_DCP_LOCAL_TOPK": lambda: os.getenv("ATOM_DCP_LOCAL_TOPK", "auto"),
+    # DCP sparse prefill owned-slot filter: each program reads its token's
+    # whole top-k row in one tile, and the offset scan runs in one wide block.
+    # Bit-identical output. Off by default.
+    "ATOM_DCP_PREFILL_FILTER_WHOLE_ROW": lambda: (
+        os.getenv("ATOM_DCP_PREFILL_FILTER_WHOLE_ROW", "0") == "1"
+    ),
     # GLM-5.2 (glm_moe_dsa): enable the fused indexer qk-rope + fp8-quant + kv-cache
     # kernel (indexer_qk_rope_quant_and_cache), same path DeepSeek-V3.2 uses. GLM's
     # indexer dims (index_head_dim=128, qk_rope_head_dim=64, per_1x128, neox rope) are
