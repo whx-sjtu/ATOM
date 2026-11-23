@@ -1200,7 +1200,36 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         groups = get_mla_decode_fwd_max_splits(heads, 1, self.dtype_q, self.dtype_kv)
         if not 0 < rows <= min(256, groups) or work_indptr.numel() < groups + 1:
             return None
-        return (rows, heads, self.dtype_q, self.dtype_kv)
+        return (rows, heads, self.dtype_q, self.dtype_kv, 1)
+
+    def _sparse_dcp_decode_template(self, rows: int, heads: int, work_indptr):
+        """`_sparse_dcp_decode_plan`, over 16-head rows (heads // 16 a query
+        row) when `ATOM_DMLA_MLA_HEAD_SPLIT` is set and they still fit.
+
+        A decode row's latency is one workgroup's, whatever the batch, so a
+        small batch spreads over heads // 16 times as many CUs. aiter's 16-head
+        persistent kernel returns a valid LSE; its 32-head one does not.
+        """
+        groups = heads // 16
+        if (
+            envs.ATOM_DMLA_MLA_HEAD_SPLIT
+            and groups > 1
+            and heads % 16 == 0
+            and rows * groups
+            < self.model_runner.forward_vars["sparse_cu_seqlens_q"].gpu.numel()
+        ):
+            plan = self._sparse_dcp_decode_plan(rows * groups, 16, work_indptr)
+            if plan is not None:
+                if not getattr(type(self), "_head_split_logged", False):
+                    type(self)._head_split_logged = True
+                    logger.info(
+                        "ATOM_DMLA_MLA_HEAD_SPLIT is on: %d decode rows planned "
+                        "as %d rows of 16 heads.",
+                        rows,
+                        rows * groups,
+                    )
+                return (*plan[:4], groups)
+        return self._sparse_dcp_decode_plan(rows, heads, work_indptr)
 
     def _set_mla_persistent_worker_buffers_sparse_mtp(
         self,
@@ -1221,9 +1250,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             if self.sparse_dcp_metadata_rebuild
             else self.padded_num_attention_heads
         )
-        plan = self._sparse_dcp_decode_plan(
+        plan = self._sparse_dcp_decode_template(
             num_tokens, heads, var["sparse_mtp_work_indptr"]
         )
+        rows, heads = (num_tokens, heads) if plan is None else plan[:2]
         split_params = {
             "kv_granularity": (
                 triton.next_power_of_2(self.index_topk_out)
@@ -1242,12 +1272,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         reduce_final_map = var["sparse_mtp_reduce_final_map"]
         reduce_partial_map = var["sparse_mtp_reduce_partial_map"]
         get_mla_metadata_v1(
-            var["sparse_cu_seqlens_q"].gpu[: num_tokens + 1],
+            var["sparse_cu_seqlens_q"].gpu[: rows + 1],
             # Unit placeholders give even empty rows their own workgroup.
-            var["sparse_cu_seqlens_q" if plan else "sparse_kv_indptr"].gpu[
-                : num_tokens + 1
-            ],
-            var["sparse_kv_last_page_lens"].gpu[:num_tokens],
+            var["sparse_cu_seqlens_q" if plan else "sparse_kv_indptr"].gpu[: rows + 1],
+            var["sparse_kv_last_page_lens"].gpu[:rows],
             heads,
             1,  # nhead_kv
             True,
@@ -1330,15 +1358,23 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # index_topk (dense >> sparse) -> illegal KV-cache access.
         use_sparse_meta = self.is_sparse and (max_q_len == 1 or sparse_decode)
         plan = (
-            self._sparse_dcp_decode_plan(bs, self.persistent_num_heads, work_indptr)
+            self._sparse_dcp_decode_template(
+                bs, self.persistent_num_heads, var[f"{prefix}work_indptr"]
+            )
             if use_sparse_meta and max_q_len == 1 and not only_update
             else None
         )
+        heads = self.persistent_num_heads
         if plan is not None:
             split_params.update(
                 kv_granularity=triton.next_power_of_2(self.index_topk_out),
                 max_split_per_batch=1,
             )
+            if plan[1] != heads:
+                heads = plan[1]
+                work_indptr = self._active_work_indptr(
+                    var[f"{prefix}work_indptr"], heads, max_q_len
+                )
         kv_indptr_for_metadata = (
             var[f"{prefix}sparse_kv_indptr"].gpu[: bs + 1]
             if use_sparse_meta
@@ -1360,8 +1396,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
         cu_seqlens_q = var[f"{prefix}cu_seqlens_q"].gpu[: bs + 1]
         if plan is not None:
-            cu_seqlens_q = var["sparse_cu_seqlens_q"].gpu[: bs + 1]
+            cu_seqlens_q = var["sparse_cu_seqlens_q"].gpu[: plan[0] + 1]
             kv_indptr_for_metadata = cu_seqlens_q
+            kv_last_page_lens_for_metadata = var["sparse_kv_last_page_lens"].gpu[
+                : plan[0]
+            ]
         if only_update:
             decode_update_mla_metadata_v1(
                 cu_seqlens_q,
@@ -1388,7 +1427,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 cu_seqlens_q,
                 kv_indptr_for_metadata,
                 kv_last_page_lens_for_metadata,
-                self.persistent_num_heads,
+                heads,
                 1,  # nhead_kv,
                 True,
                 work_meta_data,

@@ -723,9 +723,12 @@ class AttentionMetaData:
     reduce_indptr: torch.Tensor | None = None
     reduce_final_map: torch.Tensor | None = None
     reduce_partial_map: torch.Tensor | None = None
-    # Builder geometry for a native whole-row sparse DCP decode template.
-    sparse_dcp_decode_plan: tuple[int, int, torch.dtype, torch.dtype] | None = None
-    sparse_mtp_dcp_decode_plan: tuple[int, int, torch.dtype, torch.dtype] | None = None
+    # Builder geometry for a native whole-row sparse DCP decode template: its
+    # rows, their heads, the q/kv dtypes and the rows a query row spans.
+    sparse_dcp_decode_plan: tuple[int, int, torch.dtype, torch.dtype, int] | None = None
+    sparse_mtp_dcp_decode_plan: (
+        tuple[int, int, torch.dtype, torch.dtype, int] | None
+    ) = None
 
     # The model's decode round's share of this step (`RoundService`): set once
     # by the attention builder; the builder, its cache, Engram staging, the
@@ -785,9 +788,11 @@ class AttentionMetaData:
         total_kv: int | None = None,
         num_cached_tokens: torch.Tensor | None = None,
         seq_starts: torch.Tensor | None = None,
-        sparse_dcp_decode_plan: tuple[int, int, torch.dtype, torch.dtype] | None = None,
+        sparse_dcp_decode_plan: (
+            tuple[int, int, torch.dtype, torch.dtype, int] | None
+        ) = None,
         sparse_mtp_dcp_decode_plan: (
-            tuple[int, int, torch.dtype, torch.dtype] | None
+            tuple[int, int, torch.dtype, torch.dtype, int] | None
         ) = None,
     ):
         self.has_cached = has_cached

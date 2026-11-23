@@ -592,6 +592,40 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the whole gathered q back to token-major; this removes both. Costs a
     # group-wide q GEMM + W_K bmm per prefill token. Off by default.
     "ATOM_DCP_PREFILL_QREP": lambda: os.getenv("ATOM_DCP_PREFILL_QREP", "0") == "1",
+    # QREP decode of a NoPE layer: one kernel absorbs W_K into the FP8 q_out,
+    # stores the rope half and writes the step's K, in place of the W_K bmm and
+    # fused_qk_rope_concat_and_cache_mla. The nope half rounds once instead of
+    # through bf16, moving about 3% of its e4m3 codes one step. Off by default.
+    "ATOM_DMLA_DECODE_QTAIL": lambda: os.getenv("ATOM_DMLA_DECODE_QTAIL", "0") == "1",
+    # Sparse DCP decode: split each query row's heads over 16-head virtual rows
+    # when the template then still has one row a workgroup, so a small decode
+    # occupies heads/16 times as many CUs. Changes the kernel, hence the
+    # accumulation order. Off by default.
+    "ATOM_DMLA_MLA_HEAD_SPLIT": lambda: (
+        os.getenv("ATOM_DMLA_MLA_HEAD_SPLIT", "0") == "1"
+    ),
+    # Sparse DCP decode on the one-row-a-workgroup template: skip aiter's split
+    # reduce. Every work item of that template holds a whole row and writes o
+    # and the LSE itself, so the reduce has no partials and only costs a launch;
+    # outputs are bit-identical. Rebuilt plans keep it. Off by default.
+    "ATOM_DMLA_MLA_NO_REDUCE": lambda: (
+        os.getenv("ATOM_DMLA_MLA_NO_REDUCE", "0") == "1"
+    ),
+    # BF16 V up-projection (W_V absorb bmm) over at most 128 rows: a 32x64x128
+    # tile instead of aiter's 128x128x32 fallback. K stays one slice walked in
+    # order; outputs measured bit-identical. Off by default.
+    "ATOM_DMLA_WV_BMM_TILE": lambda: (os.getenv("ATOM_DMLA_WV_BMM_TILE", "0") == "1"),
+    # Unquantized BF16 attn_res in decode steps: take a layer's B+1 candidates
+    # in one tile (BL = next_pow2(B+1), at most 16) instead of two at a time.
+    # Prefill and a column-gathered mix (the MoE column tail, whose bank tiles
+    # overlap the peers' columns) keep the two-candidate tile. BL follows the
+    # layer, the step kind and the gather, not the batch, so outputs stay batch
+    # invariant, but the decode candidate reduction order changes and BF16
+    # outputs can move by one ulp.
+    # Off by default.
+    "ATOM_DMLA_ATTN_RES_TILE": lambda: (
+        os.getenv("ATOM_DMLA_ATTN_RES_TILE", "0") == "1"
+    ),
     # DCP sparse prefill: use the non-persistent fp8 gqa64 MLA kernel, which
     # needs no work metadata. On by default; needs an aiter with ROCm/aiter#6132.
     "ATOM_DCP_SPARSE_PREFILL_NONPS": lambda: (

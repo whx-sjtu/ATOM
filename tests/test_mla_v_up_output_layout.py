@@ -39,7 +39,7 @@ def projection():
     assert {node.name for node in methods} == names
     for method in methods:
         method.decorator_list = []
-    namespace = {"torch": torch}
+    namespace = {"torch": torch, "_v_up_bf16_bmm_config": lambda x: ("tile", x)}
     exec(  # noqa: S102 - execute only the checked-in production method bodies
         compile(ast.Module(body=methods, type_ignores=[]), str(path), "exec"),
         namespace,
@@ -69,8 +69,11 @@ def _stub_bmm(namespace, branch, weights, scale):
         output.copy_(result.transpose(0, 1))
         return output
 
-    def bf16(x, weight, *, YQ):
+    def bf16(x, weight, *, YQ, config=None):
         seen["YQ"] = YQ
+        if config is not None:
+            assert config[0] == "tile" and config[1] is x
+            seen["config"] = config
         write_output(x, weight, YQ.transpose(0, 1))
         return YQ
 
@@ -135,6 +138,7 @@ def test_v_up_output_is_contiguous_and_o_proj_receives_a_view(
             assert yq.shape == (heads, tokens, v_dim)
             assert yq.stride() == (v_dim, heads * v_dim, 1)
             assert yq.data_ptr() == output.data_ptr()
+            assert "config" in seen
         return flat
 
     attn.o_proj = o_proj

@@ -2,6 +2,7 @@
 """CPU controls at production initialization and prefill dispatch boundaries."""
 
 import ast
+import logging
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 
@@ -185,19 +186,34 @@ def absorb():
         for n in _tree("atom/model_ops/triton_mla_absorb_qpack.py").body
         if isinstance(n, ast.FunctionDef) and n.name == "mla_absorb_q_pack_supports"
     )
+
+    class NoPE:
+        pass
+
     namespace = {
         "torch": torch,
         "dtypes": SimpleNamespace(fp8=torch.float8_e4m3fn),
         "triton": SimpleNamespace(next_power_of_2=lambda n: 1 << (n - 1).bit_length()),
         "_BLOCK_N": 64,
+        "NoPositionalRotaryEmbedding": NoPE,
+        "mla_decode_qtail_supports": lambda *a: True,
+        "logger": logging.getLogger(__name__),
     }
     _run([support, *nodes], namespace)
-    layer = SimpleNamespace(
+
+    class Layer(SimpleNamespace):
+        pass
+
+    layer = Layer(
         qrep_enabled=True,
         W_K_qrep_scale=None,
         kv_shuffled=False,
         qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
         kv_lora_rank=512,
+        rotary_emb=NoPE(),
+        use_seg_mla=False,
+        _fused_q_head_pad=False,
         pbm_enabled=False,
         _dcp_project_merge_out=lambda: None,
         _dcp_project_merge_out_head_major=lambda: None,
@@ -250,25 +266,16 @@ def test_absorb_fixed_gate_is_cached_and_live_cache_dtype_still_gates(
     assert layer._absorb_into_q_out(cache, dtype) is expected
 
 
-def test_weight_processing_initializes_the_cached_absorb_route(absorb):
+@pytest.mark.parametrize("head_split", [False, True])
+def test_weight_processing_initializes_the_cached_absorb_route(absorb, head_split):
     layer, namespace = absorb
-    layer.num_heads, layer.v_head_dim = 2, 4
-    layer.kv_b_proj = object()
-    layer.dcp_group = SimpleNamespace(all_gather=lambda x, dim: x)
-    weight = torch.zeros(
-        (
-            layer.num_heads * (layer.qk_nope_head_dim + layer.v_head_dim),
-            layer.kv_lora_rank,
-        ),
-        dtype=torch.bfloat16,
-    )
-    namespace.update(
-        get_and_maybe_dequant_weights=lambda _: weight,
-        _mla_absorb_bf16_enabled=lambda: True,
-    )
-    layer.process_weights_after_loading()
+    _load_weights(layer, namespace, ATOM_DMLA_MLA_HEAD_SPLIT=head_split)
     assert getattr(layer, "_absorb_q_pack_enabled", False)
     assert layer.W_K_qrep_scale is None
+    assert hasattr(layer, "_head_group_indptr") is head_split
+    if head_split:
+        assert torch.equal(layer._head_group_indptr, torch.arange(257).int())
+        assert torch.equal(layer._head_group_last_page_lens, torch.ones(256).int())
 
 
 @pytest.mark.parametrize(
@@ -294,6 +301,97 @@ def test_default_and_decode_steps_do_not_call_the_absorb_gate(qrep, prefill, cal
     }
     _run(assignments, ns)
     assert bool(calls) is called and ns["absorb_into_q_out"] is called
+
+
+@pytest.mark.parametrize(
+    "change,expected",
+    [
+        ({}, True),
+        ({"rotary_emb": object()}, False),
+        ({"use_seg_mla": True}, False),
+        ({"_fused_q_head_pad": True}, False),
+        ({"supports": False}, False),
+        ({"W_K_qrep_scale": object()}, False),
+    ],
+)
+def test_decode_qtail_route_is_fixed_at_load_on_top_of_the_absorb_route(
+    absorb, change, expected
+):
+    layer, namespace = absorb
+    change = dict(change)
+    supported = change.pop("supports", True)
+    namespace["mla_decode_qtail_supports"] = lambda *a: supported
+    for name, value in change.items():
+        setattr(layer, name, value)
+    layer._configure_dcp_prefill_routes()
+    assert layer._decode_qtail_enabled is expected
+
+
+def _load_weights(layer, namespace, **switches):
+    layer.num_heads, layer.v_head_dim = 2, 4
+    layer.kv_b_proj = object()
+    layer.dcp_group = SimpleNamespace(all_gather=lambda x, dim: x)
+    layer.is_sparse_mla, layer.dcp_world_size = True, 8
+    weight = torch.zeros(
+        (
+            layer.num_heads * (layer.qk_nope_head_dim + layer.v_head_dim),
+            layer.kv_lora_rank,
+        ),
+        dtype=torch.bfloat16,
+    )
+    namespace.update(
+        get_and_maybe_dequant_weights=lambda _: weight,
+        _mla_absorb_bf16_enabled=lambda: True,
+        envs=SimpleNamespace(
+            **{"ATOM_DMLA_DECODE_QTAIL": False, "ATOM_DMLA_MLA_HEAD_SPLIT": False}
+            | switches
+        ),
+    )
+    layer.process_weights_after_loading()
+
+
+@pytest.mark.parametrize("switch", [False, True])
+def test_decode_qtail_logs_once_when_it_arms(absorb, caplog, switch):
+    layer, namespace = absorb
+    with caplog.at_level(logging.INFO, logger=namespace["logger"].name):
+        _load_weights(layer, namespace, ATOM_DMLA_DECODE_QTAIL=switch)
+        _load_weights(layer, namespace, ATOM_DMLA_DECODE_QTAIL=switch)
+    armed = [r for r in caplog.records if "ATOM_DMLA_DECODE_QTAIL" in r.getMessage()]
+    assert len(armed) == int(switch)
+
+
+@pytest.mark.parametrize(
+    "qrep,prefill,switch,enabled,expected",
+    [
+        (True, False, True, True, True),
+        (True, False, False, True, False),
+        (True, True, True, True, False),
+        (False, False, True, True, False),
+        (True, False, True, False, False),
+    ],
+)
+def test_decode_qtail_runs_only_on_opt_in_qrep_decode(
+    qrep, prefill, switch, enabled, expected
+):
+    assignments = [
+        n
+        for n in ast.walk(_tree("atom/model_ops/attention_mla.py"))
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "decode_qtail" for t in n.targets)
+    ]
+    assert len(assignments) == 1
+    ns = {
+        "self": SimpleNamespace(
+            _decode_qtail_enabled=enabled, _absorb_into_q_out=lambda *a: True
+        ),
+        "use_qrep": qrep,
+        "context": SimpleNamespace(is_prefill=prefill),
+        "envs": SimpleNamespace(ATOM_DMLA_DECODE_QTAIL=switch),
+        "kv_cache": object(),
+        "attn_metadata": SimpleNamespace(dtype_q=torch.float8_e4m3fn),
+    }
+    _run(assignments, ns)
+    assert ns["decode_qtail"] is expected
 
 
 @pytest.mark.parametrize("kind", ["plan", "absorb"])

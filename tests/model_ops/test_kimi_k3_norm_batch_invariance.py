@@ -1,13 +1,19 @@
 """BF16 normalization must not change when a prefix has different batch peers."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 pytest.importorskip("aiter")
 pytest.importorskip("triton")
 
+from atom.model_ops.kimi_k3 import attention_residual
 from atom.model_ops.kimi_k3.activations import rmsnorm_gated
-from atom.model_ops.kimi_k3.attention_residual import _apply_attn_res_impl
+from atom.model_ops.kimi_k3.attention_residual import (
+    _apply_attn_res_impl,
+    _attn_res_bf16_config,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="ROCm GPU required"
@@ -59,9 +65,47 @@ def test_bf16_gated_norm_prefill_batch_invariance(heads):
         assert torch.equal(output, _tile(baseline, rows))
 
 
-@pytest.mark.parametrize("blocks,add_count", [(1, 0), (3, 2)])
+def _step(monkeypatch, *, one_tile, is_prefill=False):
+    monkeypatch.setenv("ATOM_DMLA_ATTN_RES_TILE", "1" if one_tile else "0")
+    context = SimpleNamespace(context=SimpleNamespace(is_prefill=is_prefill))
+    monkeypatch.setattr(attention_residual, "get_forward_context", lambda: context)
+
+
+@pytest.mark.parametrize(
+    "one_tile,is_prefill,tiles",
+    [
+        (False, False, [2] * 5),
+        (True, True, [2] * 5),
+        (True, False, [2, 4, 8, 16, 16]),
+    ],
+)
+def test_bf16_attn_res_tile_follows_the_layer_in_decode(
+    one_tile, is_prefill, tiles, monkeypatch
+):
+    _step(monkeypatch, one_tile=one_tile, is_prefill=is_prefill)
+    configs = [_attn_res_bf16_config(c) for c in (2, 3, 5, 9, 17)]
+    assert all(c[:2] == (8, 2) for c in configs)
+    assert [c[2] for c in configs] == tiles
+
+
+def test_bf16_attn_res_tile_keeps_two_under_a_column_gather(monkeypatch):
+    _step(monkeypatch, one_tile=True)
+    configs = [_attn_res_bf16_config(c, gathered=True) for c in (2, 3, 5, 9, 17)]
+    assert configs == [(8, 2, 2)] * 5
+
+
+def test_bf16_attn_res_tile_needs_a_step(monkeypatch):
+    monkeypatch.setenv("ATOM_DMLA_ATTN_RES_TILE", "1")
+    no_step = SimpleNamespace(context=None)
+    monkeypatch.setattr(attention_residual, "get_forward_context", lambda: no_step)
+    assert _attn_res_bf16_config(9) == (8, 2, 2)
+
+
+@pytest.mark.parametrize("one_tile", [False, True])
+@pytest.mark.parametrize("blocks,add_count", [(1, 0), (3, 2), (8, 2)])
 @torch.inference_mode()
-def test_bf16_attn_res_batch_invariance(blocks, add_count):
+def test_bf16_attn_res_batch_invariance(blocks, add_count, one_tile, monkeypatch):
+    _step(monkeypatch, one_tile=one_tile)
     generator = torch.Generator().manual_seed(20261025 + blocks)
     prefix = torch.randn(8, 7168, generator=generator).bfloat16()
     block = torch.randn(8, blocks, 7168, generator=generator).bfloat16()
@@ -83,7 +127,7 @@ def test_bf16_attn_res_batch_invariance(blocks, add_count):
     )
     score_weight, norm_weight = score_weight.cuda(), norm_weight.cuda()
     baseline = None
-    for rows in (97, 512, 513, 8192):
+    for rows in (8, 20, 97, 512, 513, 8192):
         x = _tile(prefix, rows).cuda()
         residuals = _tile(block, rows).cuda()
         add = [_tile(a, rows).cuda() for a in adds] if add_count else [None, None]
