@@ -99,6 +99,10 @@ class K2Build:
     reduce: bool = field(default=True, metadata={"sym": "r"})
     qlen: int = field(default=1, metadata={"sym": "q"})
     skip_padding: bool = field(default=False, metadata={"sym": "sp"})
+    # a down batch's ug flags loaded under the batch before it (``stage_down``)
+    down_peek: bool = field(default=False, metadata={"sym": "dk"})
+    # ug rounds placed up to the queue's last ones (``run_ug``)
+    ug_place: bool = field(default=False, metadata={"sym": "up"})
     diag: bool = field(default=False, metadata={"sym": "g"})
     timeline: bool = field(default=False, metadata={"sym": "t"})
 
@@ -363,6 +367,8 @@ def build(key: K2Build):
             "S": s,
             "qlen": key.qlen,
             "skip_padding": skip_padding,
+            "down_peek": key.down_peek,
+            "ug_place": key.ug_place,
             "G": G,
             "NS": ns,
             "NB": key.nblocks,
@@ -381,6 +387,8 @@ def build(key: K2Build):
             "put_bf": mb.put_bf,
             "put_words": mb.put_words,
             "poll": mb.poll,
+            "peek": mb.peek,
+            "stale": mb.stale,
             "queue": queue,
             "red": lds.red.ptr,
             "peer": peer,

@@ -627,6 +627,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Keep graph widths; omit padded requests from Kimi K2 expert scheduling.
     "ATOM_MONO_K2_SKIP_PADDING": lambda: os.getenv("ATOM_MONO_K2_SKIP_PADDING", "0")
     == "1",
+    # Kimi K2: load a down batch's ug flags under the batch before it.
+    "ATOM_MONO_K2_DOWN_PEEK": lambda: os.getenv("ATOM_MONO_K2_DOWN_PEEK", "0") == "1",
+    # Kimi K2: place the ug rounds before the queue's last two (no claim atomic).
+    "ATOM_MONO_K2_UG_PLACE": lambda: os.getenv("ATOM_MONO_K2_UG_PLACE", "0") == "1",
     # GLM-5.2 mono: run the "full" indexer layers (18 of 78) through the fused
     # MonoKernel (atom/models/glm52/mono/kernels/{kernel,layout,op}.py, built
     # with with_indexer=True), which does index Q/K/W projection, paged FP8

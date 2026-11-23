@@ -149,13 +149,18 @@ def _lean_width(built: WidthBuild, spilled: list) -> WidthBuild | None:
     )
 
 
-def _agree_skip_padding(group) -> bool:
-    requested = envs.ATOM_MONO_K2_SKIP_PADDING
+def _agree_env(name: str, group) -> bool:
+    """K2 build switch ``name`` (``envs``), the same on every TP rank."""
+    requested = getattr(envs, name)
     enabled = group_agree(requested, group)
     disabled = group_agree(not requested, group)
     if not (enabled or disabled):
-        raise RuntimeError("ATOM_MONO_K2_SKIP_PADDING differs across TP ranks")
+        raise RuntimeError(f"{name} differs across TP ranks")
     return enabled
+
+
+def _agree_skip_padding(group) -> bool:
+    return _agree_env("ATOM_MONO_K2_SKIP_PADDING", group)
 
 
 class K3MonoDecodeRunner:
@@ -164,10 +169,14 @@ class K3MonoDecodeRunner:
 
     max_rows = MAX_ROWS
     skip_padding = False
+    down_peek = False
+    ug_place = False
 
     def __init__(self, model, drafter=None, metadata_builder=None) -> None:
         group = get_tp_group().cpu_group
         self.skip_padding = _agree_skip_padding(group)
+        self.down_peek = _agree_env("ATOM_MONO_K2_DOWN_PEEK", group)
+        self.ug_place = _agree_env("ATOM_MONO_K2_UG_PLACE", group)
         bind_agreed(lambda: self._bind(model, drafter, metadata_builder), group)
         peer_bytes = k2.peer_bytes(self.max_rows)
         if self.ix is not None:
@@ -430,6 +439,8 @@ class K3MonoDecodeRunner:
                 ln_eps=p.moe.ln_eps,
                 qlen=qlen,
                 skip_padding=self.skip_padding,
+                down_peek=self.down_peek,
+                ug_place=self.ug_place,
                 diag=self.debug,
             )
             for p in self.plans
