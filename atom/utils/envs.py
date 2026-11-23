@@ -626,6 +626,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MLA_SPARSE_PREFILL_ROW_PLAN": lambda: (
         os.getenv("ATOM_MLA_SPARSE_PREFILL_ROW_PLAN", "1") == "1"
     ),
+    # Mono DSA indexer: bit-identical kernel options (``IxBuild.dc1``, a mask;
+    # ``atom/mono/dsa_indexer/build.py`` DC1_*). 0 (default) is the kernel as before;
+    # a build the mask does not fit runs with 0.
+    "ATOM_MONO_DSA_INDEXER_OPT": lambda: int(
+        os.getenv("ATOM_MONO_DSA_INDEXER_OPT", "0") or "0", 0
+    ),
     # GLM-5.2 (glm_moe_dsa): enable the fused indexer qk-rope + fp8-quant + kv-cache
     # kernel (indexer_qk_rope_quant_and_cache), same path DeepSeek-V3.2 uses. GLM's
     # indexer dims (index_head_dim=128, qk_rope_head_dim=64, per_1x128, neox rope) are
