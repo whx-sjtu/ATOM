@@ -656,10 +656,16 @@ def upload_numpy(arr: np.ndarray, device, *, non_blocking: bool = True) -> torch
     sits behind whatever is queued, and waiting on it costs what pageable
     costs. Only a block nobody else touches escapes that.
     """
+    src = torch.from_numpy(arr)
     if arr.nbytes <= _PAGEABLE_H2D_LIMIT:
-        return torch.from_numpy(arr).to(device, non_blocking=non_blocking)
+        return src.to(device, non_blocking=non_blocking)
     _warn_oversize_upload(arr.nbytes)
-    return torch.from_numpy(arr).pin_memory().to(device, non_blocking=non_blocking)
+    # Filled by numpy, not `src.pin_memory()`: ATen's CPU copy splits anything
+    # past 32K elements over the whole OpenMP pool, and with every TP rank
+    # entering that region at once the join alone runs to tens of ms.
+    staged = torch.empty_like(src, pin_memory=True)
+    np.copyto(staged.numpy(), arr)
+    return staged.to(device, non_blocking=non_blocking)
 
 
 def pack_rows(dst: np.ndarray, rows: Sequence) -> None:
