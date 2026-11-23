@@ -51,6 +51,7 @@ from atom.model_ops.fla_ops.replayssm import (
 from atom.model_ops.kimi_k3.attention_residual import (
     ColumnTail,
     materialize_column_output,
+    zero_addends,
 )
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
@@ -2645,7 +2646,7 @@ class KimiDecoderLayer(nn.Module):
         residual = moe.row_sharded_moe(
             rows.gather(hidden_rows), rows, prefix_rows, hidden_rows
         )
-        return residual, torch.zeros_like(residual), torch.zeros_like(residual)
+        return residual, *zero_addends(residual)
 
     def forward(
         self,

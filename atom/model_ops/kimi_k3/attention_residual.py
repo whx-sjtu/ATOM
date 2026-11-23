@@ -34,6 +34,7 @@ Four deliberate divergences from that reference:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import torch
@@ -568,6 +569,74 @@ def _pick_attn_res_config(tokens: int):
     return _ATTN_RES_CATCHALL
 
 
+# The last row-tail step's zero addends, until a residual mix consumes them.
+_ZERO_ADDENDS: list[torch.Tensor] = []
+# Read-only [1, H] zeros per (device, dtype, H), handed out as stride-0 views.
+_ZERO_ROWS: dict[tuple, torch.Tensor] = {}
+_ZERO_ADDENDS_LOGGED: set[str] = set()
+_ZERO_ADDENDS_MISSED = (
+    "Kimi-K3 attention residual: a zero addend pair reached no residual mix "
+    "as itself and was loaded"
+)
+
+
+def _log_zero_addends_once(what: str, msg: str):
+    if what not in _ZERO_ADDENDS_LOGGED:
+        _ZERO_ADDENDS_LOGGED.add(what)
+        logging.getLogger("atom").info(msg)
+
+
+def zero_addends(like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Two real zero addends for a step whose residual already holds its sum.
+
+    Under ``ATOM_KIMI_K3_ATTN_RES_SKIP_ZERO_ADDENDS`` the residual mix that is
+    handed these same two tensors reads one shared zero row in their place:
+    the same kernel and values, without their HBM traffic. Any other reader,
+    and any copy a compiler makes of them, still reads the zeros themselves.
+    """
+    from atom.utils import envs
+
+    pair = (torch.zeros_like(like), torch.zeros_like(like))
+    if envs.ATOM_KIMI_K3_ATTN_RES_SKIP_ZERO_ADDENDS:
+        if _ZERO_ADDENDS:
+            _log_zero_addends_once("missed", _ZERO_ADDENDS_MISSED)
+        _ZERO_ADDENDS[:] = pair
+    else:
+        _ZERO_ADDENDS.clear()
+    return pair
+
+
+def _take_zero_addends(first, second) -> bool:
+    """Whether this mix was handed the registered pair; either way the next
+    mix after registration ends the registration."""
+    if not _ZERO_ADDENDS:
+        return False
+    hit = first is _ZERO_ADDENDS[0] and second is _ZERO_ADDENDS[1]
+    _ZERO_ADDENDS.clear()
+    if hit:
+        _log_zero_addends_once(
+            "skipped",
+            "Kimi-K3 attention residual: reading a row-sharded step's zero "
+            "addends as one shared zero row",
+        )
+    else:
+        _log_zero_addends_once("missed", _ZERO_ADDENDS_MISSED)
+    return hit
+
+
+def _zero_row(like: torch.Tensor) -> torch.Tensor:
+    """``like``-shaped zeros as a stride-0 view of one cached row. A row
+    stride of 0 specializes like any multiple of 16, so the kernel that reads
+    it is the one that reads a full zero tensor."""
+    key = (like.device, like.dtype, like.shape[-1])
+    row = _ZERO_ROWS.get(key)
+    if row is None:
+        row = _ZERO_ROWS[key] = torch.zeros(
+            1, like.shape[-1], dtype=like.dtype, device=like.device
+        )
+    return row.expand(like.shape[0], -1)
+
+
 def _apply_attn_res_impl(
     prefix_sum: torch.Tensor,  # [T, H]
     block_residual: torch.Tensor,  # [T, B, H]; by stride, H unit-stride or copied
@@ -612,6 +681,8 @@ def _apply_attn_res_impl(
             raise ValueError("num_blocks must fit the supplied block bank")
         B = num_blocks
     Bp = B + 1
+    # A zero pair (see `zero_addends`) is read as one shared zero row.
+    zero_pair = _take_zero_addends(add_hidden, add_hidden2) and not column_gather
     do_add = add_hidden is not None
     do_add2 = add_hidden2 is not None
     gather = None
@@ -656,8 +727,11 @@ def _apply_attn_res_impl(
     # hs/hs2/pref pointers are always passed (triton needs a tensor); when not
     # adding they alias ps and are never dereferenced (DO_ADD / DO_ADD2 /
     # WRITE_PREF are False).
-    hs = add_hidden.contiguous() if load_add else ps
-    hs2 = add_hidden2.contiguous() if do_add2 else ps
+    if zero_pair:
+        hs = hs2 = _zero_row(ps)
+    else:
+        hs = add_hidden.contiguous() if load_add else ps
+        hs2 = add_hidden2.contiguous() if do_add2 else ps
     pref = torch.empty_like(ps) if do_add else ps
 
     nw, ns, bl = (
