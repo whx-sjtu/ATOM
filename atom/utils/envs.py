@@ -647,6 +647,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MONO_K2_DOWN_PEEK": lambda: os.getenv("ATOM_MONO_K2_DOWN_PEEK", "0") == "1",
     # Kimi K2: place the ug rounds before the queue's last two (no claim atomic).
     "ATOM_MONO_K2_UG_PLACE": lambda: os.getenv("ATOM_MONO_K2_UG_PLACE", "0") == "1",
+    # Kimi K2 hand-offs, the same sums: gather the latent before the route
+    # (widths up to ``layer.LATQ_FIRST_ROWS``).
+    "ATOM_MONO_K2_LATQ_FIRST": lambda: os.getenv("ATOM_MONO_K2_LATQ_FIRST", "0") == "1",
+    # Kimi K2: poll every pass's mailbox pairs in one batch.
+    "ATOM_MONO_K2_BATCH_POLLS": lambda: os.getenv("ATOM_MONO_K2_BATCH_POLLS", "0")
+    == "1",
+    # Kimi K2: router K parts to every rank, added by the route.
+    "ATOM_MONO_K2_ROUTE_PARTS": lambda: os.getenv("ATOM_MONO_K2_ROUTE_PARTS", "0")
+    == "1",
+    # Kimi K2: the latent norm's sums of squares from their owner rank.
+    "ATOM_MONO_K2_LN_SQ": lambda: os.getenv("ATOM_MONO_K2_LN_SQ", "0") == "1",
     # GLM-5.2 mono: run the "full" indexer layers (18 of 78) through the fused
     # MonoKernel (atom/models/glm52/mono/kernels/{kernel,layout,op}.py, built
     # with with_indexer=True), which does index Q/K/W projection, paged FP8

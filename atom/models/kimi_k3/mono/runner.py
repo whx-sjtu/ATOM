@@ -34,6 +34,7 @@ returns it as the single pending and folds any two it was handed into K1's one
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
+from types import MappingProxyType
 
 import torch
 from aiter.dist.parallel_state import (
@@ -114,12 +115,22 @@ class WidthBuild:
         )
 
 
-def ix_peer_offset(max_rows: int) -> int:
+def ix_peer_offset(max_rows: int, extra: tuple = ()) -> int:
     """Where the DSA indexer's regions start in the peer buffer it shares with
-    K2: past every K2 width's (up to ``max_rows``). A rank already in the next
-    layer's K2 (its AR pushes from offset 0) then cannot land on hist pairs a
-    peer's indexer is still polling; at a shared 0 they overlapped from 2 rows."""
-    return -(-k2.peer_bytes(max_rows) // 256) * 256
+    K2: past every K2 width's (up to ``max_rows``; ``extra``: the builds'
+    opt-in regions, ``k2.peer_extra``). A rank already in the next layer's
+    K2 (its AR pushes from offset 0) then cannot land on hist pairs a peer's
+    indexer is still polling; at a shared 0 they overlapped from 2 rows."""
+    return -(-k2.peer_bytes(max_rows, extra) // 256) * 256
+
+
+# K2's hand-off switches (``k2.HANDOFFS``): env -> K2Build field
+K2_HANDOFF_ENVS = {
+    "ATOM_MONO_K2_LATQ_FIRST": "latq_first",
+    "ATOM_MONO_K2_BATCH_POLLS": "batch_polls",
+    "ATOM_MONO_K2_ROUTE_PARTS": "route_parts",
+    "ATOM_MONO_K2_LN_SQ": "ln_sq",
+}
 
 
 def _lean_k1(key: k1.KdaPreBuild) -> k1.KdaPreBuild | None:
@@ -220,6 +231,7 @@ class K3MonoDecodeRunner:
     down_peek = False
     ug_place = False
     k1_w_ahead = False
+    handoffs = MappingProxyType({})  # K2Build field -> on (``K2_HANDOFF_ENVS``)
 
     def __init__(self, model, drafter=None, metadata_builder=None) -> None:
         group = get_tp_group().cpu_group
@@ -227,8 +239,11 @@ class K3MonoDecodeRunner:
         self.down_peek = _agree_env("ATOM_MONO_K2_DOWN_PEEK", group)
         self.ug_place = _agree_env("ATOM_MONO_K2_UG_PLACE", group)
         self.k1_w_ahead = _agree_k1_w_ahead(group)
+        self.handoffs = {
+            name: _agree_env(env, group) for env, name in K2_HANDOFF_ENVS.items()
+        }
         bind_agreed(lambda: self._bind(model, drafter, metadata_builder), group)
-        peer_bytes = k2.peer_bytes(self.max_rows)
+        peer_bytes = k2.peer_bytes(self.max_rows, self.k2_peer_extra)
         if self.ix is not None:
             peer_bytes = max(peer_bytes, self.ix.peer_bytes)
         self.peers, self._finalizer = owned_peer_buffer(
@@ -282,7 +297,7 @@ class K3MonoDecodeRunner:
             self.ix = IndexerRunner(
                 self.inner,
                 metadata_builder,
-                peer_offset=ix_peer_offset(self.max_rows),
+                peer_offset=ix_peer_offset(self.max_rows, self.k2_peer_extra),
                 max_rows=self.max_rows,
             )
         except MonoUnsupported as why:
@@ -477,6 +492,12 @@ class K3MonoDecodeRunner:
                 raise MonoUnsupported(k1.lds_refusal(key))
         return keys
 
+    @property
+    def k2_peer_extra(self) -> tuple:
+        """The opt-in peer regions this runner's K2 builds push into: the peer
+        buffer holds them past every width's default ones."""
+        return k2.peer_extra(k2.K2Build(tokens=1, nblocks=1, **self.handoffs))
+
     def _k2_keys(self, rows: int, qlen: int = 1) -> dict[int, k2.K2Build]:
         return {
             p.layer_id: k2.K2Build(
@@ -491,6 +512,7 @@ class K3MonoDecodeRunner:
                 down_peek=self.down_peek,
                 ug_place=self.ug_place,
                 diag=self.debug,
+                **k2.handoffs_at(rows, self.handoffs),
             )
             for p in self.plans
             if p.moe is not None
