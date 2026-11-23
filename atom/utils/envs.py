@@ -604,11 +604,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DMLA_MLA_HEAD_SPLIT": lambda: (
         os.getenv("ATOM_DMLA_MLA_HEAD_SPLIT", "0") == "1"
     ),
-    # Unquantized BF16 attn_res: take a layer's B+1 candidates in one tile
-    # (BL = next_pow2(B+1), at most 16) instead of two at a time. BL follows the
-    # layer, not the batch, so outputs stay batch invariant, but the candidate
-    # reduction order changes and BF16 outputs can move by one ulp. Off by
-    # default.
+    # Unquantized BF16 attn_res in decode steps: take a layer's B+1 candidates
+    # in one tile (BL = next_pow2(B+1), at most 16) instead of two at a time.
+    # Prefill keeps the two-candidate tile. BL follows the layer and the step
+    # kind, not the batch, so outputs stay batch invariant, but the decode
+    # candidate reduction order changes and BF16 outputs can move by one ulp.
+    # Off by default.
     "ATOM_DMLA_ATTN_RES_TILE": lambda: (
         os.getenv("ATOM_DMLA_ATTN_RES_TILE", "0") == "1"
     ),

@@ -41,6 +41,7 @@ import torch
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace
+from atom.utils.forward_context import get_forward_context
 
 
 def _column_tail_op(
@@ -564,9 +565,13 @@ _ATTN_RES_BF16_MAX_TILE = 16
 
 
 def _attn_res_bf16_config(candidates: int):
+    # Keyed on the step kind, never on T: prefill keeps one layout at every T,
+    # and at prefill T the one-tile layout is slower from B=4 on.
     nw, ns, bl = _ATTN_RES_BF16_CONFIG
     if envs.ATOM_DMLA_ATTN_RES_TILE:
-        bl = min(_ATTN_RES_BF16_MAX_TILE, triton.next_power_of_2(candidates))
+        context = get_forward_context().context
+        if context is not None and not context.is_prefill:
+            bl = min(_ATTN_RES_BF16_MAX_TILE, triton.next_power_of_2(candidates))
     return nw, ns, bl
 
 
