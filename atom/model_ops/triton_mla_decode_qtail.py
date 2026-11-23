@@ -17,6 +17,10 @@ decode step's few rows still spread over heads x L / BLOCK_N programs; the
 programs at column block 0 also store the head's rope slice, and those of head 0
 the rows' K.
 
+Given the step's whole-row MLA work plan, the first row block's programs at the
+last column block also give its work items this layer's key ranges, the
+stores of ``patch_work_kv_ranges``, so the decode needs no patch launch.
+
 Numerics: the bf16 intermediate of the two-kernel path is not formed, so the
 nope half of q_out takes one rounding (fp32 to e4m3) instead of two and moves by
 at most one e4m3 step. The rope half and the cache are bit-identical for the
@@ -28,6 +32,8 @@ import triton
 import triton.language as tl
 
 _BLOCK_N = 128
+# Work items a plan-patching program covers.
+_PLAN_BLOCK = 64
 
 
 def mla_decode_qtail_supports(
@@ -56,6 +62,9 @@ def _mla_decode_qtail_kernel(
     slot_ptr,  # [T] int64, < 0: not this rank's
     q_scale_ptr,
     k_scale_ptr,
+    work_info_ptr,  # [items, 8] int32 aiter MlaWorkInfo, if PLAN_GROUPS
+    work_items_ptr,  # the plan's item count (its work_indptr[-1])
+    kv_indptr_ptr,  # [rows + 1] the layer's key ranges
     num_tokens,
     stride_qn_t,
     stride_qn_h,
@@ -74,10 +83,26 @@ def _mla_decode_qtail_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    PLAN_GROUPS: tl.constexpr,  # 0: no plan; else the plan's rows a kv row
+    PLAN_BLOCK: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     head = tl.program_id(1)
     pid_n = tl.program_id(2)
+    if PLAN_GROUPS > 0:  # noqa: SIM102
+        if (pid_m == 0) & (pid_n == tl.num_programs(2) - 1):
+            # patch_work_kv_ranges for items [head, head + 1) * PLAN_BLOCK:
+            # batch_idx (the row) at 0, kv_start and kv_end at 4, 5, counted
+            # from the indptr's first entry.
+            item = head * PLAN_BLOCK + tl.arange(0, PLAN_BLOCK)
+            live = item < tl.load(work_items_ptr)
+            info = work_info_ptr + item * 8
+            row = tl.load(info, mask=live, other=0) // PLAN_GROUPS
+            first = tl.load(kv_indptr_ptr)
+            lo = tl.load(kv_indptr_ptr + row, mask=live)
+            hi = tl.load(kv_indptr_ptr + row + 1, mask=live)
+            tl.store(info + 4, lo - first, mask=live)
+            tl.store(info + 5, hi - first, mask=live)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     m_mask = offs_m < num_tokens
     rows = offs_m.to(tl.int64)[:, None]
@@ -147,6 +172,7 @@ def mla_decode_qtail(
     slot_mapping: torch.Tensor,
     q_scale: torch.Tensor,
     k_scale: torch.Tensor,
+    work_plan: tuple | None = None,
 ) -> None:
     """Fill ``q_out`` and write the step's K, in place (see the module docstring).
 
@@ -159,6 +185,8 @@ def mla_decode_qtail(
         kv_cache: FP8 cache whose rows, flattened to ``[-1, L + PE]``, are slots.
         slot_mapping: ``[T]`` int64; rows with a negative slot write no K.
         q_scale, k_scale: fp32 per-tensor scales.
+        work_plan: ``(work_info_set, work_indptr, kv_indptr, rows, groups)``,
+            the arguments of ``patch_work_kv_ranges``, to make it on the way.
     """
     t, h, p = q_nope.shape
     l, pe = w_k.shape[1], q_pe.shape[-1]
@@ -169,6 +197,13 @@ def mla_decode_qtail(
     cache = kv_cache.view(-1, l + pe)
     for x in (q_nope, q_pe, w_k, q_out, k_nope, k_pe, cache):
         assert x.stride(-1) == 1
+    if work_plan is None:
+        info, items, kv_indptr, groups = q_scale, q_scale, q_scale, 0
+    else:
+        info, work_indptr, kv_indptr, rows, groups = work_plan
+        assert info.dtype == torch.int32 and info.shape[-1] == 8 and groups > 0
+        assert rows <= h * _PLAN_BLOCK and kv_indptr.dtype == torch.int32
+        items = work_indptr[-1:]
     if t == 0:
         return
     block_m = max(16, min(64, 1 << (t - 1).bit_length()))
@@ -184,6 +219,9 @@ def mla_decode_qtail(
         slot_mapping,
         q_scale,
         k_scale,
+        info,
+        items,
+        kv_indptr,
         t,
         q_nope.stride(0),
         q_nope.stride(1),
@@ -202,6 +240,8 @@ def mla_decode_qtail(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         FP8_MAX=torch.finfo(q_out.dtype).max,
+        PLAN_GROUPS=groups,
+        PLAN_BLOCK=_PLAN_BLOCK,
         num_warps=4,
         num_stages=1,
     )

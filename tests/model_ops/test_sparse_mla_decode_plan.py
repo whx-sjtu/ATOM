@@ -34,6 +34,8 @@ BUILD = {
 }
 DECODE = {
     "_forward_decode",
+    "_sparse_dcp_decode_reusable_plan",
+    "_decode_qtail_work_plan",
     "_sparse_dcp_decode_work_buffers",
     "_rebuild_sparse_dcp_persistent_metadata",
 }
@@ -62,6 +64,7 @@ def runtime():
             ATOM_MLA_PAGE_SIZE=1,
             ATOM_DMLA_MLA_HEAD_SPLIT=False,
             ATOM_DMLA_MLA_NO_REDUCE=False,
+            ATOM_DMLA_QTAIL_PLAN_PATCH=False,
         ),
         "triton": SimpleNamespace(next_power_of_2=lambda n: 1 << (n - 1).bit_length()),
         "logger": logging.getLogger(__name__),
@@ -109,7 +112,10 @@ def runtime():
         for tensor in (wmd, ri, rfm, rpm):
             tensor.fill_(len(calls))
 
+    patches = []
+
     def patch(info, wi, ptr, rows, groups=1):
+        patches.append((rows, groups))
         count = int(wi[-1])
         ids = info[:count, 0].long()
         assert count <= rows and (ids < rows).all()
@@ -144,6 +150,7 @@ def runtime():
         mla_decode_fwd=launch,
         _skipping_mla_decode_reduce=skipping_reduce,
         calls=calls,
+        patches=patches,
         reduce_skips=reduce_skips,
     )
     return ns
@@ -224,6 +231,7 @@ def setup(
         kv_shuffled=False,
         is_sparse_mla=True,
         dcp_world_size=8,
+        dcp_head_pad=0,
         sparse_dcp_metadata_rebuild=True,
         owns_sparse_indexer=True,
         scale=0.25,
@@ -477,6 +485,53 @@ def test_no_reduce_covers_only_the_builders_template(
     layer._forward_decode(q[:, :32], kv, md, return_lse=True)
     assert len(runtime["calls"]) == 2
     assert runtime["reduce_skips"] == [no_reduce, False]
+
+
+@pytest.mark.parametrize("head_split", [False, True])
+@pytest.mark.parametrize("max_q", [1, 8])
+def test_qtail_plan_patch_stands_in_for_the_layers_patch(runtime, head_split, max_q):
+    runtime["envs"].ATOM_DMLA_MLA_HEAD_SPLIT = head_split
+    runtime["envs"].ATOM_DMLA_QTAIL_PLAN_PATCH = True
+    _, md, layer = setup(runtime, 16, max_q)
+    prefix = "sparse_mtp_" if max_q > 1 else ""
+    q, kv = torch.randn(16, 64, 8).bfloat16(), torch.randn(97, 1, 8).bfloat16()
+    patches = runtime["patches"]
+    for owner in range(3):
+        selection(md, 16, owner)
+        plan = layer._decode_qtail_work_plan(md, q, kv)
+        assert plan[0] is getattr(md, prefix + "work_info_set")
+        assert plan[1] is getattr(md, prefix + "work_indptr")
+        assert torch.equal(plan[2], md.dcp_sparse_kv_indptr)
+        assert plan[3:] == ((64, 4) if head_split else (16, 1))
+        # What mla_decode_qtail stores given the plan.
+        runtime["patch_work_kv_ranges"](*plan)
+        made = len(patches)
+        out, lse = layer._forward_decode(q, kv, md, return_lse=True)
+        assert len(patches) == made, "the decode patched what its q tail did"
+        expected, expected_lse = reference(q, kv, md, 4, layer.scale)
+        torch.testing.assert_close(out, expected.bfloat16(), atol=0.016, rtol=0.01)
+        torch.testing.assert_close(lse, expected_lse)
+        # A decode its q tail did not patch patches for itself.
+        layer._forward_decode(q, kv, md, return_lse=True)
+        assert len(patches) == made + 1
+    assert len(runtime["calls"]) == 1
+
+
+@pytest.mark.parametrize("change", ["off", "heads", "head_pad", "no_template"])
+def test_qtail_plan_patch_only_where_the_layer_patches(runtime, change):
+    runtime["envs"].ATOM_DMLA_QTAIL_PLAN_PATCH = change != "off"
+    _, md, layer = setup(runtime, 16)
+    selection(md, 16, 1)
+    q, kv = torch.randn(16, 64, 8).bfloat16(), torch.randn(97, 1, 8).bfloat16()
+    if change == "heads":
+        q = q[:, :32]
+    elif change == "head_pad":
+        layer.dcp_head_pad = 32
+    elif change == "no_template":
+        md.sparse_dcp_decode_plan = None
+    layer._decode_kv_ranges_patched = "stale"
+    assert layer._decode_qtail_work_plan(md, q, kv) is None
+    assert layer._decode_kv_ranges_patched is None
 
 
 def test_whole_row_plan_is_not_reused_for_a_multiple_of_its_heads(runtime):

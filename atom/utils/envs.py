@@ -631,6 +631,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DCP_SPARSE_PREFILL_NONPS": lambda: (
         os.getenv("ATOM_DCP_SPARSE_PREFILL_NONPS", "1") == "1"
     ),
+    # Sparse DCP decode under ATOM_DMLA_DECODE_QTAIL: the q tail kernel also
+    # gives the step template's work items this layer's key ranges, the stores
+    # of patch_work_kv_ranges, so the layer launches no patch. Bit-identical.
+    # Off by default.
+    "ATOM_DMLA_QTAIL_PLAN_PATCH": lambda: (
+        os.getenv("ATOM_DMLA_QTAIL_PLAN_PATCH", "0") == "1"
+    ),
     # DCP sparse decode: kernel that merges the exchanged top-k candidates into
     # this rank's owned KV slots. "aiter" (default) is flydsl_dcp_topk_merge;
     # "atom" is atom/model_ops/dcp_topk_merge.py. Same output bit for bit.

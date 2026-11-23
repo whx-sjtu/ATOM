@@ -9,6 +9,7 @@ from aiter import dtypes, fused_qk_rope_concat_and_cache_mla
 from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import batched_gemm_bf16
 
 from atom.model_ops.rotary_embedding import NoPositionalRotaryEmbedding
+from atom.model_ops.sparse_mla_work_plan import patch_work_kv_ranges
 from atom.model_ops.triton_mla_decode_qtail import mla_decode_qtail
 
 # Kimi-K3.1 DSA decode under QREP: 96 replicated heads, 128 nope, 64 rope,
@@ -116,3 +117,59 @@ def test_qtail_saturates_out_of_range_values(tokens):
     assert torch.equal(
         cache[:, 0, LORA:].float(), torch.full((tokens, PE), fp8_max, device="cuda")
     )
+
+
+@pytest.mark.parametrize(
+    "tokens,groups,items",
+    [
+        pytest.param(5, 6, 30, id="R5 head split"),
+        pytest.param(42, 6, 252, id="R42 head split"),
+        pytest.param(45, 1, 45, id="R45 whole rows"),
+        pytest.param(20, 6, 117, id="fewer items than rows"),
+        pytest.param(257, 1, 257, id="row blocks past the first"),
+    ],
+)
+def test_qtail_work_plan_makes_the_patch_stores(tokens, groups, items):
+    """ATOM_DMLA_QTAIL_PLAN_PATCH: given a work plan, the q tail leaves the
+    plan exactly as patch_work_kv_ranges would, and q_out and the cache exactly
+    as without one."""
+    gen = torch.Generator(device="cuda").manual_seed(tokens * groups)
+    q = torch.randn(
+        tokens, HEADS, NOPE + PE, device="cuda", dtype=torch.bfloat16, generator=gen
+    )
+    w_k = 0.05 * torch.randn(
+        HEADS, LORA, NOPE, device="cuda", dtype=torch.bfloat16, generator=gen
+    )
+    k_nope = torch.randn(tokens, LORA, device="cuda", dtype=torch.bfloat16)
+    k_pe = torch.randn(tokens, PE, device="cuda", dtype=torch.bfloat16)
+    slots = torch.randperm(4 * tokens, device="cuda", generator=gen)[:tokens]
+    slots[1::3] = -1
+    one = torch.ones(1, device="cuda")
+    rows = tokens * groups
+    # A template's items in a shuffled row order, over stale ranges, with
+    # spare capacity past them.
+    info = torch.randint(
+        -9, 9, (rows + 300, 8), dtype=torch.int32, device="cuda", generator=gen
+    )
+    info[:rows, 0] = torch.randperm(rows, device="cuda", generator=gen).int()
+    work_indptr = torch.tensor([0, items // 2, items], dtype=torch.int32, device="cuda")
+    counts = torch.randint(0, 300, (tokens,), device="cuda", generator=gen)
+    kvptr = torch.cat([counts.new_zeros(1), counts.cumsum(0)]).int() + 11
+
+    def run(plan):
+        q_out = torch.zeros(tokens, HEADS, LORA + PE, device="cuda", dtype=dtypes.fp8)
+        cache = torch.zeros(4 * tokens, 1, LORA + PE, device="cuda", dtype=dtypes.fp8)
+        mla_decode_qtail(
+            q[..., :NOPE], q[..., NOPE:], w_k, q_out, k_nope, k_pe, cache, slots,
+            one, one, work_plan=plan,
+        )  # fmt: skip
+        return q_out, cache
+
+    ref_info = info.clone()
+    patch_work_kv_ranges(ref_info, work_indptr, kvptr, rows, groups)
+    ref_q, ref_cache = run(None)
+    new_q, new_cache = run((info, work_indptr, kvptr, rows, groups))
+
+    assert torch.equal(info, ref_info)
+    assert torch.equal(new_q.view(torch.uint8), ref_q.view(torch.uint8))
+    assert torch.equal(new_cache.view(torch.uint8), ref_cache.view(torch.uint8))

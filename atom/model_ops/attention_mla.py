@@ -3004,6 +3004,74 @@ class MLAAttention(nn.Module):
             max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
         )
 
+    def _sparse_dcp_decode_reusable_plan(
+        self, attn_metadata, q, kv_buffer, kvptr, work_prefix
+    ):
+        """The step template's planned rows and head groups when q's decode
+        takes it with only its work items' key ranges rewritten; None where the
+        decode plans its own."""
+        plan_name = (
+            "sparse_mtp_dcp_decode_plan" if work_prefix else "sparse_dcp_decode_plan"
+        )
+        plan = getattr(attn_metadata, plan_name, None)
+        if plan is None:
+            return None
+        rows, heads, dtype_q, dtype_kv, groups = plan
+        support = get_mla_decode_shape_support(
+            heads,
+            1,
+            q.dtype,
+            kv_buffer.dtype,
+            persistent=True,
+            return_lse=True,
+            page_size=1,
+        )
+        reuse = (
+            support.supported is True
+            and support.native
+            and groups * heads == q.shape[1]
+            and (
+                groups == 1
+                or (
+                    q.is_contiguous()
+                    and rows % groups == 0
+                    and hasattr(self, "_head_group_indptr")
+                )
+            )
+            and (q.dtype, kv_buffer.dtype) == (dtype_q, dtype_kv)
+            and rows <= q.shape[0] * groups
+            and rows // groups + 1 <= kvptr.numel()
+        )
+        return (rows, groups) if reuse else None
+
+    def _decode_qtail_work_plan(self, attn_metadata, q_out, kv_cache):
+        """The KV range patch `_sparse_dcp_decode_work_buffers` would make next
+        for this decode, as `mla_decode_qtail`'s ``work_plan``
+        (`ATOM_DMLA_QTAIL_PLAN_PATCH`); None where it would not patch."""
+        self._decode_kv_ranges_patched = None
+        if not (
+            envs.ATOM_DMLA_QTAIL_PLAN_PATCH
+            and self.is_sparse_mla
+            and self.dcp_world_size > 1
+            and self.dcp_head_pad == 0
+            and not self.use_triton_mla
+            and not self.kv_shuffled
+            and self.sparse_dcp_metadata_rebuild
+            and self.decode_is_persistent()
+        ):
+            return None
+        prefix = "sparse_mtp_" if attn_metadata.max_seqlen_q > 1 else ""
+        kvptr = attn_metadata.dcp_sparse_kv_indptr[: q_out.shape[0] + 1]
+        reused = self._sparse_dcp_decode_reusable_plan(
+            attn_metadata, q_out, kv_cache, kvptr, prefix
+        )
+        if reused is None:
+            return None
+        info = getattr(attn_metadata, f"{prefix}work_info_set")
+        work_indptr = getattr(attn_metadata, f"{prefix}work_indptr")
+        self._decode_kv_ranges_patched = (info.data_ptr(), kvptr.data_ptr(), *reused)
+        return info, work_indptr, kvptr, *reused
+
     def _sparse_dcp_decode_work_buffers(
         self, attn_metadata, q, kv_buffer, qptr, kvptr, last, work_prefix
     ):
@@ -3019,41 +3087,22 @@ class MLAAttention(nn.Module):
             "sparse_mtp_dcp_decode_plan" if work_prefix else "sparse_dcp_decode_plan"
         )
         plan = getattr(attn_metadata, plan_name, None)
-        reuse = False
+        reused = self._sparse_dcp_decode_reusable_plan(
+            attn_metadata, q, kv_buffer, kvptr, work_prefix
+        )
+        reuse = reused is not None
         groups = 1
+        patched = getattr(self, "_decode_kv_ranges_patched", None)
+        self._decode_kv_ranges_patched = None
         if plan is not None:
-            rows, heads, dtype_q, dtype_kv, groups = plan
-            support = get_mla_decode_shape_support(
-                heads,
-                1,
-                q.dtype,
-                kv_buffer.dtype,
-                persistent=True,
-                return_lse=True,
-                page_size=1,
-            )
-            reuse = (
-                support.supported is True
-                and support.native
-                and groups * heads == q.shape[1]
-                and (
-                    groups == 1
-                    or (
-                        q.is_contiguous()
-                        and rows % groups == 0
-                        and hasattr(self, "_head_group_indptr")
-                    )
-                )
-                and (q.dtype, kv_buffer.dtype) == (dtype_q, dtype_kv)
-                and rows <= q.shape[0] * groups
-                and rows // groups + 1 <= kvptr.numel()
-            )
             if reuse:
+                rows, groups = reused
                 # Shared layers read the preceding owner's indptr. Patch here
-                # too, so a differing draft/folded consumer cannot leave it stale.
-                patch_work_kv_ranges(buffers[2], buffers[1], kvptr, rows, groups)
+                # too, so a differing draft/folded consumer cannot leave it
+                # stale -- unless this layer's q tail just made these stores.
+                if patched != (buffers[2].data_ptr(), kvptr.data_ptr(), rows, groups):
+                    patch_work_kv_ranges(buffers[2], buffers[1], kvptr, rows, groups)
             else:
-                groups = 1
                 # A fallback must not overwrite the next native layer's template.
                 # Its head fold/occupancy can require larger buffers than that plan.
                 sizes = get_mla_metadata_info_v1(
@@ -3875,6 +3924,9 @@ class MLAAttention(nn.Module):
                         write_slot_mapping,
                         self._q_scale,
                         self._k_scale,
+                        work_plan=self._decode_qtail_work_plan(
+                            attn_metadata, q_out, kv_cache
+                        ),
                     )
                 else:
                     # DCP: q_out is head all-gathered, so every rank must compute
