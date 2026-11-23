@@ -62,6 +62,7 @@ from typing import TYPE_CHECKING, ClassVar
 import torch
 from aiter import QuantType, dtypes
 from aiter.rotary_embedding import get_rope
+from aiter.tuned_gemm import tgemm
 from torch import nn
 
 from atom.model_ops.activation import SiluAndMul
@@ -90,6 +91,7 @@ from atom.models.dspark_draft import (
 from atom.models.kimi_k3 import _RMS_FUSABLE_QUANT_TYPES
 from atom.models.utils import is_neox_rope_style
 from atom.quant_spec import effective_layer_quant
+from atom.utils import envs
 
 if TYPE_CHECKING:
     from atom.config import Config
@@ -274,6 +276,9 @@ class K3DSparkMLAAttention(nn.Module):
             config=atom_config,
             prefix=f"{prefix}.mla_attn",
         )
+        # Only the draft's own W_K absorb takes ATOM_MLA_BF16_ABSORB_BMM_CONFIG's
+        # tile; the target's MLA layers keep aiter's.
+        self.mla_attn.impl.bf16_absorb_bmm_tile = True
 
         # Which scheme -- if any -- the two fusable activation quants run in.
         # Resolved from the CONSUMER linear, the way kimi_k3 does it, so an
@@ -316,9 +321,18 @@ class K3DSparkMLAAttention(nn.Module):
         quantizes this projection per output channel and preshuffles its rows,
         after which a row slice of the merged weight is not that shard's weight.
         (vLLM's reference computes the full projection here too, and offers a
-        cross-layer fused fast path on top; that optimization is not ported.)
+        cross-layer fused fast path on top; ATOM_DSPARK_STACKED_CTX_KV_GEMM is that
+        path, see `KimiK3DSpark.write_context_rows`.)
         """
         kv_lora = linear_out(self.fused_qkv_a_proj(ctx_hidden))[..., self.q_lora_rank :]
+        self.write_context_latent(kv_lora, positions, slot_mapping)
+
+    def write_context_latent(
+        self,
+        kv_lora: torch.Tensor,  # [N, kv_lora_rank + qk_rope_head_dim]
+        positions: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
         # norm + rope + concat + store live behind one call so every cache
         # layout stays in the attention impl: the normal store hardcodes
         # attn_metadata.slot_mapping, which is the draft block's, not these
@@ -331,6 +345,23 @@ class K3DSparkMLAAttention(nn.Module):
             slot_mapping,
             self.kv_a_layernorm,
         )
+
+    def kv_rows(self) -> torch.Tensor | None:
+        """The kv rows of ``fused_qkv_a_proj``'s weight as a view, or None when
+        its weight is not a plain bf16 GEMM weight (quantized, padded, biased),
+        where a row slice is not that shard's weight. Checked per call: online
+        quantization rewrites quant_type after __init__."""
+        proj = self.fused_qkv_a_proj
+        if (
+            proj.quant_type.value != QuantType.No.value
+            or proj.weight.dtype != torch.bfloat16
+            or proj.weight.dim() != 2
+            or proj.bias is not None
+            or proj.is_output_padded
+            or proj.native_a8_group_rows is not None
+        ):
+            return None
+        return proj.weight[self.q_lora_rank :]
 
     # ---- block pass --------------------------------------------------------
 
@@ -571,6 +602,23 @@ class KimiK3DSpark(DSparkDraftModel):
             ]
         )
         self.final_norm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        # ATOM_DSPARK_STACKED_CTX_KV_GEMM: every layer's kv rows of fused_qkv_a_proj,
+        # stacked, so the context rows take one GEMM for all layers. Allocated
+        # here so it is counted before the KV cache is sized; filled on use.
+        self._ctx_kv_src = None
+        if envs.ATOM_DSPARK_STACKED_CTX_KV_GEMM:
+            kv_width = config.kv_lora_rank + config.qk_rope_head_dim
+            self.register_buffer(
+                "_ctx_kv_weight",
+                torch.empty(
+                    config.num_hidden_layers * kv_width,
+                    self.hidden_size,
+                    dtype=torch.bfloat16,
+                ),
+                persistent=False,
+            )
+        else:
+            self._ctx_kv_weight = None
         self.init_block_fields(config)
         # Markov-head vocab, exposed at the top level so the proposer can clamp
         # the anchor uniformly across DSpark flavors (V4 exposes it too).
@@ -598,3 +646,34 @@ class KimiK3DSpark(DSparkDraftModel):
         projection to it.
         """
         return self.context_norm(linear_out(self.context_proj(self.concat_taps(taps))))
+
+    def write_context_rows(self, ctx_hidden, positions, slot_mapping) -> None:
+        """One GEMM over the stacked kv rows of every layer instead of one
+        full q_a + kv_a projection per layer (ATOM_DSPARK_STACKED_CTX_KV_GEMM)."""
+        attns = [layer.self_attn for layer in self.context_layers]
+        weight = self._stacked_ctx_kv_weight(attns)
+        if weight is None:
+            return super().write_context_rows(ctx_hidden, positions, slot_mapping)
+        kv = tgemm.mm(ctx_hidden, weight).split(weight.shape[0] // len(attns), dim=-1)
+        for attn, kv_lora in zip(attns, kv):
+            attn.write_context_latent(kv_lora, positions, slot_mapping)
+
+    def _stacked_ctx_kv_weight(self, attns) -> torch.Tensor | None:
+        if self._ctx_kv_weight is None:
+            return None
+        rows = [attn.kv_rows() for attn in attns]
+        if any(r is None for r in rows):
+            return None
+        # Filled on first use, after every layer's own post-load hook, and
+        # again after a reload (`process_weights_after_loading` clears the
+        # key) or when a layer's weight tensor is replaced.
+        src = tuple(r.data_ptr() for r in rows)
+        if src != self._ctx_kv_src:
+            torch.cat(rows, out=self._ctx_kv_weight)
+            self._ctx_kv_src = src
+        return self._ctx_kv_weight
+
+    def process_weights_after_loading(self) -> None:
+        # Runs before the layers' hooks (parent first), so only mark the stack
+        # stale; the next context write refills it from the final weights.
+        self._ctx_kv_src = None

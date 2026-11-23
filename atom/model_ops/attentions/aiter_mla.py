@@ -2454,6 +2454,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             self._dense_prefill_layer = dense
         return dense
 
+    def _verify_reads_dense_plan(self) -> bool:
+        """Whether a sparse MTP verify step's dense persistent plan has a
+        reader. Its readers are the dense MLA layers that decode under the
+        target's metadata -- the set `_has_dense_prefill_layer` scans: sparse
+        layers read the sparse_mtp_ plan, and a block drafter (DSpark) plans
+        its own block. Always yes with ATOM_MLA_SKIP_UNREAD_DENSE_PLAN off."""
+        return (
+            not envs.ATOM_MLA_SKIP_UNREAD_DENSE_PLAN or self._has_dense_prefill_layer()
+        )
+
     def _attach_selection(
         self,
         attn_metadata: AttentionMetaData,
@@ -3682,8 +3692,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         is_sparse_mtp = self.is_sparse and max_seqlen_q > 1
         if is_sparse_mtp:
-            ctx_mla_ps = self.set_mla_persistent_worker_buffers(
-                running_bs, max_seqlen_q
+            ctx_mla_ps = (
+                self.set_mla_persistent_worker_buffers(running_bs, max_seqlen_q)
+                if batch.is_dummy_run or self._verify_reads_dense_plan()
+                else {"sparse_dcp_decode_plan": None}
             )
             # Plan the sparse per-token work over the REAL tokens only, as the
             # cprr branch below does for its requests. This plan is not the

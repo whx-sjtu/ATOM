@@ -44,6 +44,7 @@ from aiter.ops.triton.fusions.fused_kv_cache import (
 )
 from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
 from aiter.ops.triton.kv_cache import cat_and_cache_mla as triton_cat_and_cache_mla
+from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
 from torch import nn
 
 from atom.config import (
@@ -944,6 +945,10 @@ class MLAAttention(nn.Module):
             and getattr(rope, "cos_cache", None) is not None
             and rope.cos_cache.shape[-1] == self.qk_rope_head_dim // 2
         )
+        # Set by a drafter on its own layers (the Kimi-K3 DSpark draft does):
+        # their BF16 W_K absorb takes _BF16_ABSORB_BMM_CONFIG under
+        # ATOM_MLA_BF16_ABSORB_BMM_CONFIG. Every other MLA keeps aiter's tile.
+        self.bf16_absorb_bmm_tile = False
 
         # Decode context parallel (DCP): KV cache is sharded across TP ranks, so
         # decode attention runs locally then combines via all-gather LSE +
@@ -1911,7 +1916,9 @@ class MLAAttention(nn.Module):
             # hipBLASLt bf16 batched path memory-faults). batched_gemm_bf16 does
             # X @ W^T with W (B,N,K): q_nope (N,B,P) @ W_K (N,L,P)^T -> (N,B,L),
             # then -> (B,N,L) to match the fp8/fp4 output layout.
-            ql_nope = _aiter_triton_bf16_bmm(q_nope, W_K).transpose(0, 1)
+            ql_nope = _aiter_triton_bf16_bmm(
+                q_nope, W_K, **self._bf16_absorb_bmm_kwargs(q_nope, W_K)
+            ).transpose(0, 1)
         else:
             # Multiply (N, B, P) x (N, P, L) -> (N, B, L), Convert from (N, B, L) to (B, N, L)
             # ql_nope = torch.bmm(q_nope, self.W_UK_T).transpose(0, 1)
@@ -1919,6 +1926,41 @@ class MLAAttention(nn.Module):
                 q_nope, W_K, W_K_scale, group_size=128, transpose_bm=True
             )
         return ql_nope, q_pe
+
+    # aiter has no tuned entry for the absorb shapes (heads x 512x128), so its
+    # default tile (128x128x32, 8 warps) runs a decode's few rows. Same K order,
+    # so the output is unchanged.
+    _BF16_ABSORB_BMM_CONFIG: ClassVar[dict] = {
+        "BLOCK_SIZE_M": 32,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": ".cg",
+        "NUM_KSPLIT": 1,
+    }
+
+    def _bf16_absorb_bmm_kwargs(self, x: torch.Tensor, w: torch.Tensor) -> dict:
+        """Triton config for this layer's BF16 absorb bmm of at most 64 rows per
+        head, when its owner opted in (``bf16_absorb_bmm_tile``) under
+        ATOM_MLA_BF16_ABSORB_BMM_CONFIG on gfx950; empty (aiter's choice)
+        otherwise."""
+        config = self._BF16_ABSORB_BMM_CONFIG
+        if (
+            not self.bf16_absorb_bmm_tile
+            or not envs.ATOM_MLA_BF16_ABSORB_BMM_CONFIG
+            or x.shape[1] > 64
+            or w.shape[2] < config["BLOCK_SIZE_K"]
+            or not _runs_on_gfx950()
+        ):
+            return {}
+        return {
+            "config": compute_splitk_params(dict(config), w.shape[2]),
+            "backend": "triton",
+        }
 
     def fused_kv_bmm(
         self, x, x_scale, k_nope, k_rope, positions, kv_cache, attn_metadata

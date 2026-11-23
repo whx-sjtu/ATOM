@@ -890,12 +890,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSPARK_FUSED_MARKOV_SAMPLE": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_MARKOV_SAMPLE", "1") == "1"
     ),
+    # DSA MTP verify: skip the step's dense persistent MLA plan when no layer
+    # decodes off it (no dense MLA layer in the target or a non-block drafter).
+    # Off by default.
+    "ATOM_MLA_SKIP_UNREAD_DENSE_PLAN": lambda: _flag_env(
+        "ATOM_MLA_SKIP_UNREAD_DENSE_PLAN"
+    ),
     # Build the Kimi-K3 DSpark block's DCP-sharded MLA metadata (positions,
     # slots, ctx_lens, kv_indptr, pad-tail kv_indices) in one Triton program
     # instead of ~20 torch launches. Same values; "0" restores the torch path.
     # Read at proposer construction.
     "ATOM_DSPARK_FUSED_BLOCK_META": lambda: _flag_env(
         "ATOM_DSPARK_FUSED_BLOCK_META", "1"
+    ),
+    # Kimi-K3 DSpark context rows: one GEMM over every layer's kv rows of a bf16
+    # fused_qkv_a_proj, stacked into a weight copy at model construction.
+    # Off by default.
+    "ATOM_DSPARK_STACKED_CTX_KV_GEMM": lambda: _flag_env(
+        "ATOM_DSPARK_STACKED_CTX_KV_GEMM"
+    ),
+    # Kimi-K3 DSpark draft: its MLA layers' BF16 W_K absorb bmm of <= 64 rows per
+    # head on gfx950 takes an explicit Triton tile instead of aiter's untuned
+    # default. The target's layers keep aiter's. Same output. Off by default.
+    "ATOM_MLA_BF16_ABSORB_BMM_CONFIG": lambda: _flag_env(
+        "ATOM_MLA_BF16_ABSORB_BMM_CONFIG"
     ),
     # Lossless speculative sampling: the DSpark draft samples its block from q
     # and the verify accepts by the probability ratio (u * q < p). Off by
