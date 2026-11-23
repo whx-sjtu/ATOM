@@ -2203,6 +2203,35 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.has_cached and not self.kv_shuffled
         )
 
+    def _has_dense_prefill_layer(self) -> bool:
+        """Whether an MLA layer that forwards under a prefill's metadata is
+        dense, so takes the dense cached-prefix branch even on a sparse step:
+        the target's, or a drafter's that runs as a prefill. A block drafter
+        (DSpark) runs its pass as a decode (`context.is_prefill = False`).
+
+        No MLA layer found answers yes. Not cached until the drafter, if the
+        config has one, is attached."""
+        known = getattr(self, "_dense_prefill_layer", None)
+        if known is not None:
+            return known
+        runner = self.model_runner
+        models = [getattr(runner, "model", None)]
+        drafter = getattr(runner, "drafter", None)
+        if drafter is not None and not drafter.is_block_drafter:
+            models.append(drafter.model)
+        impls = [
+            module
+            for model in models
+            if model is not None
+            for module in model.modules()
+            if isinstance(module, MLAAttention)
+        ]
+        dense = not impls or any(not impl.is_sparse_mla for impl in impls)
+        config = getattr(runner, "config", None)
+        if drafter is not None or getattr(config, "speculative_config", None) is None:
+            self._dense_prefill_layer = dense
+        return dense
+
     def _attach_selection(
         self,
         attn_metadata: AttentionMetaData,
@@ -2299,6 +2328,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 self.block_ratio,
                 attn_metadata.max_seqlen_k,
             )
+
+        # Everything below feeds only the dense cached-prefix branch, which a
+        # sparse forward sends no sparse MLA layer down.
+        if (
+            attn_metadata.has_cached
+            and attn_metadata.run_sparse
+            and not self._has_dense_prefill_layer()
+        ):
+            return
 
         # Build chunked-context metadata when enabled AND the cached
         # prefix is large enough to risk OOM in the single-pass path.
