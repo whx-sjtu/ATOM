@@ -224,6 +224,37 @@ class Mailbox:
             e += 2 * n
         return outs
 
+    def peek(self, specs):
+        """The tags of pairs ``specs`` (at most POLL_MAX), loaded once at their
+        space's scope and not waited for, for ``stale`` where the wait would
+        be: a poll issued ahead of loads it would otherwise queue behind
+        (vmcnt counts in order) costs no round trip once its producers have
+        landed. Tags alone: a dead payload word's register is reused at once,
+        and its reuse waits for every load before it."""
+        assert len(specs) <= POLL_MAX
+        tags = []
+        for a, i, n in specs:
+            base, cm = _noted(a, "poll"), _SCOPE_CM[a.space]
+            for q in range_constexpr(n):
+                tags.append(
+                    bo.buffer_load(
+                        rsrc(base),
+                        (fx.Int32(i) + q) * 2 + 1,
+                        vec_width=1,
+                        dtype=T.i32,
+                        cache_modifier=cm,
+                    )
+                )
+        return [fx.Int32(t) for t in tags]
+
+    def stale(self, tags):
+        """Whether any of ``peek``'s ``tags`` is another launch's (``poll`` the
+        pairs then)."""
+        bad = tags[0] != self.tag
+        for t in tags[1:]:
+            bad = bad | (t != self.tag)
+        return bad
+
 
 @traced
 def publish(put, a, i, v, who):

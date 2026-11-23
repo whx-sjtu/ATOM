@@ -54,9 +54,15 @@ def _runner(tapped, *, mono):
     )
     runner.inner = SimpleNamespace(layers={i: _Layer() for i in range(4)})
     out = (torch.full((ROWS, HIDDEN), 2.0), torch.full((ROWS, HIDDEN), 3.0), None)
+    runner.metadata = object()
     if mono:
         runner._k1 = lambda *a, **k: None
-        runner._k2 = lambda build, plan, core, prefix, blocks: out[1]
+
+        def k2(build, plan, core, prefix, blocks, metadata):
+            assert metadata is runner.metadata
+            return out[1]
+
+        runner._k2 = k2
     else:
         runner._fallback = lambda *a, **k: out
     return runner, out
@@ -64,7 +70,7 @@ def _runner(tapped, *, mono):
 
 def _drive(runner, *, layer_id, mono, prefix):
     plan = SimpleNamespace(mono=mono, ffn_only=False, layer_id=layer_id)
-    return runner._layer(None, plan, None, prefix, None, None, None, None)
+    return runner._layer(None, plan, None, prefix, None, None, None, runner.metadata)
 
 
 @pytest.mark.parametrize("mono", [True, False])
@@ -115,7 +121,7 @@ def test_the_drafters_extract_gets_the_layer_return_and_the_block_bank(mono):
 
     runner.aux = AuxTaps(runner.aux.layer_ids, runner.aux.buffers, extract)
     plan = SimpleNamespace(mono=mono, ffn_only=False, layer_id=1)
-    runner._layer(None, plan, None, out[0], blocks, None, None, None)
+    runner._layer(None, plan, None, out[0], blocks, None, None, runner.metadata)
     ((output, layer),) = seen
     assert len(output) == 4 and output[1] is out[1] and output[3] is blocks
     assert layer is runner.inner.layers[1]

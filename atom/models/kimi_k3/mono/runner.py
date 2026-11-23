@@ -43,6 +43,7 @@ from aiter.dist.parallel_state import (
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
+from atom.distributed.group_agreement import group_agree
 from atom.models.kimi_k3.mono.config import (
     MAX_ROWS,
     Dims,
@@ -145,14 +146,34 @@ def _lean_width(built: WidthBuild, spilled: list) -> WidthBuild | None:
     )
 
 
+def _agree_env(name: str, group) -> bool:
+    """K2 build switch ``name`` (``envs``), the same on every TP rank."""
+    requested = getattr(envs, name)
+    enabled = group_agree(requested, group)
+    disabled = group_agree(not requested, group)
+    if not (enabled or disabled):
+        raise RuntimeError(f"{name} differs across TP ranks")
+    return enabled
+
+
+def _agree_skip_padding(group) -> bool:
+    return _agree_env("ATOM_MONO_K2_SKIP_PADDING", group)
+
+
 class K3MonoDecodeRunner:
     """Binds every rank's weights and buffers, or none: a rank that cannot is a
     refusal every rank agrees on before anything collective."""
 
     max_rows = MAX_ROWS
+    skip_padding = False
+    down_peek = False
+    ug_place = False
 
     def __init__(self, model, drafter=None, metadata_builder=None) -> None:
         group = get_tp_group().cpu_group
+        self.skip_padding = _agree_skip_padding(group)
+        self.down_peek = _agree_env("ATOM_MONO_K2_DOWN_PEEK", group)
+        self.ug_place = _agree_env("ATOM_MONO_K2_UG_PLACE", group)
         bind_agreed(lambda: self._bind(model, drafter, metadata_builder), group)
         peer_bytes = k2.peer_bytes(self.max_rows)
         if self.ix is not None:
@@ -403,7 +424,7 @@ class K3MonoDecodeRunner:
                 raise MonoUnsupported(k1.lds_refusal(key))
         return keys
 
-    def _k2_keys(self, rows: int) -> dict[int, k2.K2Build]:
+    def _k2_keys(self, rows: int, qlen: int = 1) -> dict[int, k2.K2Build]:
         return {
             p.layer_id: k2.K2Build(
                 tokens=rows,
@@ -412,6 +433,10 @@ class K3MonoDecodeRunner:
                 eps=p.moe.seam.eps,
                 out_eps=p.moe.seam.out_eps,
                 ln_eps=p.moe.ln_eps,
+                qlen=qlen,
+                skip_padding=self.skip_padding,
+                down_peek=self.down_peek,
+                ug_place=self.ug_place,
                 diag=self.debug,
             )
             for p in self.plans
@@ -421,7 +446,7 @@ class K3MonoDecodeRunner:
     def _build_width(self, key: int) -> WidthBuild:
         rows, qlen = _width(key)
         k1_keys = self._k1_keys(rows, qlen)
-        k2_keys = self._k2_keys(rows)
+        k2_keys = self._k2_keys(rows, qlen)
         return WidthBuild(
             k1_keys=k1_keys,
             k1_launchers={k: k1.build(k) for k in set(k1_keys.values())},
@@ -523,7 +548,7 @@ class K3MonoDecodeRunner:
                 core = self._k1(build, plan, prefix, delta, blocks, metadata)
             # K2 updates ``prefix`` in place: on a block-write layer it restarts
             # it at the all-reduced o_proj output, which K1 has already banked
-            out = (prefix, self._k2(build, plan, core, prefix, blocks), None)
+            out = (prefix, self._k2(build, plan, core, prefix, blocks, metadata), None)
         self._write_aux(plan.layer_id, out, blocks)
         return out
 
@@ -667,15 +692,20 @@ class K3MonoDecodeRunner:
             self._replay_tables[layer_id] = (table, ptrs)
         return table.data_ptr()
 
-    def _k2(self, build, plan, core, prefix, blocks) -> torch.Tensor:
+    def _k2(self, build, plan, core, prefix, blocks, metadata) -> torch.Tensor:
         w = plan.moe
         key = build.k2_keys[plan.layer_id]
         out = torch.empty_like(prefix)
         p = torch.Tensor.data_ptr
+        st_idx, st_stride = 0, 0
+        if k2.padding_supported(key):
+            slots, _ = state_slots(metadata, self.ones)
+            st_idx, st_stride = p(slots), slots.stride(0)
         args = k2.ABI.pack({
             "core": p(core), "w_o": p(w.w_o), "prefix": p(prefix),
             "blocks": p(blocks), "blk_sm": blocks.stride(0),
-            "blk_sr": blocks.stride(1), "ares_nw": p(w.seam.nw),
+            "blk_sr": blocks.stride(1), "st_idx": st_idx, "st_stride": st_stride,
+            "ares_nw": p(w.seam.nw),
             "ares_qk": p(w.seam.qk), "in_nw": p(w.seam.out_nw),
             "w_gate": p(w.w_gate), "bias": p(w.bias), "w_ld": p(w.w_ld),
             "w_sgu": p(w.w_sgu), "w_sd": p(w.w_sd), "w13": p(w.w13),

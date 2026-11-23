@@ -81,6 +81,7 @@ from atom.mono.device.ops import (
     hw_rsq,
     kernel_symbol,
     ld_f32,
+    ld_i32,
     load_ptr64,
     popcount,
     row_sum,
@@ -821,6 +822,15 @@ def pick_expert(rt, p):
     return fx.max(fx.min(fx.ptr_load(rt["route"] + (t * 2 * TOPK + k)), E - 1), 0)
 
 
+def token_live(c, token):
+    """State slots describe global request padding; slot zero is a live slot."""
+    if c.get("skip_padding", False):
+        request = token // c["qlen"]
+        # Lane-dependent: a down-fold wave can straddle live/padded requests.
+        return ld_i32(c["args"]["st_idx"], request * c["args"]["st_stride"]) >= 0
+    return fx.Boolean(True)
+
+
 @traced
 def load_route(c):
     """ROUTE -> LDS (ids, weights); the union U (ascending): expert[slot],
@@ -849,8 +859,9 @@ def load_route(c):
     gpu.barrier()
     for i in range_constexpr(passes(s * TOPK)):
         p = tid + THREADS * i
-        if p < s * TOPK:
-            route.mark_token(rt["mask"], mw, pick_expert(rt, p), p // TOPK)
+        if p < s * TOPK:  # noqa: SIM102 - bound the slot read before the predicate
+            if token_live(c, p // TOPK):
+                route.mark_token(rt["mask"], mw, pick_expert(rt, p), p // TOPK)
     gpu.barrier()
     # two experts a thread: their pick counts; slots and first picks by scans
     ea, eb = fx.min(2 * tid, E - 1), fx.min(2 * tid + 1, E - 1)
@@ -880,11 +891,12 @@ def load_route(c):
         p = tid + THREADS * i
         if p < s * TOPK:
             t = p // TOPK
-            e = pick_expert(rt, p)
-            # the tokens below t that picked e: the picks before p in its slot
-            rank = route.tokens_below(rt["mask"], mw, e, t)
-            slot = fx.ptr_load(rt["slot"] + e)
-            fx.ptr_store(p, rt["order"] + (fx.ptr_load(rt["first"] + slot) + rank))
+            if token_live(c, t):
+                e = pick_expert(rt, p)
+                # The active picks keep their original token/top-k order.
+                rank = route.tokens_below(rt["mask"], mw, e, t)
+                slot = fx.ptr_load(rt["slot"] + e)
+                fx.ptr_store(p, rt["order"] + (fx.ptr_load(rt["first"] + slot) + rank))
     gpu.barrier()
     return uniform(tot)
 
@@ -933,18 +945,33 @@ def w13_scale_word(e, rg, st, lane):
     )
 
 
+UG_QUEUED = 2  # ``ug_place``: the last rounds, at least, left to the queue
+
+
 @traced
-def claim_ug_task(c, total):
+def claim_ug_task(c, total, r=None, placed=None):
     """Claim an ug task past the first round from the launch's ug queue
     (``queue_word``) into LDS ``scan[0]`` (tid 0; read it past a barrier). A
     CTA its early or route work delayed takes fewer tasks, where round-robin
     gave every CTA the same count and the stage ended with the latest
     starter; a task's result is the same whichever CTA runs it. One round's
-    worth of tasks or fewer: no claim (``total``)."""
+    worth of tasks or fewer: no claim (``total``).
+
+    ``ug_place`` builds (``r`` the claim's round, ``placed`` the rounds before
+    the queue's) place rounds below ``placed`` like the first, with no
+    atomic: tid 0 waits out its round trip before its wave's next weights
+    go out, and every wave waits for it at the task's first barrier."""
     if c["tid"] == 0:
         task = total
-        if total > BLOCKS:
-            task = BLOCKS + queue.take(queue_word(c, "ug"))
+        if const_expr(r is None):
+            if total > BLOCKS:
+                task = BLOCKS + queue.take(queue_word(c, "ug"))
+        else:
+            if r < placed:
+                task = BLOCKS - 1 - c["bid"] + BLOCKS * r
+            else:
+                if total > BLOCKS * placed:
+                    task = BLOCKS * placed + queue.take(queue_word(c, "ug"))
         fx.ptr_store(fx.Int32(task), c["scan"])
 
 
@@ -952,25 +979,43 @@ def claim_ug_task(c, total):
 def run_ug(c, bid, nu):
     """Every ug task of the step's union: the first round placed (reversed:
     its leftover tasks go to the high CTAs, whose early work ends first), the
-    rest from the queue. A task's weights are in flight under the one before
-    it (past the end: the last task's, cache hits), and its claim one task
-    further ahead: the atomic's round trip under a whole task."""
+    rest from the queue (``ug_place``: all but the last UG_QUEUED rounds
+    placed too). A task's weights are in flight under the one before it
+    (past the end: the last task's, cache hits), and its claim one task
+    further ahead."""
     total = nu * UG_GROUPS
     last = total - 1
     task = BLOCKS - 1 - bid
-    claim_ug_task(c, total)
-    ops = ug_loads(c, fx.min(task, last))
-    gpu.barrier()
-    nxt = fx.ptr_load(c["scan"])
-    while task < total:
-        gpu.barrier()  # every thread read the claim before the next one lands
-        claim_ug_task(c, total)
-        ops_n = ug_loads(c, fx.min(nxt, last))
-        stage_ug(c, task, ops)
-        # ``stage_ug`` ends at a barrier: the claim is visible
-        task = nxt
+    if const_expr(c.get("ug_place", False)):
+        placed = fx.max(total // BLOCKS - UG_QUEUED, 1)
+        r = fx.Int32(1)
+        claim_ug_task(c, total, r, placed)
+        ops = ug_loads(c, fx.min(task, last))
+        gpu.barrier()
         nxt = fx.ptr_load(c["scan"])
-        ops = ops_n
+        while task < total:
+            gpu.barrier()  # every thread read the claim before the next one lands
+            r = r + 1
+            claim_ug_task(c, total, r, placed)
+            ops_n = ug_loads(c, fx.min(nxt, last))
+            stage_ug(c, task, ops)
+            task = nxt
+            nxt = fx.ptr_load(c["scan"])
+            ops = ops_n
+    else:
+        claim_ug_task(c, total)
+        ops = ug_loads(c, fx.min(task, last))
+        gpu.barrier()
+        nxt = fx.ptr_load(c["scan"])
+        while task < total:
+            gpu.barrier()  # every thread read the claim before the next one lands
+            claim_ug_task(c, total)
+            ops_n = ug_loads(c, fx.min(nxt, last))
+            stage_ug(c, task, ops)
+            # ``stage_ug`` ends at a barrier: the claim is visible
+            task = nxt
+            nxt = fx.ptr_load(c["scan"])
+            ops = ops_n
 
 
 def ug_loads(c, task):
@@ -1211,6 +1256,26 @@ def down_loads(c, rgd, nu, b0):
     return av + sw
 
 
+def batch_slots(b0, nu):
+    """A wave's batch from slot b0: slots b0, b0 + 8, ..; past |U| the last."""
+    return [fx.min(b0 + WAVES * j, nu - 1) for j in range(DOWN_BATCH)]
+
+
+def ug_flag_specs(c, slots):
+    """The ug flags of a down batch's ``slots``: lanes l, l + 64, ..
+    (DOWN_BATCH x 12 of them)."""
+    lane = c["lane"]
+    nf = DOWN_BATCH * UG_GROUPS
+    specs = []
+    for q in range_constexpr(-(-nf // 64)):
+        f = fx.min(lane + 64 * q, nf - 1)
+        mine = slots[0]
+        for j in range_constexpr(1, DOWN_BATCH):
+            mine = (f // UG_GROUPS == j).select(slots[j], mine)
+        specs.append((c["ugf"], mine * UG_GROUPS + f % UG_GROUPS, 1))
+    return specs
+
+
 @traced
 def stage_down(c, rgd, nu, ops0):
     """Latent rows 16 rgd ..: every slot's w2 against its picks (wave w the slots
@@ -1218,69 +1283,98 @@ def stage_down(c, rgd, nu, ops0):
     one's MFMAs; ``ops0`` the first, issued before any ug flag was waited for;
     a batch waits only for its own slots' ug tasks) -> bf16(w acc) a (token,
     k) in LDS -> folded in top-k order with a bf16 rounding an add -> every
-    rank's LATR."""
-    s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
-    rt = c["rt"]
-    b0 = wave
+    rank's LATR.
+
+    ``down_peek`` builds load a batch's ug flags under the batch before it,
+    ahead of its weights (``Mailbox.peek``): a batch whose ug tasks were in
+    by then starts on its B operands with no flag round trip; any other
+    polls them as before."""
+    b0 = c["wave"]
     ops = ops0
-    while b0 < nu:
-        nb = b0 + WAVES * DOWN_BATCH
-        slots = [fx.min(b0 + WAVES * j, nu - 1) for j in range(DOWN_BATCH)]
-        # the batch's ug flags, lanes l, l + 64, .. (DOWN_BATCH x 12 of them)
-        nf = DOWN_BATCH * UG_GROUPS
-        specs = []
-        for q in range_constexpr(-(-nf // 64)):
-            f = fx.min(lane + 64 * q, nf - 1)
-            mine = slots[0]
-            for j in range_constexpr(1, DOWN_BATCH):
-                mine = (f // UG_GROUPS == j).select(slots[j], mine)
-            specs.append((c["ugf"], mine * UG_GROUPS + f % UG_GROUPS, 1))
-        c["poll"](specs)
-        firsts, counts, bss = [], [], []
-        for j in range_constexpr(DOWN_BATCH):
-            first = fx.ptr_load(rt["first"] + slots[j])
-            count = fx.ptr_load(rt["first"] + slots[j] + 1) - first
-            # a slot past U repeats the last: its picks are written once
-            firsts.append(first)
-            counts.append(((b0 + WAVES * j) < nu).select(count, fx.Int32(0)))
-        # every slot's B operands, then the next batch's weights: a B load
-        # issued after them waited for them (vmcnt counts in order)
-        for j in range_constexpr(DOWN_BATCH):
-            row, live = tile_row(c, firsts[j], counts[j])
-            bss.append(inter_operands(c, row, live))
-        ops_n = down_loads(c, rgd, nu, fx.min(nb, nu - 1))
-        for j in range_constexpr(DOWN_BATCH):
-            down_tile(c, rgd, ops, j, firsts[j], counts[j], bss[j])
-            if const_expr(s > TG):
-                # past 16 picks: the next tiles against the same weights
-                j0 = fx.Int32(TG)
-                while j0 < counts[j]:
-                    row, live = tile_row(c, firsts[j] + j0, counts[j] - j0)
-                    down_tile(
-                        c,
-                        rgd,
-                        ops,
-                        j,
-                        firsts[j] + j0,
-                        counts[j] - j0,
-                        inter_operands(c, row, live),
-                    )
-                    j0 = j0 + TG
-        b0 = nb
-        ops = ops_n
+    if const_expr(c.get("down_peek", False)):
+        seen = c["peek"](ug_flag_specs(c, batch_slots(b0, nu)))
+        while b0 < nu:
+            if c["stale"](seen):
+                c["poll"](ug_flag_specs(c, batch_slots(b0, nu)))
+            ops, seen = down_batch(c, rgd, nu, b0, ops, True)
+            b0 = b0 + WAVES * DOWN_BATCH
+    else:
+        while b0 < nu:
+            c["poll"](ug_flag_specs(c, batch_slots(b0, nu)))
+            ops, _ = down_batch(c, rgd, nu, b0, ops, False)
+            b0 = b0 + WAVES * DOWN_BATCH
+    publish_down(c, rgd)
+
+
+@traced
+def down_batch(c, rgd, nu, b0, ops, ahead):
+    """``stage_down``'s batch from slot b0, its ug flags seen: its B operands,
+    then (``ahead``) the next batch's flags and its weights, under this one's
+    MFMAs. Returns the next batch's weights and the flags' words (or None)."""
+    s, rt = c["S"], c["rt"]
+    nb = b0 + WAVES * DOWN_BATCH
+    slots = batch_slots(b0, nu)
+    firsts, counts, bss = [], [], []
+    for j in range_constexpr(DOWN_BATCH):
+        first = fx.ptr_load(rt["first"] + slots[j])
+        count = fx.ptr_load(rt["first"] + slots[j] + 1) - first
+        # a slot past U repeats the last: its picks are written once
+        firsts.append(first)
+        counts.append(((b0 + WAVES * j) < nu).select(count, fx.Int32(0)))
+    # every slot's B operands, then the next batch's weights: a B load
+    # issued after them waited for them (vmcnt counts in order)
+    for j in range_constexpr(DOWN_BATCH):
+        row, live = tile_row(c, firsts[j], counts[j])
+        bss.append(inter_operands(c, row, live))
+    seen = None
+    if const_expr(ahead):
+        seen = c["peek"](ug_flag_specs(c, batch_slots(nb, nu)))
+        # ahead of the weights, or its test waits for them
+        rocdl.sched_barrier(0)
+    ops_n = down_loads(c, rgd, nu, fx.min(nb, nu - 1))
+    for j in range_constexpr(DOWN_BATCH):
+        down_tile(c, rgd, ops, j, firsts[j], counts[j], bss[j])
+        if const_expr(s > TG):
+            # past 16 picks: the next tiles against the same weights
+            j0 = fx.Int32(TG)
+            while j0 < counts[j]:
+                row, live = tile_row(c, firsts[j] + j0, counts[j] - j0)
+                down_tile(
+                    c,
+                    rgd,
+                    ops,
+                    j,
+                    firsts[j] + j0,
+                    counts[j] - j0,
+                    inter_operands(c, row, live),
+                )
+                j0 = j0 + TG
+    return ops_n, seen
+
+
+@traced
+def publish_down(c, rgd, contributions=True):
+    """Publish every row's LATR, including zero routed contributions for padding."""
+    s, tid = c["S"], c["tid"]
     gpu.barrier()
     if tid < (ROWS // 2) * s:
         rp = tid % (ROWS // 2)
         tt = tid // (ROWS // 2)
         y0 = fx.Float32(0.0)
         y1 = fx.Float32(0.0)
-        for k in range_constexpr(TOPK):
-            y0 = bf16_round(
-                y0 + fx.ptr_load(c["contrib"] + ((tt * TOPK + k) * ROWS + 2 * rp))
-            )
-            y1 = bf16_round(
-                y1 + fx.ptr_load(c["contrib"] + ((tt * TOPK + k) * ROWS + 2 * rp + 1))
-            )
+        if const_expr(contributions):  # noqa: SIM102 - compile-time then lane predicate
+            if token_live(c, tt):
+                for k in range_constexpr(TOPK):
+                    y0 = bf16_round(
+                        y0
+                        + fx.ptr_load(c["contrib"] + ((tt * TOPK + k) * ROWS + 2 * rp))
+                    )
+                    y1 = bf16_round(
+                        y1
+                        + fx.ptr_load(
+                            c["contrib"] + ((tt * TOPK + k) * ROWS + 2 * rp + 1)
+                        )
+                    )
         # to the owner of these columns' lnorm task alone (``lat_owner``)
         task = rgd // (128 // ROWS)
         for p in range_constexpr(TP):
