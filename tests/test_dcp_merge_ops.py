@@ -1237,6 +1237,7 @@ def test_pcp_reindex_builds_work_plan_only_when_read(
         dcp_world_size=1,
         padded_num_attention_heads=padded_heads,
         sparse_prefill_num_heads=prefill_heads,
+        _sparse_prefill_kv_granularity=16,
         block_size=1,
         dtype_q=None,
         dtype_kv=None,
@@ -1469,13 +1470,17 @@ def test_mlaattention_init_actually_calls_qrep_enabled_for_layer():
 
 @needs_gpu
 @pytest.mark.parametrize(
-    "world,decode_heads,prefill_heads", [(2, 32, 32), (4, 48, 64), (8, 96, 96)]
+    "world,decode_heads,prefill_bf16,prefill_fp8",
+    [(2, 32, 32, 32), (4, 48, 64, 64), (8, 96, 128, 96)],
 )
 @pytest.mark.parametrize("cache_dtype", ["bf16", "fp8"])
 def test_sparse_prefill_builder_allocates_for_its_consumer(
-    monkeypatch, world, decode_heads, prefill_heads, cache_dtype
+    monkeypatch, world, decode_heads, prefill_bf16, prefill_fp8, cache_dtype
 ):
-    """12 heads per rank need distinct decode and prefill work buffers."""
+    """12 heads per rank need distinct decode and prefill work buffers. A BF16
+    cache keeps the 16/32/64/128 prefill widths; FP8 runs 96 gathered heads
+    natively (mla_dcp_sparse_prefill_num_heads)."""
+    prefill_heads = prefill_bf16 if cache_dtype == "bf16" else prefill_fp8
     from aiter import get_mla_metadata_info_v1
 
     from atom.model_ops.attentions import aiter_mla, backends

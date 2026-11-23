@@ -293,6 +293,10 @@ def _merge_layer(monkeypatch, seen):
     attn = (torch.zeros(2, 16, 128, dtype=torch.bfloat16), torch.zeros(2, 16))
     layer._forward_decode = lambda *a, **k: attn
     layer._forward_prefill_mla = lambda *a, **k: attn
+    # off: the absorb routes bound alongside the merge read weights this stub lacks
+    layer.qrep_enabled = False
+    # what process_weights_after_loading ends with: bind the prefill merge route
+    layer._configure_dcp_prefill_routes()
     return layer
 
 
