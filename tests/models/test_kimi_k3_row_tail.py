@@ -103,6 +103,7 @@ class _Stub(nn.Module):
 @pytest.fixture(autouse=True)
 def stub_block_parts(monkeypatch):
     monkeypatch.setenv("ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS", "0")
+    monkeypatch.delenv("ATOM_KIMI_K3_MOE_LATENT_ROW_SHARD", raising=False)
     empty_like = torch.empty_like
 
     def poisoned_empty_like(*args, **kwargs):
@@ -497,9 +498,11 @@ def test_base_kernels_launch_in_order(
         assert all(torch.equal(a, b) for a, b in zip(out, want))
 
 
+@pytest.mark.parametrize("latent", ["0", "1"], ids=["latent-off", "latent-on"])
 @pytest.mark.parametrize("floor", [None, "14"], ids=["default-floor", "below-floor"])
-def test_below_row_floor_all_reduces(logged, monkeypatch, floor):
+def test_below_row_floor_all_reduces(logged, monkeypatch, floor, latent):
     monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "0")
+    monkeypatch.setenv("ATOM_KIMI_K3_MOE_LATENT_ROW_SHARD", latent)
     if floor is None:
         monkeypatch.delenv("ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS")
     else:
@@ -513,6 +516,94 @@ def test_below_row_floor_all_reduces(logged, monkeypatch, floor):
     for (want, want_log), (out, log) in zip(base, got):
         assert log == want_log
         assert all(torch.equal(a, b) for a, b in zip(out, want))
+
+
+def _merge_front(monkeypatch, blocks):
+    """Give each block the merged [gate_up | gate | down] front weight of its
+    stubs, and a logged GEMM over it."""
+    w = _weights()
+    gen = torch.Generator().manual_seed(5)
+    gate_up = torch.randn(3, HIDDEN, generator=gen).bfloat16()
+    merged = torch.cat([gate_up, w["gate"].t(), w["down"].t()])
+    for block in blocks:
+        block.front_proj.merged_weight = merged
+    gemm = _logs("front_rows", lambda x, weight, otype: x @ weight.t())
+    monkeypatch.setattr(kimi, "tgemm", SimpleNamespace(mm=gemm))
+
+
+@pytest.mark.parametrize("layer_num", [4, 5], ids=["block-closes", "mid-block"])
+@pytest.mark.parametrize("tokens", [8, 13, 1027])
+def test_latent_row_shard_gathers_router_and_latent_rows(
+    logged, monkeypatch, tokens, layer_num
+):
+    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "4")
+    layers = _layers(layer_num)
+    _merge_front(monkeypatch, [layer.block_sparse_moe for layer in layers])
+    inputs = _inputs(tokens)
+
+    def forward(rank):
+        return layers[rank](None, *(x.clone() for x in inputs))
+
+    replicated = logged(forward)
+    monkeypatch.setenv("ATOM_KIMI_K3_MOE_LATENT_ROW_SHARD", "1")
+    sharded = logged(forward)
+
+    chunk = -(-tokens // WORLD)
+    for (want, want_log), (got, log) in zip(replicated, sharded):
+        front = want_log.index(("gate", tokens))
+        assert want_log[front + 1] == ("routed_expert_down_proj", tokens)
+        assert log == (
+            want_log[:front]
+            + [("front_rows", chunk), ("all_gather", chunk)]
+            + want_log[front + 2 :]
+        )
+        torch.testing.assert_close(got[0], want[0])
+        assert not got[1].any() and not got[2].any()
+
+
+@pytest.mark.parametrize(
+    "latent,merged", [("0", True), ("1", False)], ids=["off", "unmerged"]
+)
+def test_latent_row_shard_off_or_unmerged_keeps_the_row_tail_bit_for_bit(
+    logged, monkeypatch, latent, merged
+):
+    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "4")
+    layers = _layers(BLOCK)
+    inputs = _inputs(13)
+
+    def forward(rank):
+        return layers[rank](None, *(x.clone() for x in inputs))
+
+    base = logged(forward)
+    if merged:
+        _merge_front(monkeypatch, [layer.block_sparse_moe for layer in layers])
+    monkeypatch.setenv("ATOM_KIMI_K3_MOE_LATENT_ROW_SHARD", latent)
+    for (want, want_log), (out, log) in zip(base, logged(forward)):
+        assert log == want_log
+        assert all(torch.equal(a, b) for a, b in zip(out, want))
+
+
+@pytest.mark.parametrize("tokens", [8, 13, 1027])
+def test_latent_row_shard_in_the_split_op_shards_its_input(logged, monkeypatch, tokens):
+    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "4")
+    w = _weights()
+    blocks = [_block(w, rank, []) for rank in range(WORLD)]
+    _merge_front(monkeypatch, blocks)
+    gen = torch.Generator().manual_seed(tokens)
+    x = torch.randn(tokens, HIDDEN, generator=gen).to(torch.bfloat16)
+
+    def forward(rank):
+        return blocks[rank].single_stream_split_moe_forward(x)
+
+    replicated = logged(forward)
+    monkeypatch.setenv("ATOM_KIMI_K3_MOE_LATENT_ROW_SHARD", "1")
+    sharded = logged(forward)
+
+    chunk = -(-tokens // WORLD)
+    for (want, want_log), (got, log) in zip(replicated, sharded):
+        assert log == [("front_rows", chunk), ("all_gather", chunk)] + want_log
+        torch.testing.assert_close(got[0], want[0])
+        assert not got[1].any()
 
 
 @pytest.mark.parametrize(
