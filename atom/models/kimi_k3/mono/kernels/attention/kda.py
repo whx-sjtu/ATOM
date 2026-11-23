@@ -50,6 +50,7 @@ from atom.models.kimi_k3.mono.sources import SOURCES
 from atom.mono.device import gemv
 from atom.mono.device.ops import (
     CM_DEV,
+    CM_SYS,
     bf_hi,
     bf_lo,
     butterflies,
@@ -284,6 +285,13 @@ class KdaPreBuild:
     # a timing bench's ablation (``ABLATE_*`` bits; wrong outputs), 0 serving.
     # Only a build that sets it names it (``symbol``)
     ablate: int = field(default=0, metadata={"sym": "ab"})
+    # the x rows in the cached ``xc`` buffer, not the uncached plain region:
+    # every GEMV CTA reads all of them, so uncached that is 197 copies a layer
+    # from memory; cached, an XCD's first reader fills its L2 for the rest.
+    # Written through (system scope) before XRDY, read only past it, and no
+    # CU of the launch has read the buffer before (a launch starts with its
+    # caches invalidated): no reader can hold a stale line
+    x_cached: bool = field(default=False, metadata={"sym": "xc"})
 
 
 # ``KdaPreBuild.ablate``: a path compiled away, its cost read off the time left
@@ -292,13 +300,17 @@ ABLATE_WEIGHTS = 2  # the GEMV's weight operands zeros, never loaded
 ABLATE_ATTN = 4  # no AttnRes, and the GEMV waits for no x (XRDY)
 ABLATE_X = 8  # the GEMV's x rows zeros, never loaded (their LDS staging kept)
 
+# fields a build names only when set, so a serving build's symbol (and LLVM's
+# register choice with it) is the one it had before they existed
+_UNNAMED_OFF = ("ablate", "x_cached")
+
 
 def symbol(key: KdaPreBuild) -> str:
-    """``key``'s kernel symbol; ``ablate`` named only when set, so a serving
-    build's symbol (and LLVM's register choice with it) is unchanged."""
+    """``key``'s kernel symbol (``_UNNAMED_OFF``)."""
     sym = symbol_params(key)
-    if not key.ablate:
-        del sym["ab"]
+    for f in _UNNAMED_OFF:
+        if not getattr(key, f):
+            del sym[KdaPreBuild.__dataclass_fields__[f].metadata["sym"]]
     return kernel_symbol("k3_mono_kda_pre", **sym)
 
 
@@ -339,6 +351,9 @@ ABI = KernelAbi(
         "plain",
         "layer",
         "tl",
+        # ``x_cached``'s x rows (cached device memory; unread without). Last:
+        # every other argument keeps its kernarg offset
+        "xc",
     )
 )
 
@@ -373,6 +388,11 @@ def plain_layout(key: KdaPreBuild) -> dict:
 
 def plain_bytes(key: KdaPreBuild) -> int:
     return max(o + n for o, n in plain_layout(key).values())
+
+
+def x_rows(key: KdaPreBuild, plain, xc):
+    """The x rows' address: ``xc`` (``x_cached``), else the plain region's."""
+    return xc if key.x_cached else plain + fx.Int64(plain_layout(key)["x"][0])
 
 
 def ld_bf(ptr, i, cm=0):
@@ -615,9 +635,11 @@ def stage_mix(c, task):
     r = hw_rsq(tot * fx.Float32(1.0 / HIDDEN) + fx.Float32(c["out_eps"]))
     wn = ld_bf4(a["in_nw"], c0 + cc)
     xw = bf4_words([mixed[j] * r * wn[j] for j in range(4)])
+    # K2's and the MLA back's seams (no ``x_cached``) store to the plain region
+    x_store_cm = CM_SYS if c.get("x_cached", False) else CM_DEV
     if mine:
         at = (t * HIDDEN + c0 + cc) // 2
-        bo.buffer_store(xw, rsrc(c["xbuf"]), at, cache_modifier=CM_DEV)
+        bo.buffer_store(xw, rsrc(c["xbuf"]), at, cache_modifier=x_store_cm)
         if const_expr(c["debug"]):
             bo.buffer_store(xw, rsrc(a["x_dbg"]), at)
     publish(c["put"], c["xrdy"], task, fx.Int32(1), tid == 0)
@@ -690,10 +712,15 @@ def x_chunk(c, i0: int, ni: int, e):
             (t * HIDDEN + i0 * KGROUP + k) // 8 * 4,
             vec_width=4,
             dtype=T.i32,
-            cache_modifier=CM_DEV,
+            cache_modifier=x_cm(c),
         )
     )
     return v, c["xl"] + (t * c["xrow"] + k) // 2
+
+
+def x_cm(c):
+    """The x rows' load policy: cached (``x_cached``), else device scope."""
+    return 0 if c["x_cached"] else CM_DEV
 
 
 X_BATCH = 16  # the x wave's 16 B loads in flight (64 VGPRs: no weights yet)
@@ -815,7 +842,7 @@ def x_unit_loads(c, i0, n):
     """A thread's chunks of column groups i0 .. i0 + n of the (group's) x rows."""
     if const_expr(c["ablate"] & ABLATE_X):
         return [fx.Vector.filled(4, 0, fx.Int32) for _ in range(-(-c["S"] * n * KGROUP // 8 // THREADS))]
-    return gemv.rows_loads(c["tid"], c["xbuf"], c["S"], n * KGROUP, HIDDEN, i0 * KGROUP)
+    return gemv.rows_loads(c["tid"], c["xbuf"], c["S"], n * KGROUP, HIDDEN, i0 * KGROUP, x_cm(c))
 
 
 def x_unit_store(c, xs, n, buf):
@@ -1726,6 +1753,7 @@ def build(key: KdaPreBuild):
         plain: Int64,
         layer: Int32,
         tl: Int64,
+        xc: Int64,
     ):
         _ = keyed
         tid = fx.thread_idx.x
@@ -1775,13 +1803,14 @@ def build(key: KdaPreBuild):
             "unit": key.gemv_unit,
             "x_ahead": key.x_ahead,
             "ablate": key.ablate,
+            "x_cached": key.x_cached,
             "vloc": kl.vloc.ptr,
             "ol": kl.ol.ptr,
             "onl": kl.onl.ptr,
             "beta": kl.beta.ptr,
             "kda_head": head,
             "hparts": head_parts(s, L) if head else 1,
-            "xbuf": plain + fx.Int64(plain_layout(key)["x"][0]),
+            "xbuf": x_rows(key, plain, xc),
             "args": {
                 "prefix": prefix,
                 "delta": delta,
@@ -1918,6 +1947,7 @@ def build(key: KdaPreBuild):
         plain: Int64,
         layer: Int32,
         tl: Int64,
+        xc: Int64,
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
@@ -1953,6 +1983,7 @@ def build(key: KdaPreBuild):
             plain,
             layer,
             tl,
+            xc,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     ABI.check(kda_pre, launch)
