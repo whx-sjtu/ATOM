@@ -97,6 +97,10 @@ from atom.model_ops.sparse_indexer_fp4 import (
     fp4_index_scale_rows,
     sparse_indexer_fp4_enabled,
 )
+from atom.model_ops.sparse_mla_work_plan import (
+    plan_whole_rows,
+    whole_row_plan_rows_per_cu,
+)
 from atom.utils import CpuGpuBuffer, envs, upload_numpy
 from atom.utils.block_convert import (
     decompose_slots_triton,
@@ -388,6 +392,61 @@ class AiterMLABackend(AttentionBackend):
     @staticmethod
     def get_impl_cls() -> type["MLAAttention"]:
         return MLAAttention
+
+
+def _aiter_sparse_prefill_plan(
+    builder, attn_metadata, num_heads, last_page_lens, work
+) -> None:
+    get_mla_metadata_v1(
+        attn_metadata.sparse_cu_seqlens_q,
+        attn_metadata.sparse_kv_indptr,
+        last_page_lens,
+        num_heads,
+        1,  # nhead_kv
+        True,
+        work["work_meta_data"],
+        work["work_info_set"],
+        work["work_indptr"],
+        work["reduce_indptr"],
+        work["reduce_final_map"],
+        work["reduce_partial_map"],
+        page_size=builder.block_size,
+        dtype_q=builder.dtype_q,
+        dtype_kv=builder.dtype_kv,
+        # No row selects more than index_topk_out keys.
+        kv_granularity=builder._sparse_prefill_kv_granularity,
+        max_seqlen_qo=1,
+        uni_seqlen_qo=1,
+        fast_mode=1,
+        max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
+    )
+
+
+def _check_whole_row_plan(
+    builder, attn_metadata, num_heads, last_page_lens, work, ref
+) -> None:
+    """Once a process: hold the first whole-row plan to aiter's, made on
+    ``ref``, copies of the buffers from before either plan, and plan with
+    aiter from then on if they differ (say a card whose workgroup count is
+    not the buffer's)."""
+    _aiter_sparse_prefill_plan(builder, attn_metadata, num_heads, last_page_lens, ref)
+    meta = work["work_meta_data"].view(torch.int64)[:2].tolist()
+    same = meta == [
+        work["work_indptr"].data_ptr(),
+        work["work_info_set"].data_ptr(),
+    ] and all(
+        torch.equal(work[name], ref[name]) for name in work if name != "work_meta_data"
+    )
+    builder._whole_row_plan_checked = True
+    builder._whole_row_plan_ok = same
+    if not same:
+        logger.warning(
+            "ATOM_MLA_SPARSE_PREFILL_ROW_PLAN: the whole-row plan differs "
+            "from get_mla_metadata_v1's; planning with aiter instead"
+        )
+        _aiter_sparse_prefill_plan(
+            builder, attn_metadata, num_heads, last_page_lens, work
+        )
 
 
 class AiterMLAMetadataBuilder(CommonAttentionBuilder):
@@ -2397,29 +2456,35 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             name: var[f"{prefix}sparse_prefill_{name}"]
             for name in PERSISTENT_WORK_BUFFERS
         }
-        get_mla_metadata_v1(
-            attn_metadata.sparse_cu_seqlens_q,
-            attn_metadata.sparse_kv_indptr,
-            last_page_lens,
-            num_heads,
-            1,  # nhead_kv
-            True,
-            work["work_meta_data"],
-            work["work_info_set"],
-            work["work_indptr"],
-            work["reduce_indptr"],
-            work["reduce_final_map"],
-            work["reduce_partial_map"],
-            page_size=self.block_size,
-            dtype_q=self.dtype_q,
-            dtype_kv=self.dtype_kv,
-            # No row selects more than index_topk_out keys.
-            kv_granularity=self._sparse_prefill_kv_granularity,
-            max_seqlen_qo=1,
-            uni_seqlen_qo=1,
-            fast_mode=1,
-            max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
-        )
+        kv_indptr = attn_metadata.sparse_kv_indptr
+        rows_per_cu = None
+        if (
+            envs.ATOM_MLA_SPARSE_PREFILL_ROW_PLAN
+            and getattr(self, "_whole_row_plan_ok", True)
+            and self.block_size == 1
+        ):
+            # The row lengths come from the host copy the indptr was built from.
+            host = var.get(f"{prefix}sparse_kv_indptr")
+            if host is not None and kv_indptr.data_ptr() == host.gpu.data_ptr():
+                rows = kv_indptr.numel() - 1
+                rows_per_cu = whole_row_plan_rows_per_cu(
+                    host.np[: rows + 1],
+                    self._sparse_prefill_kv_granularity,
+                    work["work_indptr"].numel() - 1,
+                )
+        if rows_per_cu is None:
+            _aiter_sparse_prefill_plan(
+                self, attn_metadata, num_heads, last_page_lens, work
+            )
+        else:
+            ref = None
+            if not getattr(self, "_whole_row_plan_checked", False):
+                ref = {name: buffer.clone() for name, buffer in work.items()}
+            plan_whole_rows(kv_indptr, rows, rows_per_cu, work)
+            if ref is not None:
+                _check_whole_row_plan(
+                    self, attn_metadata, num_heads, last_page_lens, work, ref
+                )
         for name, buffer in work.items():
             setattr(attn_metadata, f"sparse_prefill_{name}", buffer)
 
