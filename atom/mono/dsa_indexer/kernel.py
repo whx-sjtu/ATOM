@@ -86,6 +86,8 @@ MAX_TOKENS = build_plan.MAX_TOKENS
 MAX_VERIFY_TOKENS = build_plan.MAX_VERIFY_TOKENS
 dual_score_shape = build_plan.dual_score_shape
 DC1_ALL = build_plan.DC1_ALL
+DC1_PACKED_HIST = build_plan.DC1_PACKED_HIST
+PACKED_HIST_MIN_ROWS = build_plan.PACKED_HIST_MIN_ROWS
 
 SOURCES = source_digest("mono")
 Q_AMAX_SEED = 1e-10

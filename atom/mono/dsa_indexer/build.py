@@ -38,6 +38,9 @@ DC1_ALL = (
     | DC1_EARLY_W
     | DC1_JOINT_POLL
 )
+# ``packed_hist`` from this many rows a step: with fewer, packing the pushes
+# costs more than their smaller size saves
+PACKED_HIST_MIN_ROWS = 20
 
 
 def local_step_symbol(rows, qlen, world, compact, debug=False):

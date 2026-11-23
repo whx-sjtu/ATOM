@@ -72,6 +72,9 @@ class IndexerBinding:
                 or rows in DUAL_SCORE_ROWS
             )
         )
+        dc1 = self.dc1
+        if rows < kix.PACKED_HIST_MIN_ROWS:
+            dc1 &= ~kix.DC1_PACKED_HIST
         key = kix.IxBuild(
             self.shape,
             rows,
@@ -81,9 +84,9 @@ class IndexerBinding:
             qlen=qlen,
             score_blocks=2 * BLOCKS if dual else BLOCKS,
             short_gemm=self.short_gemm,
-            dc1=self.dc1,
+            dc1=dc1,
         )
-        if self.dc1 and kix.unfit(key):
+        if key.dc1 and kix.unfit(key):
             key = replace(key, dc1=0)
         return key
 
