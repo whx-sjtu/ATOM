@@ -607,14 +607,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Sparse DCP decode on the one-row-a-workgroup template: skip aiter's split
     # reduce. Every work item of that template holds a whole row and writes o
     # and the LSE itself, so the reduce has no partials and only costs a launch;
-    # outputs are bit-identical. Rebuilt plans keep it. Off by default.
+    # outputs are bit-identical. Rebuilt plans keep it. On by default; 0 runs
+    # the reduce.
     "ATOM_DMLA_MLA_NO_REDUCE": lambda: (
-        os.getenv("ATOM_DMLA_MLA_NO_REDUCE", "0") == "1"
+        os.getenv("ATOM_DMLA_MLA_NO_REDUCE", "1") == "1"
     ),
     # BF16 V up-projection (W_V absorb bmm) over at most 128 rows: a 32x64x128
     # tile instead of aiter's 128x128x32 fallback. K stays one slice walked in
-    # order; outputs measured bit-identical. Off by default.
-    "ATOM_DMLA_WV_BMM_TILE": lambda: (os.getenv("ATOM_DMLA_WV_BMM_TILE", "0") == "1"),
+    # order; outputs measured bit-identical. On by default; 0 keeps aiter's.
+    "ATOM_DMLA_WV_BMM_TILE": lambda: (os.getenv("ATOM_DMLA_WV_BMM_TILE", "1") == "1"),
     # Unquantized BF16 attn_res in decode steps: take a layer's B+1 candidates
     # in one tile (BL = next_pow2(B+1), at most 16) instead of two at a time.
     # Prefill and a column-gathered mix (the MoE column tail, whose bank tiles
@@ -668,10 +669,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_MLA_SPARSE_PREFILL_ROW_PLAN", "1") == "1"
     ),
     # Mono DSA indexer: bit-identical kernel options (``IxBuild.dc1``, a mask;
-    # ``atom/mono/dsa_indexer/build.py`` DC1_*). 0 (default) is the kernel as before;
-    # a build the mask does not fit runs with 0.
+    # ``atom/mono/dsa_indexer/build.py`` DC1_*). On by default (3315); 0 is the
+    # kernel as before; a build the mask does not fit runs with 0.
     "ATOM_MONO_DSA_INDEXER_OPT": lambda: int(
-        os.getenv("ATOM_MONO_DSA_INDEXER_OPT", "0") or "0", 0
+        os.getenv("ATOM_MONO_DSA_INDEXER_OPT", "3315") or "0", 0
     ),
     # GLM-5.2 (glm_moe_dsa): enable the fused indexer qk-rope + fp8-quant + kv-cache
     # kernel (indexer_qk_rope_quant_and_cache), same path DeepSeek-V3.2 uses. GLM's
@@ -763,13 +764,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Kimi-K3 mono K1: at two token groups with a short second one, the GEMV's
     # weights two column groups ahead (kda.gemv_staging). Same sums. 0 turns it off.
     "ATOM_MONO_K1_W_AHEAD": lambda: os.getenv("ATOM_MONO_K1_W_AHEAD", "1") == "1",
-    # Kimi-K3 mono K1's KDA tail hand-offs (kda.KDA_TAIL), each the same sums:
+    # Kimi-K3 mono K1's KDA tail hand-offs (kda.KDA_TAIL), each the same sums;
+    # 0 turns one off:
     # a chunk task's q / k from its own conv of the head, not the QK hand-off
-    "ATOM_MONO_K1_OWN_QK": lambda: os.getenv("ATOM_MONO_K1_OWN_QK", "0") == "1",
+    "ATOM_MONO_K1_OWN_QK": lambda: os.getenv("ATOM_MONO_K1_OWN_QK", "1") == "1",
     # a task's f_b rows and ReplaySSM records issued with its other inputs
-    "ATOM_MONO_K1_EARLY_IN": lambda: os.getenv("ATOM_MONO_K1_EARLY_IN", "0") == "1",
+    "ATOM_MONO_K1_EARLY_IN": lambda: os.getenv("ATOM_MONO_K1_EARLY_IN", "1") == "1",
     # a head split over parts writes its conv state after the norm's poll
-    "ATOM_MONO_K1_CS_LATE": lambda: os.getenv("ATOM_MONO_K1_CS_LATE", "0") == "1",
+    "ATOM_MONO_K1_CS_LATE": lambda: os.getenv("ATOM_MONO_K1_CS_LATE", "1") == "1",
     # gfx950 mono mailbox retry spacing in s_sleep units (1..127, unset: 16).
     # Read and checked by atom/mono/polling.py at import, which needs no ATOM
     # import; 1 restores the pre-backoff polling (ROCm/ATOM#3369).
@@ -906,9 +908,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # DSA MTP verify: skip the step's dense persistent MLA plan when no layer
     # decodes off it (no dense MLA layer in the target or a non-block drafter).
-    # Off by default.
+    # On by default; 0 always builds it.
     "ATOM_MLA_SKIP_UNREAD_DENSE_PLAN": lambda: _flag_env(
-        "ATOM_MLA_SKIP_UNREAD_DENSE_PLAN"
+        "ATOM_MLA_SKIP_UNREAD_DENSE_PLAN", "1"
     ),
     # Build the Kimi-K3 DSpark block's DCP-sharded MLA metadata (positions,
     # slots, ctx_lens, kv_indptr, pad-tail kv_indices) in one Triton program
@@ -925,25 +927,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Kimi-K3 DSpark draft: its MLA layers' BF16 W_K absorb bmm of <= 64 rows per
     # head on gfx950 takes an explicit Triton tile instead of aiter's untuned
-    # default. The target's layers keep aiter's. Same output. Off by default.
+    # default. The target's layers keep aiter's. Same output. On by default; 0
+    # keeps aiter's tile.
     "ATOM_MLA_BF16_ABSORB_BMM_CONFIG": lambda: _flag_env(
-        "ATOM_MLA_BF16_ABSORB_BMM_CONFIG"
+        "ATOM_MLA_BF16_ABSORB_BMM_CONFIG", "1"
     ),
     # MTP verify: the host builds each verification row's request index and
     # temperature with the step's other spec-decode indices, so the sampler's
     # verification draw skips its arange / searchsorted / gather launches. Same
-    # rows, same values. Read at drafter construction.
-    "ATOM_SPEC_VERIFY_HOST_ROWS": lambda: _flag_env("ATOM_SPEC_VERIFY_HOST_ROWS"),
+    # rows, same values. Read at drafter construction. On by default; 0 keeps
+    # the device lookup.
+    "ATOM_SPEC_VERIFY_HOST_ROWS": lambda: _flag_env("ATOM_SPEC_VERIFY_HOST_ROWS", "1"),
     # MTP verify: one index_select of the bonus and target logits rows, from a
     # host-built index of both, instead of one each. Same rows. Read at drafter
-    # construction.
-    "ATOM_SPEC_VERIFY_ONE_GATHER": lambda: _flag_env("ATOM_SPEC_VERIFY_ONE_GATHER"),
+    # construction. On by default; 0 keeps the two gathers.
+    "ATOM_SPEC_VERIFY_ONE_GATHER": lambda: _flag_env(
+        "ATOM_SPEC_VERIFY_ONE_GATHER", "1"
+    ),
     # MTP verify of a sampled batch under TP: broadcast rank 0's verification
     # and bonus draws together, so every rank verifies the same two draws and
     # emits rank 0's ids without the second broadcast. Every rank still makes
-    # both draws. Same ids and verdict. Read at runner construction.
+    # both draws. Same ids and verdict. Read at runner construction. On by
+    # default; 0 keeps the two broadcasts.
     "ATOM_SPEC_VERIFY_ONE_BROADCAST": lambda: _flag_env(
-        "ATOM_SPEC_VERIFY_ONE_BROADCAST"
+        "ATOM_SPEC_VERIFY_ONE_BROADCAST", "1"
     ),
     # Lossless speculative sampling: the DSpark draft samples its block from q
     # and the verify accepts by the probability ratio (u * q < p). Off by
@@ -990,8 +997,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_REPLAYSSM_ROUTE": lambda: os.getenv("ATOM_REPLAYSSM_ROUTE", "auto").lower(),
     # Spec decode: write the linear-attention spec masks, query start loc and
     # accepted-count padding, and advance the ReplaySSM record cursor, in one
-    # launch instead of six. Same values. Read at builder construction.
-    "ATOM_GDN_FUSED_SPEC_TAIL": lambda: _flag_env("ATOM_GDN_FUSED_SPEC_TAIL"),
+    # launch instead of six. Same values. Read at builder construction. On by
+    # default; 0 keeps the six launches.
+    "ATOM_GDN_FUSED_SPEC_TAIL": lambda: _flag_env("ATOM_GDN_FUSED_SPEC_TAIL", "1"),
     # "fp32" | "fp16" | "bf16".  Storage dtype of the KDA temporal state pool,
     # whose per-token traffic dominates KDA decode; the recurrence itself
     # always accumulates in fp32.  fp16 over bf16 when narrowing: the state is
@@ -1003,16 +1011,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Prefill causal conv1d (channel-last, no prefix caching) with a
     # [tokens x channels] tile per program instead of the 8-token row kernel.
-    # Bit-identical output at Kimi-K3's shape (width 4, no bias); off by default.
+    # Bit-identical output at Kimi-K3's shape (width 4, no bias). On by
+    # default; 0 keeps the row kernel.
     "ATOM_CONV1D_TILED_PREFILL": lambda: (
-        os.getenv("ATOM_CONV1D_TILED_PREFILL", "0") == "1"
+        os.getenv("ATOM_CONV1D_TILED_PREFILL", "1") == "1"
     ),
     # Kimi-K3 KDA prefill reads and writes the recurrent state in the slot pool
     # directly (FlashKDA's paged state_cache) instead of gathering it, copying
     # it K-first and scattering the final state back. Steps with a state fork
-    # or interior checkpoints keep the gather path. Bit-identical. Off by default.
+    # or interior checkpoints keep the gather path. Bit-identical. On by
+    # default; 0 always gathers.
     "ATOM_KDA_PREFILL_PAGED_STATE": lambda: (
-        os.getenv("ATOM_KDA_PREFILL_PAGED_STATE", "0") == "1"
+        os.getenv("ATOM_KDA_PREFILL_PAGED_STATE", "1") == "1"
     ),
     # Kimi-K3 KDA prefill with several sequences sizes FlashKDA's segments on
     # the step's total chunks rather than its longest sequence
@@ -1024,9 +1034,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # gfx950 FlashKDA pass A always on its wide tile (BW=64, 4 warps), which
     # FlashKDA reserves for grids above 2 blocks per CU. Same per-element
-    # arithmetic, bit-identical. Off by default.
+    # arithmetic, bit-identical. On by default; 0 keeps FlashKDA's choice.
     "ATOM_KDA_PREFILL_K2AB_WIDE": lambda: (
-        os.getenv("ATOM_KDA_PREFILL_K2AB_WIDE", "0") == "1"
+        os.getenv("ATOM_KDA_PREFILL_K2AB_WIDE", "1") == "1"
     ),
     # gfx950 FlashKDA pass B as the prefetching scan (FlashKDA's gfx1250
     # default). Changes numerics (scan schedule). Off by default.
@@ -1329,8 +1339,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_MOE_ELIDE_FULL_ROW_COUNT", "1").lower() == "1"
     ),
     # The next residual mix reads a row-sharded step's zero addends as one zero row.
+    # Bit-identical output. On by default; 0 reads the zero tensors themselves.
     "ATOM_KIMI_K3_ATTN_RES_SKIP_ZERO_ADDENDS": lambda: (
-        os.getenv("ATOM_KIMI_K3_ATTN_RES_SKIP_ZERO_ADDENDS", "0") == "1"
+        os.getenv("ATOM_KIMI_K3_ATTN_RES_SKIP_ZERO_ADDENDS", "1") == "1"
     ),
     # Fuse into a per-rank replica without EPLB. EPLB always fuses it as routed.
     "ATOM_FUSE_SHARED_EXPERT": lambda: (

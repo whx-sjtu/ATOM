@@ -56,6 +56,12 @@ def test_an_opted_in_layer_gets_the_tile(monkeypatch, gfx950, rows):
     assert "SPLITK_BLOCK_SIZE" not in MLAAttention._BF16_ABSORB_BMM_CONFIG
 
 
+def test_on_by_default(monkeypatch, gfx950):
+    monkeypatch.delenv("ATOM_MLA_BF16_ABSORB_BMM_CONFIG", raising=False)
+    assert _kwargs(_layer(True), 48, 128)["backend"] == "triton"
+    assert _kwargs(_layer(False), 48, 128) == {}
+
+
 @pytest.mark.parametrize(
     "opted_in, flag, rows, k, on_gfx950",
     [

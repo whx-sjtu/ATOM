@@ -441,6 +441,24 @@ def test_malformed_offload_timeout_names_the_variable(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "name",
+    [
+        "ATOM_SPEC_VERIFY_HOST_ROWS",
+        "ATOM_SPEC_VERIFY_ONE_GATHER",
+        "ATOM_SPEC_VERIFY_ONE_BROADCAST",
+        "ATOM_GDN_FUSED_SPEC_TAIL",
+    ],
+)
+def test_n1_launch_switches_default_on(monkeypatch, name):
+    """The bit-exact MTP verify / GDN spec tail launch switches are on unless
+    set to 0."""
+    monkeypatch.delenv(name, raising=False)
+    assert getattr(_get_envs(), name) is True
+    monkeypatch.setenv(name, "0")
+    assert getattr(_get_envs(), name) is False
+
+
+@pytest.mark.parametrize(
     "value,expected",
     [(None, False), ("0", False), ("1", True), ("TRUE", True), ("false", False)],
 )
@@ -454,3 +472,12 @@ def test_otel_version_environment(monkeypatch):
     assert _get_envs().ATOM_TRACE_VERSION == "unknown"
     monkeypatch.setenv("ATOM_TRACE_VERSION", "build-test")
     assert _get_envs().ATOM_TRACE_VERSION == "build-test"
+
+
+@pytest.mark.parametrize("name", ["ATOM_DMLA_MLA_NO_REDUCE", "ATOM_DMLA_WV_BMM_TILE"])
+def test_dmla_decode_switches_default_on(monkeypatch, name):
+    """The adopted DMLA decode switches are on unless set to 0."""
+    monkeypatch.delenv(name, raising=False)
+    assert getattr(_get_envs(), name) is True
+    monkeypatch.setenv(name, "0")
+    assert getattr(_get_envs(), name) is False

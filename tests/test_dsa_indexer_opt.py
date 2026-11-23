@@ -2,7 +2,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """ATOM_MONO_DSA_INDEXER_OPT, the Mono DSA indexer's bit-identical options:
 the mask reaches every width's build, option 2 only from PACKED_HIST_MIN_ROWS
-rows a step, and a build the mask does not fit runs with 0."""
+rows a step, and a build the mask does not fit runs with 0. On by default
+(3315); 0 turns it off."""
 
 from dataclasses import replace
 
@@ -14,6 +15,7 @@ pytest.importorskip("aiter", reason="the binding imports aiter.dist")
 from atom.mono.dsa_indexer import kernel as kix
 from atom.mono.dsa_indexer.bind import IndexerBinding
 from atom.mono.dsa_indexer.plan import IndexerShape
+from atom.utils import envs
 
 SHAPE = IndexerShape(32, 128, 2048, 1536, "bf16", "fp4", 64, 0)  # Kimi-K3's
 MAX_CTX = 1048576
@@ -39,3 +41,15 @@ def test_a_mask_the_build_does_not_fit_runs_with_0():
     # 64 and 128 need DCP
     assert kix.unfit(replace(key, dc1=MASK))
     assert key.dc1 == 0
+
+
+def test_on_by_default(monkeypatch):
+    monkeypatch.delenv("ATOM_MONO_DSA_INDEXER_OPT", raising=False)
+    assert envs.ATOM_MONO_DSA_INDEXER_OPT == MASK
+    assert not MASK & ~kix.DC1_ALL
+
+
+def test_zero_turns_it_off(monkeypatch):
+    monkeypatch.setenv("ATOM_MONO_DSA_INDEXER_OPT", "0")
+    assert envs.ATOM_MONO_DSA_INDEXER_OPT == 0
+    assert _binding(envs.ATOM_MONO_DSA_INDEXER_OPT).key(60, 5).dc1 == 0

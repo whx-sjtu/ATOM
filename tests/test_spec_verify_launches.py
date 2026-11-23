@@ -123,6 +123,18 @@ def test_off_keeps_the_metadata_buffers_and_counts(monkeypatch):
     assert metadata.verify_logits_indices is None
 
 
+def test_on_by_default_the_drafter_stages_both(monkeypatch):
+    _drafter(monkeypatch, host_rows=True, one_gather=True)
+    monkeypatch.delenv("ATOM_SPEC_VERIFY_HOST_ROWS")
+    monkeypatch.delenv("ATOM_SPEC_VERIFY_ONE_GATHER")
+    buffers = mods.drafter.Drafter._allocate_metadata_buffers(8, 4, "cpu")
+    assert {
+        "verify_request_indices",
+        "verify_temperatures",
+        "verify_logits_indices",
+    } <= set(buffers)
+
+
 def test_the_verification_draw_takes_host_rows_without_a_device_lookup(monkeypatch):
     Sampler = mods.sampler.Sampler
     seen = []

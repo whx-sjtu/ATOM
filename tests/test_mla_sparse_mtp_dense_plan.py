@@ -82,8 +82,15 @@ def _finish(monkeypatch, runner, is_dummy_run=False):
     return built, md
 
 
+def test_on_by_default_kimi_k3_dspark_skips_it(monkeypatch):
+    monkeypatch.delenv("ATOM_MLA_SKIP_UNREAD_DENSE_PLAN", raising=False)
+    built, md = _finish(monkeypatch, _runner(_model(True, True), _dspark()))
+    assert built == [("sparse", 15)]
+    assert md.work_indptr is None
+
+
 @pytest.mark.parametrize("flag", ["", "0"])
-def test_off_by_default_the_dense_plan_is_built(monkeypatch, flag):
+def test_switched_off_the_dense_plan_is_built(monkeypatch, flag):
     monkeypatch.setenv("ATOM_MLA_SKIP_UNREAD_DENSE_PLAN", flag)
     built, md = _finish(monkeypatch, _runner(_model(True, True), _dspark()))
     assert built == [("dense", 4, 5), ("sparse", 15)]

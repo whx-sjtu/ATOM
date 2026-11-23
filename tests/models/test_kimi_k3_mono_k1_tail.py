@@ -24,11 +24,11 @@ SYMS = {"own_qk": "oq", "early_in": "ei", "cs_late": "cl"}
 
 
 @pytest.mark.parametrize("name", sorted(SWITCHES))
-def test_default_is_off(monkeypatch, name):
+def test_default_is_on(monkeypatch, name):
     monkeypatch.delenv(name, raising=False)
-    assert not getattr(envs, name)
-    monkeypatch.setenv(name, "1")
     assert getattr(envs, name)
+    monkeypatch.setenv(name, "0")
+    assert not getattr(envs, name)
 
 
 def test_the_switches_are_build_fields():
