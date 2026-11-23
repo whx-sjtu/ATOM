@@ -2348,7 +2348,7 @@ class KimiDecoderLayer(nn.Module):
 
     def _ffn(
         self, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor | ColumnTail, torch.Tensor | None]:
         """Run the FFN, returning split MoE branches or its row-tail sum and zero.
 
         The next apply_attn_res folds a returned second tensor into its prefix
@@ -2363,7 +2363,7 @@ class KimiDecoderLayer(nn.Module):
         attn_out: torch.Tensor,
         prefix_sum: torch.Tensor | None,
         block_residual: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | ColumnTail, torch.Tensor | None]:
         """mlp_attn_res and the FFN on the reduced attention output; returns
         ``(prefix_sum, ffn_out, shared)``."""
         hidden_states, prefix_sum = self.mlp_attn_res(
@@ -2377,10 +2377,15 @@ class KimiDecoderLayer(nn.Module):
         attn_out: torch.Tensor,
         prefix_sum: torch.Tensor | None,
         block_residual: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | ColumnTail, torch.Tensor | None]:
         """`_mlp` on the attention's output, which is o_proj's partial sum
         on a `post_attention_op` layer."""
         if self.post_attention_op:
+            moe = self.block_sparse_moe
+            if moe.column_gather_name and moe._can_defer_column_tail(attn_out):
+                # The typed pending value must stay outside a tensor-only op.
+                reduced = torch.ops.aiter.tbo_all_reduce(attn_out)
+                return self._mlp(reduced, prefix_sum, block_residual)
             return torch.ops.aiter.kimi_k3_post_attention_forward(
                 attn_out, prefix_sum, block_residual, self.layer_name
             )
@@ -2392,6 +2397,24 @@ class KimiDecoderLayer(nn.Module):
         prefix_sum: torch.Tensor | None,
         block_residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Tensor-only boundary: materialize columns and absent addends."""
+        prefix, first, second = self._post_attention_parts(
+            attn_partial, prefix_sum, block_residual
+        )
+        first = materialize_column_output(first)
+        second = materialize_column_output(second)
+        return (
+            prefix,
+            torch.zeros_like(prefix) if first is None else first,
+            torch.zeros_like(prefix) if second is None else second,
+        )
+
+    def _post_attention_parts(
+        self,
+        attn_partial: torch.Tensor,
+        prefix_sum: torch.Tensor | None,
+        block_residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | ColumnTail | None, torch.Tensor | None]:
         """Reduce o_proj's partial and run residual/MoE, locally on sharded steps.
 
         Sharded steps gather the normalized MoE input, then its tail gathers
@@ -2629,6 +2652,11 @@ class KimiLinearModel(nn.Module):
         else:
             self.norm = PPMissingLayer()
 
+        # The loader visits parents first. Register this last, after front merges.
+        self._column_gather_setup = _ColumnGatherSetup(
+            lambda: self._init_column_gather(atom_config, prefix)
+        )
+
     def make_empty_intermediate_tensors(
         self, batch_size: int, dtype: torch.dtype, device: torch.device
     ) -> IntermediateTensors:
@@ -2642,10 +2670,6 @@ class KimiLinearModel(nn.Module):
         )
         return IntermediateTensors(
             {"hidden_states": hidden_states, "block_residual": block_residual}
-        )
-        # The loader visits parents first. Register this last, after front merges.
-        self._column_gather_setup = _ColumnGatherSetup(
-            lambda: self._init_column_gather(atom_config, prefix)
         )
 
     def _init_column_gather(self, atom_config: Config, prefix: str) -> None:

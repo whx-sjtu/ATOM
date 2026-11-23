@@ -2,6 +2,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Kimi's rank views, dispatch, and public AITER projection/add contract."""
 
+import ast
+from pathlib import Path
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -154,6 +156,70 @@ def test_summed_tail_has_a_real_fresh_zero_at_the_split_op_boundary(modules):
     _, next_zero = modules.model.KimiSparseMoeBlock._split_op_pair((value, None))
     assert torch.count_nonzero(next_zero) == 0
     assert torch.all(value == 7)
+
+
+@pytest.mark.parametrize("eligible", [True, False], ids=["column", "op"])
+def test_post_attention_op_layer_keeps_column_tail_outside_the_op(
+    modules, monkeypatch, eligible
+):
+    model = modules.model
+    pending = modules.tail.ColumnTail(torch.ones(3, 896), "gather", 8)
+    attn, prefix = torch.ones(3, 7168), torch.zeros(3, 7168)
+    seen = []
+    moe = SimpleNamespace(
+        column_gather_name="gather", _can_defer_column_tail=lambda x: eligible
+    )
+
+    def mlp(reduced, prefix_sum, bank):
+        seen.append(("mlp", reduced))
+        return prefix_sum, pending, None
+
+    def op(*args):
+        seen.append(("op", args[0]))
+        return prefix, torch.zeros_like(prefix), torch.zeros_like(prefix)
+
+    monkeypatch.setattr(
+        torch.ops.aiter, "tbo_all_reduce", lambda x: x * 2, raising=False
+    )
+    monkeypatch.setattr(
+        torch.ops.aiter, "kimi_k3_post_attention_forward", op, raising=False
+    )
+    layer = SimpleNamespace(
+        post_attention_op=True, block_sparse_moe=moe, _mlp=mlp, layer_name="l"
+    )
+    got = model.KimiDecoderLayer._post_attention(layer, attn, prefix, None)
+    assert [name for name, _ in seen] == (["mlp"] if eligible else ["op"])
+    if eligible:
+        assert torch.equal(seen[0][1], attn * 2)
+        assert got[1] is pending and got[2] is None
+    else:
+        assert seen[0][1] is attn and isinstance(got[1], torch.Tensor)
+
+
+def test_model_registers_column_peer_setup_while_building(modules):
+    tree = ast.parse(Path(modules.model.__file__).read_text())
+    cls = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "KimiLinearModel"
+    )
+    init = next(
+        n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__"
+    )
+    assert "self._column_gather_setup = _ColumnGatherSetup(" in ast.unparse(init)
+
+
+def test_post_attention_op_boundary_returns_only_tensors(modules, monkeypatch):
+    model = modules.model
+    pending = modules.tail.ColumnTail(torch.ones(3, 896), "gather", 8)
+    prefix, full = torch.zeros(3, 7168), torch.full((3, 7168), 5.0)
+    monkeypatch.setattr(
+        torch.ops.aiter, "kimi_k3_gather_columns", lambda columns, world: full
+    )
+    layer = SimpleNamespace(_post_attention_parts=lambda *a: (prefix, pending, None))
+    got = model.KimiDecoderLayer.post_attention_forward(layer, prefix, prefix, None)
+    assert got[0] is prefix and got[1] is full
+    assert torch.count_nonzero(got[2]) == 0 and got[2].data_ptr() != prefix.data_ptr()
 
 
 @pytest.fixture
