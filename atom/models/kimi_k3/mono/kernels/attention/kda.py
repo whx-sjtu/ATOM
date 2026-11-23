@@ -290,6 +290,7 @@ class KdaPreBuild:
 ABLATE_KDA = 1  # no KDA tasks: the launch ends with the GEMV
 ABLATE_WEIGHTS = 2  # the GEMV's weight operands zeros, never loaded
 ABLATE_ATTN = 4  # no AttnRes, and the GEMV waits for no x (XRDY)
+ABLATE_X = 8  # the GEMV's x rows zeros, never loaded (their LDS staging kept)
 
 
 def symbol(key: KdaPreBuild) -> str:
@@ -681,6 +682,8 @@ def x_chunk(c, i0: int, ni: int, e):
     local column 0)."""
     cols = ni * KGROUP
     t, k = e // (cols // 8), e % (cols // 8) * 8
+    if const_expr(c["ablate"] & ABLATE_X):
+        return fx.Vector.filled(4, 0, fx.Int32), c["xl"] + (t * c["xrow"] + k) // 2
     v = fx.Vector(
         bo.buffer_load(
             rsrc(c["xbuf"]),
@@ -810,6 +813,8 @@ def units_kg(unit):
 
 def x_unit_loads(c, i0, n):
     """A thread's chunks of column groups i0 .. i0 + n of the (group's) x rows."""
+    if const_expr(c["ablate"] & ABLATE_X):
+        return [fx.Vector.filled(4, 0, fx.Int32) for _ in range(-(-c["S"] * n * KGROUP // 8 // THREADS))]
     return gemv.rows_loads(c["tid"], c["xbuf"], c["S"], n * KGROUP, HIDDEN, i0 * KGROUP)
 
 
