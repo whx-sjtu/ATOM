@@ -836,7 +836,10 @@ def units_kg(unit):
 def x_unit_loads(c, i0, n):
     """A thread's chunks of column groups i0 .. i0 + n of the (group's) x rows."""
     if const_expr(c["ablate"] & ABLATE_X):
-        return [fx.Vector.filled(4, 0, fx.Int32) for _ in range(-(-c["S"] * n * KGROUP // 8 // THREADS))]
+        return [
+            fx.Vector.filled(4, 0, fx.Int32)
+            for _ in range(-(-c["S"] * n * KGROUP // 8 // THREADS))
+        ]
     return gemv.rows_loads(c["tid"], c["xbuf"], c["S"], n * KGROUP, HIDDEN, i0 * KGROUP)
 
 
