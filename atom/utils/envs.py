@@ -848,6 +848,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSPARK_FUSED_MARKOV_SAMPLE": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_MARKOV_SAMPLE", "1") == "1"
     ),
+    # Build the Kimi-K3 DSpark block's DCP-sharded MLA metadata (positions,
+    # slots, ctx_lens, kv_indptr, pad-tail kv_indices) in one Triton program
+    # instead of ~20 torch launches. Same values. Read at proposer construction.
+    "ATOM_DSPARK_FUSED_BLOCK_META": lambda: _flag_env("ATOM_DSPARK_FUSED_BLOCK_META"),
     # Lossless speculative sampling: the DSpark draft samples its block from q
     # and the verify accepts by the probability ratio (u * q < p). Off by
     # default; needs an aiter with ROCm/aiter#6954 under TP; where it arms,

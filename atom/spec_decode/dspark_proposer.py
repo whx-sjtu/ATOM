@@ -46,6 +46,67 @@ def _stage_anchors_kernel(
     tl.store(positions_out + i, tl.load(positions + row, mask=real, other=0))
 
 
+@triton.jit(do_not_specialize=["scheduled_bs", "running_bs"])
+def _dcp_block_meta_kernel(
+    anchor_ptr,  # [running_bs] int64
+    block_tables_ptr,  # [running_bs, n_cols] int32, row-contiguous
+    positions_ptr,  # [running_bs, T] int64
+    slots_ptr,  # [running_bs * T] int64
+    ctx_lens_ptr,  # [running_bs] int32
+    kv_indptr_ptr,  # [running_bs + 1] int32; [0] is never written
+    kv_indices_ptr,  # int32; only the pad rows' entries are written
+    scheduled_bs,
+    running_bs,
+    n_cols: tl.constexpr,
+    T: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    DCP: tl.constexpr,
+    RANK: tl.constexpr,
+    PAD_CTX: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_PAD: tl.constexpr,
+):
+    """`_build_paged_block_metadata`'s DCP-sharded torch chain in one program,
+    value for value: block positions, slots, ctx_lens with the pad tail and
+    the table clamp, the kv_indptr cumsum, and the pad rows' kv_indices (one
+    page-0 entry each, what the generator emits for a row borrowing block 0).
+    Positions are non-negative, so `//` and `%` match torch's floor forms."""
+    b = tl.arange(0, BLOCK_B)
+    t = tl.arange(0, BLOCK_T)
+    row = b < running_bs
+    real = b < scheduled_bs
+    m2 = row[:, None] & (t[None, :] < T)
+    anchor = tl.load(anchor_ptr + b, mask=row, other=0).to(tl.int64)
+    pos = anchor[:, None] + (t[None, :] + 1).to(tl.int64)
+    tl.store(positions_ptr + b[:, None] * T + t[None, :], pos, mask=m2)
+    vblock = BLOCK_SIZE * DCP
+    page = pos // vblock
+    in_table = page < n_cols
+    page = tl.minimum(page, n_cols - 1)
+    entry = tl.load(
+        block_tables_ptr + b[:, None] * n_cols + page,
+        mask=m2 & real[:, None],
+        other=0,
+    )
+    slot = entry.to(tl.int64) * BLOCK_SIZE + (pos % vblock) // DCP
+    keep = in_table & ((pos % DCP) == RANK) & real[:, None]
+    tl.store(slots_ptr + b[:, None] * T + t[None, :], tl.where(keep, slot, -1), mask=m2)
+    ctx = (anchor + (1 + T + DCP - 1 - RANK)) // DCP
+    ctx = tl.where(real, ctx, PAD_CTX)
+    ctx = tl.where(row, tl.minimum(ctx, n_cols * BLOCK_SIZE), 0)
+    tl.store(ctx_lens_ptr + b, ctx.to(tl.int32), mask=row)
+    ends = tl.cumsum(ctx, 0)
+    tl.store(kv_indptr_ptr + 1 + b, ends.to(tl.int32), mask=row)
+    j = tl.arange(0, BLOCK_PAD)
+    pad = (row & ~real)[:, None] & (j[None, :] < ctx[:, None])
+    tl.store(
+        kv_indices_ptr + (ends - ctx)[:, None] + j[None, :],
+        j[None, :].to(tl.int32),
+        mask=pad,
+    )
+
+
 class DSparkProposer(Drafter):
     """DSpark block-parallel drafter (sibling of ``EagleProposer``).
 
@@ -80,6 +141,7 @@ class DSparkProposer(Drafter):
         # unset.
         self.dcp_world_size = get_dcp_world_size()
         self.dcp_rank = get_dcp_rank()
+        self._fused_block_meta = envs.ATOM_DSPARK_FUSED_BLOCK_META
         if self._with_draft:
             self._init_draft_block_buffers()
 
@@ -954,15 +1016,17 @@ class DSparkProposer(Drafter):
         # block -- so the MLA decode runs non-causal. The target rebuilds its
         # own metadata (causal defaults True), so this never leaks back.
         attn_metadata.causal = False
+        fused = self._fused_block_meta_applies(forward_context)
 
         # Filled for the PADDED batch: the backbone runs the pad rows too, so
         # they need positions to embed and rotate.
         block_positions = self._blk_positions[:running_bs]
-        torch.add(
-            anchor_positions.view(running_bs, 1),
-            self._blk_offsets.view(1, T),
-            out=block_positions,
-        )
+        if not fused:
+            torch.add(
+                anchor_positions.view(running_bs, 1),
+                self._blk_offsets.view(1, T),
+                out=block_positions,
+            )
 
         # q_out dtype for the draft's MLA decode, ahead of the dummy return
         # below because that pass needs it just as much: MLA allocates q_out
@@ -988,6 +1052,16 @@ class DSparkProposer(Drafter):
             # that returns here while the pool IS bound leaves the block
             # writing its KV through the last real step's slots. See
             # `_bound_draft_k_cache`.
+            return
+        if fused:
+            self._build_dcp_block_metadata_fused(
+                attn_metadata,
+                anchor_positions,
+                block_positions,
+                dtype_q,
+                scheduled_bs=scheduled_bs,
+                max_seqlen_k=max_seqlen_k,
+            )
             return
 
         block_tables = self.runner.forward_vars["block_tables"].gpu[:running_bs]
@@ -1125,6 +1199,78 @@ class DSparkProposer(Drafter):
         finally:
             if n_pad:
                 block_tables[scheduled_bs:, 0].copy_(saved_page0)
+        self._plan_block_mla(attn_metadata, kv_indptr, dtype_q, running_bs)
+
+    def _fused_block_meta_applies(self, forward_context) -> bool:
+        return (
+            self._fused_block_meta
+            and self._draft_is_dcp_sharded
+            and self.model.block_attention_is_mla
+            and self._bound_draft_k_cache(forward_context) is not None
+        )
+
+    def _build_dcp_block_metadata_fused(
+        self,
+        attn_metadata,
+        anchor_positions: torch.Tensor,  # [running_bs], already padded
+        block_positions: torch.Tensor,  # [running_bs, T], filled here
+        dtype_q,
+        *,
+        scheduled_bs: int,
+        max_seqlen_k: int,
+    ) -> None:
+        """`_build_paged_block_metadata`'s DCP-sharded MLA branch with its
+        torch chain in `_dcp_block_meta_kernel`. The kernel writes the pad
+        tail's page-0 kv_indices itself, so the generator runs over the
+        scheduled rows only and the target's block table is never borrowed."""
+        T = self.draft_tokens_per_seq
+        block_size = self.runner.block_size
+        running_bs = anchor_positions.shape[0]
+        block_tables = self.runner.forward_vars["block_tables"].gpu[:running_bs]
+        slots = self._blk_slots[: running_bs * T]
+        ctx_lens = self._blk_ctx_lens[:running_bs]
+        kv_indptr = self._blk_kv_indptr[: running_bs + 1]
+        pad_ctx = self._paged_pad_ctx_len
+        _dcp_block_meta_kernel[(1,)](
+            anchor_positions,
+            block_tables,
+            block_positions,
+            slots,
+            ctx_lens,
+            kv_indptr,
+            self._blk_kv_indices,
+            scheduled_bs,
+            running_bs,
+            n_cols=block_tables.shape[1],
+            T=T,
+            BLOCK_SIZE=block_size,
+            DCP=self.dcp_world_size,
+            RANK=self.dcp_rank,
+            PAD_CTX=pad_ctx,
+            BLOCK_B=triton.next_power_of_2(running_bs),
+            BLOCK_T=triton.next_power_of_2(T),
+            BLOCK_PAD=triton.next_power_of_2(pad_ctx),
+        )
+        attn_metadata.slot_mapping = slots
+        attn_metadata.block_tables = block_tables
+        attn_metadata.cu_seqlens_q = self._blk_cu_seqlens_q[: running_bs + 1]
+        attn_metadata.context_lens = ctx_lens
+        attn_metadata.max_seqlen_q = T
+        attn_metadata.max_seqlen_k = max_seqlen_k
+        kv_indices_generate_triton(
+            block_tables[:scheduled_bs],
+            self._blk_kv_indices,
+            kv_indptr,
+            block_size,
+            max_seqlen_k // self.dcp_world_size + 1,
+        )
+        self._plan_block_mla(attn_metadata, kv_indptr, dtype_q, running_bs)
+
+    def _plan_block_mla(self, attn_metadata, kv_indptr, dtype_q, running_bs):
+        """The block's CSR plus its persistent MLA plan, from per-request
+        `kv_indptr` / `_blk_kv_indices`."""
+        T = self.draft_tokens_per_seq
+        block_size = self.runner.block_size
         attn_metadata.kv_indptr = kv_indptr
         attn_metadata.kv_indices = self._blk_kv_indices
         # The pad tail needs no `_blk_last_page_lens` of its own: they are all
