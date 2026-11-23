@@ -389,6 +389,7 @@ def test_public_forward_reaches_the_prefill_and_checkpoint_writer(
     layer.layer_name, layer.layer_num = "layer_0", 0
     layer.local_proj_size, layer.num_local_heads, layer.head_dim = 2, 1, 2
     layer.fuse_f_a_quant, layer.activation, layer.conv_weight = False, "silu", None
+    layer._split_in_proj = False
     fused = torch.arange(9 * 13, dtype=torch.float32).reshape(9, 13).bfloat16()[:, :11]
     layer.in_proj = lambda x, **kw: fused
     layer.f_b_proj = lambda x: x.new_zeros((len(x), 2))
