@@ -149,26 +149,44 @@ def _identity_block_table(rows, ctx, world, dev, page=PAGE):
 
 
 def _merge_owned(gathered, local_idx, block_table, rank, world, k_loc, topk=TOPK):
-    """The production merge for one rank -- the real op, not a copy of it."""
+    """The production merge for one rank -- the real ops, not a copy of them:
+    ATOM's, on the all-gather's own [W * rows, k_loc] layout, which must match
+    aiter's on the transposed [rows, W * k_loc] plane bit for bit."""
+    from atom.model_ops.dcp_topk_merge import dcp_topk_merge
+
     rows = gathered.shape[0]
     dev = gathered.device
-    indptr = torch.zeros(rows + 1, dtype=torch.int32, device=dev)
-    counts = torch.zeros(rows, dtype=torch.int32, device=dev)
-    out = torch.zeros(rows * max(topk, k_loc), dtype=torch.int32, device=dev)
-    staging = torch.empty(rows, k_loc, dtype=torch.int32, device=dev)
-    flydsl_dcp_topk_merge(
-        gathered,
-        local_idx,
-        block_table,
-        out,
-        indptr,
-        counts,
-        staging,
-        rank,
-        world,
-        topk,
-        PAGE,
-    )
+    results = []
+    for merge, scores, kw in (
+        (flydsl_dcp_topk_merge, gathered, {}),
+        (
+            dcp_topk_merge,
+            gathered.view(rows, world, k_loc).permute(1, 0, 2).reshape(-1, k_loc),
+            {"layout": "plane"},
+        ),
+    ):
+        indptr = torch.zeros(rows + 1, dtype=torch.int32, device=dev)
+        counts = torch.zeros(rows, dtype=torch.int32, device=dev)
+        out = torch.zeros(rows * max(topk, k_loc), dtype=torch.int32, device=dev)
+        staging = torch.empty(rows, k_loc, dtype=torch.int32, device=dev)
+        merge(
+            scores,
+            local_idx,
+            block_table,
+            out,
+            indptr,
+            counts,
+            staging,
+            rank,
+            world,
+            topk,
+            PAGE,
+            **kw,
+        )
+        results.append((out, indptr, counts))
+    for want, got in zip(results[0], results[1]):
+        assert torch.equal(got, want), "ATOM's DCP merge differs from aiter's"
+    out, indptr, _ = results[0]
     return out, indptr
 
 
@@ -637,13 +655,18 @@ def test_every_backend_answers_the_draft_s_dcp_table_publish():
     assert not vars(metadata)
 
 
-def test_fused_exchange_passes_the_kernels_one_row_per_query_token(monkeypatch):
+@pytest.mark.parametrize("merge_impl", ["aiter", "atom"])
+def test_fused_exchange_passes_the_kernels_one_row_per_query_token(
+    monkeypatch, merge_impl
+):
     """Pin what the ops receive: the flatten to next_n=1 is invisible to every
     assertion above, and getting it wrong faults nothing and produces no NaN."""
     import importlib
     import sys
 
     import aiter.ops.topk as topk_mod
+
+    import atom.model_ops.dcp_topk_merge as atom_merge_mod
 
     # aiter binds this one lazily, so patch the sys.modules entry -- the module
     # attribute of the same name is a second, stale copy.
@@ -666,6 +689,9 @@ def test_fused_exchange_passes_the_kernels_one_row_per_query_token(monkeypatch):
     monkeypatch.setattr(logits_mod, "deepgemm_fp8_paged_mqa_logits", fake_logits)
     monkeypatch.setattr(topk_mod, "top_k_per_row_decode", fake_topk)
     monkeypatch.setattr(topk_mod, "flydsl_dcp_topk_merge", fake_merge)
+    monkeypatch.setattr(atom_merge_mod, "dcp_topk_merge", fake_merge)
+    monkeypatch.setenv("ATOM_DCP_TOPK_MERGE", merge_impl)
+    monkeypatch.setenv("ATOM_DCP_LOCAL_TOPK", "auto")
     monkeypatch.setattr(dcp_ops, "get_dcp_world_size", lambda: world)
     monkeypatch.setattr(
         dcp_ops,
@@ -783,8 +809,9 @@ def test_local_context_lens_refuses_a_multi_token_step_with_nothing_published():
         dcp_local_context_lens(meta, 0, 4, 1, num_rows=8)
 
 
+@pytest.mark.parametrize("merge_impl", ["aiter", "atom"])
 @pytest.mark.parametrize("world", [2, 8])
-def test_merge_launches_the_fused_kernel_count(world):
+def test_merge_launches_the_fused_kernel_count(world, merge_impl):
     """The merge must stay at 2 device kernels (select, pack).
 
     The sequence it replaced was ~16, and every correctness assertion above would
@@ -807,10 +834,17 @@ def test_merge_launches_the_fused_kernel_count(world):
     counts = torch.zeros(rows, dtype=torch.int32, device=DEV)
     out = torch.zeros(rows * max(topk, k_loc), dtype=torch.int32, device=DEV)
     staging = torch.empty(rows, k_loc, dtype=torch.int32, device=DEV)
+    if merge_impl == "atom":
+        from atom.model_ops.dcp_topk_merge import dcp_topk_merge as op
+
+        scores = gathered.view(rows, world, k_loc).permute(1, 0, 2).reshape(-1, k_loc)
+        kw = {"layout": "plane"}
+    else:
+        op, scores, kw = flydsl_dcp_topk_merge, gathered, {}
 
     def merge():
-        flydsl_dcp_topk_merge(
-            gathered,
+        op(
+            scores,
             local_idx,
             bt,
             out,
@@ -821,6 +855,7 @@ def test_merge_launches_the_fused_kernel_count(world):
             world,
             topk,
             PAGE,
+            **kw,
         )
 
     merge()  # warm up JIT

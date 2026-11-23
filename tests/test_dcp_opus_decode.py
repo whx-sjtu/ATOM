@@ -11,9 +11,10 @@ pytest.importorskip("triton")
 from atom.model_ops import dcp_ops
 
 
+@pytest.mark.parametrize("merge_impl", ["aiter", "atom", "atom:512:8,8,8,8"])
 @pytest.mark.parametrize("heads,qlen,block", [(32, 1, 64), (32, 6, 64), (64, 6, 128)])
 def test_opus_decode_flattens_queries_and_preserves_planes(
-    monkeypatch, heads, qlen, block
+    monkeypatch, heads, qlen, block, merge_impl
 ):
     bs, world, topk = 2, 8, 4
     rows = bs * qlen
@@ -22,6 +23,7 @@ def test_opus_decode_flattens_queries_and_preserves_planes(
     topk_mod = ModuleType("aiter.ops.topk")
     fp8 = ModuleType("aiter.ops.triton.pa_mqa_logits")
     ragged = ModuleType("atom.model_ops.fp4_mqa_ragged_metadata")
+    atom_merge = ModuleType("atom.model_ops.dcp_topk_merge")
 
     def configure(device, **kwargs):
         seen["config"] = kwargs
@@ -37,11 +39,18 @@ def test_opus_decode_flattens_queries_and_preserves_planes(
         idx.zero_()
         values.zero_()
 
-    def merge(scores, idx, tables, out_idx, out_ptr, counts, *args):
-        seen["merge"] = (scores, tables, out_idx, out_ptr, counts)
+    def merge(scores, idx, tables, out_idx, out_ptr, counts, *args, **kwargs):
+        seen["merge"] = (scores, tables, out_idx, out_ptr, counts, kwargs)
         out_idx.fill_(17)
         out_ptr.zero_()
         counts.zero_()
+
+    def aiter_merge(*args):
+        assert merge_impl == "aiter", "ATOM_DCP_TOPK_MERGE=atom reached aiter's merge"
+        merge(*args)
+
+    def parse_config(spec):
+        return (512, (8, 8, 8, 8)) if spec else (1024, (11, 11, 10))
 
     def wrong_scorer(*args, **kwargs):
         pytest.fail("MFMA FP4 decode reached the FP8 scorer")
@@ -49,13 +58,17 @@ def test_opus_decode_flattens_queries_and_preserves_planes(
     opus.mqa_logits_mxfp4_config = configure
     opus.mqa_logits_mxfp4 = score
     topk_mod.top_k_per_row_decode = select
-    topk_mod.flydsl_dcp_topk_merge = merge
+    topk_mod.flydsl_dcp_topk_merge = aiter_merge
+    atom_merge.dcp_topk_merge = merge
+    atom_merge.parse_config = parse_config
     fp8.deepgemm_fp8_paged_mqa_logits = wrong_scorer
     ragged.Fp4MqaRaggedMetadata = lambda *args, **kwargs: pytest.fail(
         "MFMA FP4 decode reached the PRESHUFFLE planner"
     )
-    for module in (opus, topk_mod, fp8, ragged):
+    for module in (opus, topk_mod, fp8, ragged, atom_merge):
         monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setenv("ATOM_DCP_TOPK_MERGE", merge_impl)
+    monkeypatch.setenv("ATOM_DCP_LOCAL_TOPK", "auto")
     monkeypatch.setattr(dcp_ops, "get_dcp_world_size", lambda: world)
     monkeypatch.setattr(dcp_ops, "get_dcp_group", lambda: object())
     monkeypatch.setattr(
@@ -133,8 +146,14 @@ def test_opus_decode_flattens_queries_and_preserves_planes(
     logits, next_n, local_ends, count = seen["select"]
     assert logits.shape == (rows, 33) and next_n == 1 and count == rows
     assert local_ends is windows
-    gathered, merged_tables, actual_out, actual_ptr, actual_counts = seen["merge"]
-    assert gathered.shape == (rows, world * topk)
+    gathered, merged_tables, actual_out, actual_ptr, actual_counts, kw = seen["merge"]
+    if merge_impl == "aiter":
+        assert gathered.shape == (rows, world * topk) and not kw
+    else:
+        # the all-gather's own [W * rows, k_loc], no transposing copy
+        assert gathered.shape == (world * rows, topk) and kw["layout"] == "plane"
+        want = (512, (8, 8, 8, 8)) if ":" in merge_impl else (1024, (11, 11, 10))
+        assert (kw["threads"], kw["radix"]) == want
     assert torch.equal(merged_tables, tables[:rows])
     assert actual_out is out and actual_ptr is ptr and actual_counts is counts
     assert (out == 17).all()

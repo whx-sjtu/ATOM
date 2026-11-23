@@ -33,6 +33,7 @@ from atom.distributed.dcp_layout import (  # noqa: F401
 )
 from atom.distributed.dcp_utils import get_dcp_group, get_dcp_world_size
 from atom.model_ops.indexer.layout import MFMA, PRESHUFFLE
+from atom.utils import envs
 from atom.utils.forward_context import get_published_dcp_local_context_lens
 
 logger = logging.getLogger("atom")
@@ -1576,7 +1577,16 @@ def dcp_decode_candidate_exchange_fused(
     staging = torch.empty(
         num_decode_tokens, k_loc, dtype=torch.int32, device=local_logits.device
     )
-    top_k_per_row_decode(
+    local_topk = envs.ATOM_DCP_LOCAL_TOPK
+    if local_topk == "auto":
+        select_local = top_k_per_row_decode
+    elif local_topk == "split":
+        from aiter.ops.topk import flydsl_top_k_per_row_decode as select_local
+    elif local_topk == "oneblock":
+        from aiter.ops.topk import flydsl_radix_topk_one_block_decode as select_local
+    else:
+        raise ValueError(f"ATOM_DCP_LOCAL_TOPK: unknown local top-k {local_topk!r}")
+    select_local(
         local_logits,
         1,  # next_n: one row per query token, windows come from local_ctx
         local_ctx,
@@ -1592,13 +1602,37 @@ def dcp_decode_candidate_exchange_fused(
     # Half the payload of the (score, gid) exchange, on the custom all-gather:
     # a pure copy, so the score bits arrive untouched.
     n_cand = dcp_world_size * k_loc
+    gathered_sc = dcp_all_gather(get_dcp_group(), send, 0)
+
+    merge_impl, _, merge_cfg = envs.ATOM_DCP_TOPK_MERGE.partition(":")
+    if merge_impl == "atom":
+        from atom.model_ops.dcp_topk_merge import dcp_topk_merge, parse_config
+
+        threads, radix = parse_config(merge_cfg)
+        dcp_topk_merge(
+            gathered_sc,
+            local_idx,
+            block_tables,
+            out_kv_indices,
+            out_kv_indptr,
+            owned_counts,
+            staging,
+            dcp_rank,
+            dcp_world_size,
+            topk_tokens,
+            runner_block_size,
+            threads=threads,
+            radix=radix,
+            layout="plane",
+        )
+        return
+    if merge_impl != "aiter":
+        raise ValueError(f"ATOM_DCP_TOPK_MERGE: unknown merge {merge_impl!r}")
     gathered_sc = (
-        dcp_all_gather(get_dcp_group(), send, 0)
-        .view(dcp_world_size, num_decode_tokens, k_loc)
+        gathered_sc.view(dcp_world_size, num_decode_tokens, k_loc)
         .permute(1, 0, 2)
         .reshape(num_decode_tokens, n_cand)
     )
-
     flydsl_dcp_topk_merge(
         gathered_sc,
         local_idx,
