@@ -716,6 +716,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Kimi-K3 mono K1: at two token groups with a short second one, the GEMV's
     # weights two column groups ahead (kda.gemv_staging). Same sums. 0 turns it off.
     "ATOM_MONO_K1_W_AHEAD": lambda: os.getenv("ATOM_MONO_K1_W_AHEAD", "1") == "1",
+    # Kimi-K3 mono K1's KDA tail hand-offs (kda.KDA_TAIL), each the same sums:
+    # a chunk task's q / k from its own conv of the head, not the QK hand-off
+    "ATOM_MONO_K1_OWN_QK": lambda: os.getenv("ATOM_MONO_K1_OWN_QK", "0") == "1",
+    # a task's f_b rows and ReplaySSM records issued with its other inputs
+    "ATOM_MONO_K1_EARLY_IN": lambda: os.getenv("ATOM_MONO_K1_EARLY_IN", "0") == "1",
+    # a head split over parts writes its conv state after the norm's poll
+    "ATOM_MONO_K1_CS_LATE": lambda: os.getenv("ATOM_MONO_K1_CS_LATE", "0") == "1",
     # gfx950 mono mailbox retry spacing in s_sleep units (1..127, unset: 16).
     # Read and checked by atom/mono/polling.py at import, which needs no ATOM
     # import; 1 restores the pre-backoff polling (ROCm/ATOM#3369).

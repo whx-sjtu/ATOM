@@ -132,6 +132,13 @@ K2_HANDOFF_ENVS = {
     "ATOM_MONO_K2_LN_SQ": "ln_sq",
 }
 
+# K1's KDA tail switches (``k1.KDA_TAIL``): env -> KdaPreBuild field
+K1_KDA_TAIL_ENVS = {
+    "ATOM_MONO_K1_OWN_QK": "own_qk",
+    "ATOM_MONO_K1_EARLY_IN": "early_in",
+    "ATOM_MONO_K1_CS_LATE": "cs_late",
+}
+
 
 def _lean_k1(key: k1.KdaPreBuild) -> k1.KdaPreBuild | None:
     """A spilled K1 build with fewer VGPRs: a column group a GEMV unit
@@ -198,7 +205,7 @@ def _lean_width(built: WidthBuild, spilled: list) -> WidthBuild | None:
 
 
 def _agree_env(name: str, group) -> bool:
-    """K2 build switch ``name`` (``envs``), the same on every TP rank."""
+    """K1 / K2 build switch ``name`` (``envs``), the same on every TP rank."""
     requested = getattr(envs, name)
     enabled = group_agree(requested, group)
     disabled = group_agree(not requested, group)
@@ -231,6 +238,7 @@ class K3MonoDecodeRunner:
     down_peek = False
     ug_place = False
     k1_w_ahead = False
+    k1_tail = MappingProxyType({})  # KdaPreBuild field -> on (``K1_KDA_TAIL_ENVS``)
     handoffs = MappingProxyType({})  # K2Build field -> on (``K2_HANDOFF_ENVS``)
 
     def __init__(self, model, drafter=None, metadata_builder=None) -> None:
@@ -239,6 +247,9 @@ class K3MonoDecodeRunner:
         self.down_peek = _agree_env("ATOM_MONO_K2_DOWN_PEEK", group)
         self.ug_place = _agree_env("ATOM_MONO_K2_UG_PLACE", group)
         self.k1_w_ahead = _agree_k1_w_ahead(group)
+        self.k1_tail = {
+            name: _agree_env(env, group) for env, name in K1_KDA_TAIL_ENVS.items()
+        }
         self.handoffs = {
             name: _agree_env(env, group) for env, name in K2_HANDOFF_ENVS.items()
         }
@@ -483,6 +494,7 @@ class K3MonoDecodeRunner:
                 replay_cap=self.replay_cap,
                 replay_window=window,
                 **k1.gemv_staging(rows, self.k1_w_ahead),
+                **k1.kda_tail_at(rows, qlen, self.replay_cap, self.k1_tail),
             )
             for p in self.plans
             if p.mono
