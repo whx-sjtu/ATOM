@@ -112,6 +112,14 @@ def _log_kda_wave_fallback(tp_size, num_seqs, num_heads, num_cus):
     )
 
 
+@lru_cache(maxsize=1)
+def _log_latent_rows_unmerged():
+    logging.getLogger("atom").warning(
+        "ATOM_KIMI_K3_MOE_LATENT_ROW_SHARD is set, but the MoE front weight "
+        "is not merged: router and latent down projection stay on every row."
+    )
+
+
 def _text_config(config):
     return getattr(config, "text_config", config)
 
@@ -754,18 +762,45 @@ class KimiSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         rows,
         prefix_rows: torch.Tensor | None = None,
+        hidden_rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Scatter routed/shared partials, normalize and project local rows,
         add the optional prefix, then gather the sum. Its BF16 rounding differs
-        from the next attn_res's FP32 fold and can move MoE routing."""
-        router_logits = self.gate(hidden_states)
-        routed_input = self.routed_expert_down_proj(hidden_states)
+        from the next attn_res's FP32 fold and can move MoE routing.
+        `hidden_rows` is this rank's shard of `hidden_states`, if at hand."""
+        router_logits, routed_input = self._row_sharded_front(
+            hidden_states, rows, hidden_rows
+        )
         routed_output = self.experts(routed_input, router_logits)
         routed_output = self._apply_routed_norm_and_up_proj(rows.scatter(routed_output))
         output = routed_output + rows.scatter(self.shared_experts(hidden_states))
         if prefix_rows is not None:
             output += prefix_rows
         return rows.gather(output)
+
+    def _row_sharded_front(
+        self, hidden_states: torch.Tensor, rows, hidden_rows: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Router logits and latent MoE input for every row. With
+        ATOM_KIMI_K3_MOE_LATENT_ROW_SHARD, one GEMM over the merged front
+        weight's router and latent rows on this rank's rows, then a gather;
+        the GEMM's row count changes, and with it possibly its rounding."""
+        if (
+            envs.ATOM_KIMI_K3_MOE_LATENT_ROW_SHARD
+            and hidden_states.dtype == torch.bfloat16
+        ):
+            merged = None if self.front_proj is None else self.front_proj.merged_weight
+            if merged is not None:
+                if hidden_rows is None:
+                    hidden_rows = rows.shard(hidden_states)
+                sizes = [self.num_experts, self.moe_hidden_size]
+                gathered = rows.gather(
+                    tgemm.mm(hidden_rows, merged[-sum(sizes) :], otype=dtypes.bf16)
+                )
+                router_logits, routed_input = gathered.split(sizes, dim=-1)
+                return router_logits, routed_input
+            _log_latent_rows_unmerged()
+        return self.gate(hidden_states), self.routed_expert_down_proj(hidden_states)
 
     @staticmethod
     def _split_op_pair(
@@ -2607,7 +2642,9 @@ class KimiDecoderLayer(nn.Module):
             None if window is None else rows.shard(window),
             rows.scatter(attn_partial),
         )
-        residual = moe.row_sharded_moe(rows.gather(hidden_rows), rows, prefix_rows)
+        residual = moe.row_sharded_moe(
+            rows.gather(hidden_rows), rows, prefix_rows, hidden_rows
+        )
         return residual, torch.zeros_like(residual), torch.zeros_like(residual)
 
     def forward(

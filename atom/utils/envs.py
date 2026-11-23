@@ -1158,6 +1158,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS": lambda: int(
         os.getenv("ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS", "8192")
     ),
+    # On those row-sharded steps, run the MoE router and latent down projection
+    # on each rank's rows and gather them, instead of on every row per rank.
+    "ATOM_KIMI_K3_MOE_LATENT_ROW_SHARD": lambda: (
+        os.getenv("ATOM_KIMI_K3_MOE_LATENT_ROW_SHARD", "0") == "1"
+    ),
     # Fuse into a per-rank replica without EPLB. EPLB always fuses it as routed.
     "ATOM_FUSE_SHARED_EXPERT": lambda: (
         os.getenv("ATOM_FUSE_SHARED_EXPERT", "1").lower() == "1"
