@@ -121,6 +121,9 @@ class SpecDecodeMetadata:
     # row's request and that request's temperature.
     verify_request_indices: torch.Tensor | None = None
     verify_temperatures: torch.Tensor | None = None
+    # [bonus_logits_indices ++ target_logits_indices]
+    # (ATOM_SPEC_VERIFY_ONE_GATHER).
+    verify_logits_indices: torch.Tensor | None = None
 
 
 _uncaptured_decode_shape_warned = False

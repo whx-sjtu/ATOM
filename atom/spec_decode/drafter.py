@@ -365,6 +365,11 @@ class Drafter(abc.ABC):
             buffers["verify_temperatures"] = CpuGpuBuffer(
                 max_bs * mtp_k, dtype=torch.float32, **kwargs
             )
+        if envs.ATOM_SPEC_VERIFY_ONE_GATHER:
+            # [bonus rows ++ target rows] of the step's logits.
+            buffers["verify_logits_indices"] = CpuGpuBuffer(
+                max_bs * (mtp_k + 1), dtype=torch.int64, **kwargs
+            )
         return buffers
 
     def _arm_lossless_draft(self) -> "DSparkLossless | None":
@@ -944,6 +949,13 @@ class Drafter(abc.ABC):
             var["verify_temperatures"].np[:sum_drafted_tokens] = temperatures[rows]
             counts["verify_request_indices"] = sum_drafted_tokens
             counts["verify_temperatures"] = sum_drafted_tokens
+        if "verify_logits_indices" in var:
+            both = var["verify_logits_indices"].np
+            both[:scheduled_bs] = bonus_logits_indices
+            both[scheduled_bs : scheduled_bs + sum_drafted_tokens] = (
+                target_logits_indices
+            )
+            counts["verify_logits_indices"] = scheduled_bs + sum_drafted_tokens
         publication_group.set_counts(counts)
         return num_draft_tokens, sum_drafted_tokens
 
@@ -979,5 +991,9 @@ class Drafter(abc.ABC):
             ]
             metadata.verify_temperatures = var["verify_temperatures"].gpu[
                 :sum_drafted_tokens
+            ]
+        if "verify_logits_indices" in var:
+            metadata.verify_logits_indices = var["verify_logits_indices"].gpu[
+                : scheduled_bs + sum_drafted_tokens
             ]
         return metadata

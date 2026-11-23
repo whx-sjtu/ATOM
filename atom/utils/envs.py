@@ -920,6 +920,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # verification draw skips its arange / searchsorted / gather launches. Same
     # rows, same values. Read at drafter construction.
     "ATOM_SPEC_VERIFY_HOST_ROWS": lambda: _flag_env("ATOM_SPEC_VERIFY_HOST_ROWS"),
+    # MTP verify: one index_select of the bonus and target logits rows, from a
+    # host-built index of both, instead of one each. Same rows. Read at drafter
+    # construction.
+    "ATOM_SPEC_VERIFY_ONE_GATHER": lambda: _flag_env("ATOM_SPEC_VERIFY_ONE_GATHER"),
     # Lossless speculative sampling: the DSpark draft samples its block from q
     # and the verify accepts by the probability ratio (u * q < p). Off by
     # default; needs an aiter with ROCm/aiter#6954 under TP; where it arms,

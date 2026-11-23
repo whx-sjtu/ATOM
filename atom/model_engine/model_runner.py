@@ -3516,7 +3516,12 @@ class ModelRunner:
             bonus_logits_indices = spec_decode_metadata.bonus_logits_indices
             target_logits_indices = spec_decode_metadata.target_logits_indices
 
-            if constraints is None:
+            both_indices = getattr(spec_decode_metadata, "verify_logits_indices", None)
+            if constraints is None and both_indices is not None:
+                both = torch.index_select(logits, 0, both_indices)
+                bonus_rows = bonus_logits_indices.shape[0]
+                bonus_logits, target_logits = both[:bonus_rows], both[bonus_rows:]
+            elif constraints is None:
                 bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
                 target_logits = torch.index_select(logits, 0, target_logits_indices)
             else:
