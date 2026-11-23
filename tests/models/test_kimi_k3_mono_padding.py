@@ -214,6 +214,8 @@ def test_real_k2_packing_uses_shared_metadata_or_no_pointer(monkeypatch, qlen, e
 def test_compile_complete_k2_keeps_peer_completion(qlen, tmp_path, monkeypatch):
     monkeypatch.setenv("ARCH", "gfx950")
     monkeypatch.setenv("FLYDSL_RUNTIME_CACHE_DIR", str(tmp_path))
+    # On a GPU host importing aiter already initializes CUDA (Triton's arch probe).
+    cuda_was_initialized = torch.cuda.is_initialized()
     resources = []
     for enabled in (False, True):
         key = k2.K2Build(tokens=64, nblocks=1, qlen=qlen, skip_padding=enabled)
@@ -229,5 +231,5 @@ def test_compile_complete_k2_keeps_peer_completion(qlen, tmp_path, monkeypatch):
             assert r["scratch"] == r["vgpr_spill"] == 0, r
             assert r["lds"] <= 163840, r
             resources.append(r)
-    assert not torch.cuda.is_initialized()
+    assert cuda_was_initialized or not torch.cuda.is_initialized()
     print({"qlen": qlen, "resources": resources})

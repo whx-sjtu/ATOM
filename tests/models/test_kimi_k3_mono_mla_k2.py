@@ -194,15 +194,22 @@ def _step(runner_module, core):
 
 
 def test_a_full_attention_layer_runs_its_attention_then_k2(runner_module):
+    from atom.model_ops.attention_residual import AttnRes
+    from atom.models.kimi_k3.mono.config import ATTN_RES_BLOCK
+
     core = torch.zeros(ROWS, Dims(8).proj, dtype=torch.bfloat16)
     runner, calls, args = _step(runner_module, core)
     out = runner._layer(*args)
 
     _, plan, _, prefix, blocks, add, add2, _ = args
     seam_prefix, seam_blocks, seam_add, seam_add2 = calls["seam"]
-    before, _ = layer_block(3)
     assert seam_prefix is prefix and seam_add is add and seam_add2 is add2
-    assert seam_blocks.shape == (ROWS, before, HIDDEN)
+    # the whole bank: the layer's attention-side AttnRes bounds its read to
+    # the blocks mono banked before that layer
+    assert seam_blocks is blocks
+    for i in range(1, LAYERS):
+        attn_res = AttnRes(enabled=False, block_size=ATTN_RES_BLOCK, layer_idx=i)
+        assert attn_res.num_blocks == layer_block(i)[0], i
     assert calls["attn"] == ("positions", "normed")
     # K2 gets the seam's prefix (it updates it in place), not the one it was handed
     assert calls["k2"][0] == "build" and calls["k2"][1] is plan
