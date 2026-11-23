@@ -251,6 +251,32 @@ from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import (  # isort: skip
     batched_gemm_bf16 as _aiter_triton_bf16_bmm,
 )
 
+# BF16 V up-projection tile for decode-sized row counts (`ATOM_DMLA_WV_BMM_TILE`);
+# aiter has no tuned entry for the DCP group's head count and falls back to a
+# 128x128x32 tile. Both walk K in one slice and in order.
+_V_UP_DECODE_BMM_CONFIG = {
+    "BLOCK_SIZE_M": 32,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 1,
+    "num_warps": 4,
+    "num_stages": 2,
+    "waves_per_eu": 2,
+    "matrix_instr_nonkdim": 16,
+    "cache_modifier": None,
+    "NUM_KSPLIT": 1,
+}
+_V_UP_DECODE_MAX_ROWS = 128
+
+
+def _v_up_bf16_bmm_config(x: torch.Tensor) -> dict | None:
+    """The BF16 V up-projection's tile for x (heads, rows, kv_lora_rank); None
+    leaves it to aiter."""
+    if not envs.ATOM_DMLA_WV_BMM_TILE or x.shape[1] > _V_UP_DECODE_MAX_ROWS:
+        return None
+    return {**_V_UP_DECODE_BMM_CONFIG, "SPLITK_BLOCK_SIZE": x.shape[2]}
+
+
 concat_and_cache_mla = mark_trace(
     concat_and_cache_mla, prefix="kv_cache", torch_compile=False
 )
@@ -1818,7 +1844,9 @@ class MLAAttention(nn.Module):
             # X @ W^T with W (B,N,K): x (N,B,L) @ W_V (N,V,L)^T -> (N,B,V),
             # stored through output strides into a contiguous (B,N,V) buffer so
             # the (B, N*V) view o_proj takes needs no transpose copy.
-            _aiter_triton_bf16_bmm(x, W_V, YQ=output.transpose(0, 1))
+            _aiter_triton_bf16_bmm(
+                x, W_V, YQ=output.transpose(0, 1), config=_v_up_bf16_bmm_config(x)
+            )
         else:
             _aiter_triton_fp8_bmm(
                 x, W_V, W_V_scale, group_size=128, YQ=output, transpose_bm=True

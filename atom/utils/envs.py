@@ -611,6 +611,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DMLA_MLA_NO_REDUCE": lambda: (
         os.getenv("ATOM_DMLA_MLA_NO_REDUCE", "0") == "1"
     ),
+    # BF16 V up-projection (W_V absorb bmm) over at most 128 rows: a 32x64x128
+    # tile instead of aiter's 128x128x32 fallback. K stays one slice walked in
+    # order; outputs measured bit-identical. Off by default.
+    "ATOM_DMLA_WV_BMM_TILE": lambda: (os.getenv("ATOM_DMLA_WV_BMM_TILE", "0") == "1"),
     # Unquantized BF16 attn_res in decode steps: take a layer's B+1 candidates
     # in one tile (BL = next_pow2(B+1), at most 16) instead of two at a time.
     # Prefill keeps the two-candidate tile. BL follows the layer and the step
