@@ -1189,6 +1189,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_K3_MOE_LATENT_ROW_SHARD": lambda: (
         os.getenv("ATOM_KIMI_K3_MOE_LATENT_ROW_SHARD", "0") == "1"
     ),
+    # Eager prefill: drop the device row count from aiter's fused_moe when the
+    # host already knows every row is real (`_fused_moe_row_count`).
+    "ATOM_MOE_ELIDE_FULL_ROW_COUNT": lambda: (
+        os.getenv("ATOM_MOE_ELIDE_FULL_ROW_COUNT", "0").lower() == "1"
+    ),
     # Fuse into a per-rank replica without EPLB. EPLB always fuses it as routed.
     "ATOM_FUSE_SHARED_EXPERT": lambda: (
         os.getenv("ATOM_FUSE_SHARED_EXPERT", "1").lower() == "1"
