@@ -541,6 +541,17 @@ def test_row_gate_intersects_floor_and_strict_stream_threshold(
     )
 
 
+def test_row_gate_refuses_graph_warmup(ranks, monkeypatch):
+    monkeypatch.delenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", raising=False)
+    monkeypatch.delenv("ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS", raising=False)
+    block = SimpleNamespace(tp_size=WORLD)
+    assert kimi.KimiSparseMoeBlock.takes_row_tail(block, 8192)
+    monkeypatch.setattr(
+        kimi, "get_forward_context", lambda: SimpleNamespace(in_hipgraph=True)
+    )
+    assert not kimi.KimiSparseMoeBlock.takes_row_tail(block, 8192)
+
+
 @pytest.mark.parametrize(
     "world,latent,shared,tbo,eligible",
     [

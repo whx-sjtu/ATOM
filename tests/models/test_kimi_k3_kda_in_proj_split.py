@@ -277,6 +277,21 @@ def test_real_prefill_matches_fused_projection(modules, monkeypatch, tokens, pad
     assert qualifications == [True]  # No qualification/probing during forward.
 
 
+@pytest.mark.parametrize("tokens", [3072, 8192])
+@torch.inference_mode()
+def test_token_graph_projection_splits_like_the_eager_mixer(
+    modules, monkeypatch, tokens
+):
+    attn, _, views, _ = _attention(modules, monkeypatch, tokens)
+    x = torch.randn(tokens, HIDDEN).bfloat16()
+    got = attn._project_in(x, None)
+    assert len(attn.in_proj.calls) == (tokens < 8192)
+    assert sum(bool(view.calls) for view in views) == (2 if tokens >= 8192 else 0)
+    attn._split_in_proj = False
+    for part, want in zip(got, attn._project_in(x, None)):
+        torch.testing.assert_close(part, want)
+
+
 @torch.inference_mode()
 def test_cached_row_views_follow_inplace_weight_updates(modules, monkeypatch):
     attn, _, views, _ = _attention(modules, monkeypatch, 8192)
