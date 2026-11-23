@@ -862,6 +862,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSPARK_FUSED_BLOCK_META": lambda: _flag_env(
         "ATOM_DSPARK_FUSED_BLOCK_META", "1"
     ),
+    # Kimi-K3 DSpark context rows: one GEMM over every layer's kv rows of a bf16
+    # fused_qkv_a_proj, stacked into a weight copy at model construction.
+    # Off by default.
+    "ATOM_DSPARK_STACKED_CTX_KV_GEMM": lambda: _flag_env(
+        "ATOM_DSPARK_STACKED_CTX_KV_GEMM"
+    ),
     # Lossless speculative sampling: the DSpark draft samples its block from q
     # and the verify accepts by the probability ratio (u * q < p). Off by
     # default; needs an aiter with ROCm/aiter#6954 under TP; where it arms,
