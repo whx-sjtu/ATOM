@@ -1688,6 +1688,11 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
     # alone.
     supports_token_graph = False
 
+    # The prefill token buckets this backend's model records when
+    # `ATOM_TOKEN_GRAPH_SIZES` is unset (`ModelRunner.prefill_token_buckets`).
+    # None: that variable's default.
+    prefill_token_graph_sizes: tuple[int, ...] | None = None
+
     # The `running_bs` a prefill's model records some of its layers at as
     # `ReqGraph`s, each on `build_for_req_graph_capture`'s step
     # (`ModelRunner._record_prefill_req_graphs`). Empty: none.

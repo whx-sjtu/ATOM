@@ -1351,6 +1351,17 @@ class ModelRunner:
         (`Scheduler.prefill_token_graphs`)."""
         return bool(TokenGraph.captured_sizes("prefill"))
 
+    def prefill_token_buckets(self) -> list[int]:
+        """The prefill buckets `_record_tr_graphs` records, largest first:
+        `ATOM_TOKEN_GRAPH_SIZES` when set (empty: none), else the attention
+        builder's own (`prefill_token_graph_sizes`), else that variable's
+        default; none past what one warmup forward carries."""
+        sizes = self.attn_metadata_builder.prefill_token_graph_sizes
+        if sizes is None or "ATOM_TOKEN_GRAPH_SIZES" in os.environ:
+            sizes = envs.ATOM_TOKEN_GRAPH_SIZES
+        limit = self.warmup_max_tokens()
+        return sorted({n for n in sizes if 0 < n <= limit}, reverse=True)
+
     def warmup_max_tokens(self) -> int:
         """Tokens one warmup forward carries: the activation peak KV sizing allows."""
         max_tokens = self.config.max_num_batched_tokens
@@ -4629,15 +4640,16 @@ class ModelRunner:
 
     def _record_tr_graphs(self) -> None:
         """Record the model's token graphs (`atom/utils/region_graph.py`) at
-        each prefill bucket of `ATOM_TOKEN_GRAPH_SIZES`, on the builder's
+        each prefill bucket (`prefill_token_buckets`), on the builder's
         synthetic prompt: one warmup forward, then one recording forward."""
         builder = self.attn_metadata_builder
-        limit = self.warmup_max_tokens()
         # Largest first: each module's buckets share one pool and one input
         # buffer, which the first recording sizes (`TokenGraph`).
-        sizes = sorted(
-            {n for n in envs.ATOM_TOKEN_GRAPH_SIZES if 0 < n <= limit}, reverse=True
-        )
+        sizes = self.prefill_token_buckets()
+        if not sizes:
+            return
+        free, reserved = torch.cuda.mem_get_info()[0], torch.cuda.memory_reserved()
+        start = time.perf_counter()
         for running_tokens in sizes:
             # Every rank records this bucket at once and replays it only
             # together, a decoding rank included (`ForwardMode.
@@ -4654,10 +4666,16 @@ class ModelRunner:
                     mode,
                 )
             torch.cuda.synchronize()
-        if sizes and self.rank == 0:
+        if self.rank == 0:
+            # Free memory also falls by what the warmup forwards' eager halves
+            # leave in torch's cache, hence the reserved bytes beside it.
             logger.info(
-                "Token graphs recorded for prefill buckets %s",
+                "Token graphs recorded for prefill buckets %s in %.1f s: "
+                "free memory -%.2f GiB, torch reserved %+.2f GiB",
                 TokenGraph.captured_sizes("prefill"),
+                time.perf_counter() - start,
+                (free - torch.cuda.mem_get_info()[0]) / (1 << 30),
+                (torch.cuda.memory_reserved() - reserved) / (1 << 30),
             )
 
     def _record_prefill_req_graphs(self) -> None:

@@ -810,10 +810,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSV41_MONO_HI": lambda: os.getenv("ATOM_DSV41_MONO_HI", "auto"),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest
-    # runs eagerly; empty records none. The default tops out at 3072 because
-    # the pool grows with the largest bucket (16384 costs ~10 GB per GPU on
-    # V4.1 TP4) while prefills that long are GPU-bound and gain little. Only
-    # an attention backend with `supports_token_graph` takes them.
+    # runs eagerly; empty records none. Unset, a backend may record its own
+    # (`prefill_token_graph_sizes`) instead of this default, which tops out at
+    # 3072 because the pool grows with the largest bucket (16384 costs ~10 GB
+    # per GPU on V4.1 TP4) while prefills that long are GPU-bound and gain
+    # little. Only an attention backend with `supports_token_graph` takes them.
     "ATOM_TOKEN_GRAPH_SIZES": lambda: tuple(
         int(s)
         for s in os.getenv("ATOM_TOKEN_GRAPH_SIZES", "256,512,1024,2048,3072").split(
