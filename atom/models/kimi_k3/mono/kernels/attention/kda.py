@@ -281,6 +281,24 @@ class KdaPreBuild:
     # that spilled (``runner._lean_width``)
     x_ahead: int = field(default=1, metadata={"sym": "a"})
     kda0: int = field(default=0, metadata={"sym": "k0"})  # the first KDA task's CTA
+    # a timing bench's ablation (``ABLATE_*`` bits; wrong outputs), 0 serving.
+    # Only a build that sets it names it (``symbol``)
+    ablate: int = field(default=0, metadata={"sym": "ab"})
+
+
+# ``KdaPreBuild.ablate``: a path compiled away, its cost read off the time left
+ABLATE_KDA = 1  # no KDA tasks: the launch ends with the GEMV
+ABLATE_WEIGHTS = 2  # the GEMV's weight operands zeros, never loaded
+ABLATE_ATTN = 4  # no AttnRes, and the GEMV waits for no x (XRDY)
+
+
+def symbol(key: KdaPreBuild) -> str:
+    """``key``'s kernel symbol; ``ablate`` named only when set, so a serving
+    build's symbol (and LLVM's register choice with it) is unchanged."""
+    sym = symbol_params(key)
+    if not key.ablate:
+        del sym["ab"]
+    return kernel_symbol("k3_mono_kda_pre", **sym)
 
 
 ABI = KernelAbi(
@@ -615,6 +633,8 @@ def gemv_loads(c, rg, chunks, paired: bool = False):
     lane, wave = c["lane"], c["wave"]
     # bounded: the last task's rows past ``FUSED`` are not in the weight,
     # and a buffer load past num_records returns zero
+    if const_expr(c["ablate"] & ABLATE_WEIGHTS):
+        return [[fx.Vector.filled(4, 0, fx.Int32) for _ in range(4)] for _ in chunks]
     r_w = rsrc(c["args"]["w_in"], FUSED * HIDDEN * 2)
     row0 = fx.min(rg, GEMV_TASKS - 1) * ROWS
     return [
@@ -627,8 +647,9 @@ def gemv_loads(c, rg, chunks, paired: bool = False):
 def await_x(c):
     """Every slice's x ready. Hoisted out of the staging so that slabbing it
     does not re-poll the same mailboxes once a slab."""
-    if c["tid"] < NA:
-        c["poll"]([(c["xrdy"], c["tid"], 1)])
+    if const_expr(not c["ablate"] & ABLATE_ATTN):  # noqa: SIM102
+        if c["tid"] < NA:
+            c["poll"]([(c["xrdy"], c["tid"], 1)])
     gpu.barrier()
 
 
@@ -690,8 +711,9 @@ def x_wave_stage(c, i0: int, ni: int):
     already in flight. No barrier here: the caller's, past every wave's
     weights, publishes the rows."""
     s, lane = c["S"], c["lane"]
-    if lane < NA:
-        c["poll"]([(c["xrdy"], lane, 1)])
+    if const_expr(not c["ablate"] & ABLATE_ATTN):  # noqa: SIM102
+        if lane < NA:
+            c["poll"]([(c["xrdy"], lane, 1)])
     words = x_words(s, ni)
     n = (words + 63) // 64
     # X_BATCH loads in flight, then their stores: a store after each load
@@ -824,8 +846,9 @@ def gemv_groups(c, gi):
 
     ops = {0: unit_ops(0)}
     # every group's slices ready (XRDY, NA a group)
-    if c["tid"] < NA * G:
-        c["poll"]([(c["xrdy"], c["tid"], 1)])
+    if const_expr(not c["ablate"] & ABLATE_ATTN):  # noqa: SIM102
+        if c["tid"] < NA * G:
+            c["poll"]([(c["xrdy"], c["tid"], 1)])
     gpu.barrier()
 
     def x_of(u):
@@ -1663,7 +1686,7 @@ def build(key: KdaPreBuild):
         tls: fx.Array[fx.Int64, TL_POINTS, 16]
 
     keyed = key_tuple(key, _SOURCES)
-    name = kernel_symbol("k3_mono_kda_pre", **symbol_params(key))
+    name = symbol(key)
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def kda_pre(
@@ -1746,6 +1769,7 @@ def build(key: KdaPreBuild):
             "rwin": key.replay_window,
             "unit": key.gemv_unit,
             "x_ahead": key.x_ahead,
+            "ablate": key.ablate,
             "vloc": kl.vloc.ptr,
             "ol": kl.ol.ptr,
             "onl": kl.onl.ptr,
@@ -1791,7 +1815,7 @@ def build(key: KdaPreBuild):
         # token group g's AttnRes on CTAs 56 g ..: the groups side by side; the
         # GEMV waits for every group's x (XRDY, NA a group) before its first
         # unit (``gemv_groups``)
-        for g in range_constexpr(G):
+        for g in range_constexpr(G if not key.ablate & ABLATE_ATTN else 0):
             if (bid >= NA * g) & (bid < NA * (g + 1)):
                 attnres(group_view(c, g), bid - NA * g, group_rows(s, g), on, tls)
         if const_expr(G > 1):  # noqa: SIM102
@@ -1852,7 +1876,8 @@ def build(key: KdaPreBuild):
                 stamp(on, tls, tid, 5)
                 gemv_finish(c, rg1, acc1)
                 stamp(on, tls, tid, 6)
-        kda_tasks(c, on, tls)
+        if const_expr(not key.ablate & ABLATE_KDA):
+            kda_tasks(c, on, tls)
         stamp_flush(on, tls, tl, tid, bid, TL_POINTS)
 
     @flyc.jit
