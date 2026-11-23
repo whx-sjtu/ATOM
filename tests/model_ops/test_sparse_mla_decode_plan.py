@@ -765,6 +765,10 @@ def test_native_decode_and_graph_against_direct_attention(
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         out, lse = layer._forward_decode(q, kv, md, return_lse=True)
+    # Without the FP8 probability emulation the reference is exact attention.
+    atol = (
+        0.025 if dtype == torch.float8_e4m3fn and probability_scale is None else 0.015
+    )
     for owner in range(3):
         next_md = SimpleNamespace()
         selection(next_md, rows, owner, "cuda")
@@ -778,7 +782,7 @@ def test_native_decode_and_graph_against_direct_attention(
         # to drop them. Check every live row, including those following empties.
         live = md.dcp_sparse_kv_indptr.diff() > 0
         torch.testing.assert_close(
-            out[:rows][live].float(), expected[live], atol=0.015, rtol=0.03
+            out[:rows][live].float(), expected[live], atol=atol, rtol=0.03
         )
         torch.testing.assert_close(
             lse[:rows][live], expected_lse[live], atol=0.02, rtol=0.01

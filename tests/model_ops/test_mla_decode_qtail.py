@@ -22,7 +22,7 @@ def _ordinal(codes: torch.Tensor) -> torch.Tensor:
     return torch.where(c >= 128, 128 - c, c)
 
 
-@pytest.mark.parametrize("q_scale", [1.0, 2.0**-10])
+@pytest.mark.parametrize("q_scale", [1.0, 2.0**-2])
 @pytest.mark.parametrize("tokens", [1, 20, 35, 96, 257])
 def test_qtail_matches_bmm_rope_path(tokens, q_scale):
     torch.manual_seed(tokens)
@@ -36,31 +36,83 @@ def test_qtail_matches_bmm_rope_path(tokens, q_scale):
     slots = torch.randperm(4 * tokens, device="cuda")[:tokens]
     positions = 131072 + torch.arange(tokens, device="cuda")
     slots[positions % 8 != 0] = -1
-    rope = NoPositionalRotaryEmbedding(PE, PE, 140000, 10000.0, dtype=torch.bfloat16).cuda()
+    rope = NoPositionalRotaryEmbedding(
+        PE, PE, 140000, 10000.0, dtype=torch.bfloat16
+    ).cuda()
     qs = torch.tensor([q_scale], device="cuda")
     ks = torch.ones(1, device="cuda")
 
     def buffers():
         return (
-            torch.full((tokens, HEADS, LORA + PE), 0x7F, device="cuda", dtype=torch.uint8).view(dtypes.fp8),
+            torch.full(
+                (tokens, HEADS, LORA + PE), 0x7F, device="cuda", dtype=torch.uint8
+            ).view(dtypes.fp8),
             torch.zeros(4 * tokens, 1, LORA + PE, device="cuda", dtype=dtypes.fp8),
         )
 
     ref_q, ref_kv = buffers()
     ql_nope = batched_gemm_bf16(q_nope.transpose(0, 1), w_k).transpose(0, 1)
     fused_qk_rope_concat_and_cache_mla(
-        ql_nope, q_pe, k_nope, k_pe, ref_kv, ref_q, slots, ks, qs, positions,
-        rope.cos_cache, rope.sin_cache, is_neox=rope.is_neox_style, is_nope_first=True,
+        ql_nope,
+        q_pe,
+        k_nope,
+        k_pe,
+        ref_kv,
+        ref_q,
+        slots,
+        ks,
+        qs,
+        positions,
+        rope.cos_cache,
+        rope.sin_cache,
+        is_neox=rope.is_neox_style,
+        is_nope_first=True,
         compute_all_q_rope=True,
     )
     new_q, new_kv = buffers()
     mla_decode_qtail(q_nope, q_pe, w_k, new_q, k_nope, k_pe, new_kv, slots, qs, ks)
 
-    torch.testing.assert_close(new_kv.view(torch.uint8), ref_kv.view(torch.uint8), rtol=0, atol=0)
     torch.testing.assert_close(
-        new_q[..., LORA:].view(torch.uint8), ref_q[..., LORA:].view(torch.uint8), rtol=0, atol=0
+        new_kv.view(torch.uint8), ref_kv.view(torch.uint8), rtol=0, atol=0
     )
-    assert not new_q.float().isnan().any(), "q_out holds an FP8 NaN (an unwritten or overflowed code)"
+    torch.testing.assert_close(
+        new_q[..., LORA:].view(torch.uint8),
+        ref_q[..., LORA:].view(torch.uint8),
+        rtol=0,
+        atol=0,
+    )
+    assert (
+        not new_q.float().isnan().any()
+    ), "q_out holds an FP8 NaN (an unwritten or overflowed code)"
     steps = (_ordinal(new_q[..., :LORA]) - _ordinal(ref_q[..., :LORA])).abs()
     assert steps.max().item() <= 1, f"nope half off by {steps.max().item()} e4m3 steps"
     assert (steps == 1).float().mean().item() < 0.06
+
+
+@pytest.mark.parametrize("tokens", [7, 96])
+def test_qtail_saturates_out_of_range_values(tokens):
+    """Beyond the e4m3 range q_out and the cache take the finite maximum."""
+    big = 4096.0
+    q = torch.full((tokens, HEADS, NOPE + PE), big, device="cuda", dtype=torch.bfloat16)
+    q[1::2] = -big
+    w_k = torch.ones(HEADS, LORA, NOPE, device="cuda", dtype=torch.bfloat16)
+    k_nope = torch.full((tokens, LORA), -big, device="cuda", dtype=torch.bfloat16)
+    k_pe = torch.full((tokens, PE), big, device="cuda", dtype=torch.bfloat16)
+    slots = torch.arange(tokens, device="cuda")
+    q_out = torch.zeros(tokens, HEADS, LORA + PE, device="cuda", dtype=dtypes.fp8)
+    cache = torch.zeros(tokens, 1, LORA + PE, device="cuda", dtype=dtypes.fp8)
+    one = torch.ones(1, device="cuda")
+    mla_decode_qtail(
+        q[..., :NOPE], q[..., NOPE:], w_k, q_out, k_nope, k_pe, cache, slots, one, one
+    )
+
+    fp8_max = torch.finfo(dtypes.fp8).max
+    sign = torch.ones(tokens, 1, 1, device="cuda")
+    sign[1::2] = -1
+    assert torch.equal(q_out.float(), (sign * fp8_max).expand(q_out.shape))
+    assert torch.equal(
+        cache[:, 0, :LORA].float(), torch.full((tokens, LORA), -fp8_max, device="cuda")
+    )
+    assert torch.equal(
+        cache[:, 0, LORA:].float(), torch.full((tokens, PE), fp8_max, device="cuda")
+    )

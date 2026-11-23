@@ -7,7 +7,10 @@ pytest.importorskip("aiter")
 pytest.importorskip("triton")
 
 from atom.model_ops.kimi_k3.activations import rmsnorm_gated
-from atom.model_ops.kimi_k3.attention_residual import _apply_attn_res_impl
+from atom.model_ops.kimi_k3.attention_residual import (
+    _apply_attn_res_impl,
+    _attn_res_bf16_config,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="ROCm GPU required"
@@ -59,9 +62,19 @@ def test_bf16_gated_norm_prefill_batch_invariance(heads):
         assert torch.equal(output, _tile(baseline, rows))
 
 
-@pytest.mark.parametrize("blocks,add_count", [(1, 0), (3, 2)])
+@pytest.mark.parametrize("one_tile", [False, True])
+def test_bf16_attn_res_tile_follows_the_layer(one_tile, monkeypatch):
+    monkeypatch.setenv("ATOM_DMLA_ATTN_RES_TILE", "1" if one_tile else "0")
+    tiles = [_attn_res_bf16_config(c) for c in (2, 3, 5, 9, 17)]
+    assert all(t[:2] == (8, 2) for t in tiles)
+    assert [t[2] for t in tiles] == ([2, 4, 8, 16, 16] if one_tile else [2] * 5)
+
+
+@pytest.mark.parametrize("one_tile", [False, True])
+@pytest.mark.parametrize("blocks,add_count", [(1, 0), (3, 2), (8, 2)])
 @torch.inference_mode()
-def test_bf16_attn_res_batch_invariance(blocks, add_count):
+def test_bf16_attn_res_batch_invariance(blocks, add_count, one_tile, monkeypatch):
+    monkeypatch.setenv("ATOM_DMLA_ATTN_RES_TILE", "1" if one_tile else "0")
     generator = torch.Generator().manual_seed(20261025 + blocks)
     prefix = torch.randn(8, 7168, generator=generator).bfloat16()
     block = torch.randn(8, blocks, 7168, generator=generator).bfloat16()
@@ -83,7 +96,7 @@ def test_bf16_attn_res_batch_invariance(blocks, add_count):
     )
     score_weight, norm_weight = score_weight.cuda(), norm_weight.cuda()
     baseline = None
-    for rows in (97, 512, 513, 8192):
+    for rows in (8, 20, 97, 512, 513, 8192):
         x = _tile(prefix, rows).cuda()
         residuals = _tile(block, rows).cuda()
         add = [_tile(a, rows).cuda() for a in adds] if add_count else [None, None]

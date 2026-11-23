@@ -604,6 +604,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DMLA_MLA_HEAD_SPLIT": lambda: (
         os.getenv("ATOM_DMLA_MLA_HEAD_SPLIT", "0") == "1"
     ),
+    # Unquantized BF16 attn_res: take a layer's B+1 candidates in one tile
+    # (BL = next_pow2(B+1), at most 16) instead of two at a time. BL follows the
+    # layer, not the batch, so outputs stay batch invariant, but the candidate
+    # reduction order changes and BF16 outputs can move by one ulp. Off by
+    # default.
+    "ATOM_DMLA_ATTN_RES_TILE": lambda: (
+        os.getenv("ATOM_DMLA_ATTN_RES_TILE", "0") == "1"
+    ),
     # DCP sparse prefill: use the non-persistent fp8 gqa64 MLA kernel, which
     # needs no work metadata. On by default; needs an aiter with ROCm/aiter#6132.
     "ATOM_DCP_SPARSE_PREFILL_NONPS": lambda: (

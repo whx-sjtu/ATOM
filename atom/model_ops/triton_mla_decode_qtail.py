@@ -172,7 +172,8 @@ def mla_decode_qtail(
     if t == 0:
         return
     block_m = max(16, min(64, 1 << (t - 1).bit_length()))
-    _mla_decode_qtail_kernel[(-(-t // block_m), h, l // _BLOCK_N)](
+    block_n = _BLOCK_N // 2 if t <= 64 else _BLOCK_N
+    _mla_decode_qtail_kernel[(-(-t // block_m), h, l // block_n)](
         q_nope,
         q_pe,
         w_k,
@@ -199,7 +200,7 @@ def mla_decode_qtail(
         PE=pe,
         L=l,
         BLOCK_M=block_m,
-        BLOCK_N=_BLOCK_N,
+        BLOCK_N=block_n,
         FP8_MAX=torch.finfo(q_out.dtype).max,
         num_warps=4,
         num_stages=1,

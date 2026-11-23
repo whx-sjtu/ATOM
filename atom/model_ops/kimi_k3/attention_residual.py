@@ -38,6 +38,7 @@ from dataclasses import dataclass
 
 import torch
 
+from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace
 
@@ -559,6 +560,14 @@ _ATTN_RES_CATCHALL = (4, 2, 2)  # T > largest bucket
 # warp count at T=512 can move a value across a BF16 midpoint and alter MoE
 # routing when the same prefix is evaluated with different batch peers.
 _ATTN_RES_BF16_CONFIG = (8, 2, 2)
+_ATTN_RES_BF16_MAX_TILE = 16
+
+
+def _attn_res_bf16_config(candidates: int):
+    nw, ns, bl = _ATTN_RES_BF16_CONFIG
+    if envs.ATOM_DMLA_ATTN_RES_TILE:
+        bl = min(_ATTN_RES_BF16_MAX_TILE, triton.next_power_of_2(candidates))
+    return nw, ns, bl
 
 
 def _pick_attn_res_config(tokens: int):
@@ -661,7 +670,7 @@ def _apply_attn_res_impl(
     pref = torch.empty_like(ps) if do_add else ps
 
     nw, ns, bl = (
-        _ATTN_RES_BF16_CONFIG
+        _attn_res_bf16_config(Bp)
         if ps.dtype == torch.bfloat16 and quant_dtype is None
         else _pick_attn_res_config(T)
     )
