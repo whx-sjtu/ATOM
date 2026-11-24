@@ -122,8 +122,9 @@ class _Stub(nn.Module):
 def stub_block_parts(monkeypatch):
     monkeypatch.setenv("ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS", "0")
     monkeypatch.setenv("ATOM_KIMI_K3_MOE_LATENT_ROW_SHARD", "0")
-    monkeypatch.delenv("ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB", raising=False)
-    monkeypatch.delenv("ATOM_KIMI_K3_ROW_SHARD_GROUP_RS", raising=False)
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_CUSTOM_COMM", "0")
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB", "0")
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_GROUP_RS", "0")
     empty_like = torch.empty_like
 
     def poisoned_empty_like(*args, **kwargs):
@@ -588,6 +589,22 @@ def test_latent_row_shard_is_on_unless_0(monkeypatch):
     assert not kimi.envs.ATOM_KIMI_K3_MOE_LATENT_ROW_SHARD
 
 
+def test_row_tail_defaults(monkeypatch):
+    """Eager steps from 2048 rows and token-graph buckets from 512 take the row
+    tail, on the custom collectives unless ATOM_KIMI_K3_ROW_SHARD_CUSTOM_COMM=0."""
+    for name in (
+        "ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS",
+        "ATOM_KIMI_K3_MOE_ROW_SHARD_GRAPH_MIN_TOKENS",
+        "ATOM_KIMI_K3_ROW_SHARD_CUSTOM_COMM",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    assert kimi.envs.ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS == 2048
+    assert kimi.envs.ATOM_KIMI_K3_MOE_ROW_SHARD_GRAPH_MIN_TOKENS == 512
+    assert kimi.envs.ATOM_KIMI_K3_ROW_SHARD_CUSTOM_COMM is True
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_CUSTOM_COMM", "0")
+    assert kimi.envs.ATOM_KIMI_K3_ROW_SHARD_CUSTOM_COMM is False
+
+
 @pytest.mark.parametrize("layer_num", [4, 5], ids=["block-closes", "mid-block"])
 @pytest.mark.parametrize("tokens", [8, 13, 1027])
 def test_latent_row_shard_gathers_router_and_latent_rows(
@@ -708,10 +725,10 @@ def test_latent_row_shard_in_the_split_op_shards_its_input(logged, monkeypatch, 
 @pytest.mark.parametrize(
     "tokens,threshold,floor,expected",
     [
-        (8191, None, None, False),
-        (8192, None, None, True),
-        (8192, "8192", None, False),
-        (8193, "8192", None, True),
+        (2047, None, None, False),
+        (2048, None, None, True),
+        (2048, "2048", None, False),
+        (2049, "2048", None, True),
     ],
 )
 def test_row_gate_intersects_floor_and_strict_stream_threshold(
@@ -756,12 +773,21 @@ def _in_graph(monkeypatch, token_graph=True):
 @pytest.mark.parametrize(
     "graph_floor,token_graph,tokens,expected",
     [
-        (None, True, 4096, False),
+        (None, True, 511, False),
+        (None, True, 512, True),
+        ("0", True, 4096, False),
         ("1024", True, 1023, False),
         ("1024", True, 1024, True),
         ("1024", False, 4096, False),
     ],
-    ids=["default-off", "below-floor", "at-floor", "other-capture"],
+    ids=[
+        "below-default",
+        "at-default",
+        "off",
+        "below-floor",
+        "at-floor",
+        "other-capture",
+    ],
 )
 def test_row_gate_in_a_graph_takes_the_graph_floor(
     ranks, monkeypatch, graph_floor, token_graph, tokens, expected
@@ -779,7 +805,7 @@ def test_row_gate_in_a_graph_takes_the_graph_floor(
 
 def test_graph_floor_leaves_eager_steps_alone(ranks, monkeypatch):
     monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "0")
-    monkeypatch.delenv("ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS")
+    monkeypatch.setenv("ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS", "8192")
     monkeypatch.setenv("ATOM_KIMI_K3_MOE_ROW_SHARD_GRAPH_MIN_TOKENS", "1024")
     monkeypatch.setattr(kimi, "prefill_token_graph_capture", lambda: True)
     block = SimpleNamespace(tp_size=WORLD)
@@ -848,15 +874,17 @@ def _row_layer_forward(monkeypatch, latent, tokens):
     return forward
 
 
-def test_pynccl_cap_and_group_are_off_by_default(monkeypatch):
+def test_pynccl_cap_and_group_defaults(monkeypatch):
+    """Row-tail reduce-scatters above 48 MiB run on pynccl and eager steps group
+    the routed and shared ones, unless set to 0."""
     monkeypatch.delenv("ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB", raising=False)
     monkeypatch.delenv("ATOM_KIMI_K3_ROW_SHARD_GROUP_RS", raising=False)
-    assert kimi.envs.ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB == 0
-    assert kimi.envs.ATOM_KIMI_K3_ROW_SHARD_GROUP_RS is False
-    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB", "48")
-    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_GROUP_RS", "1")
     assert kimi.envs.ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB == 48
     assert kimi.envs.ATOM_KIMI_K3_ROW_SHARD_GROUP_RS is True
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB", "0")
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_GROUP_RS", "0")
+    assert kimi.envs.ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB == 0
+    assert kimi.envs.ATOM_KIMI_K3_ROW_SHARD_GROUP_RS is False
 
 
 @pytest.mark.parametrize("latent", ["0", "1"], ids=["latent-off", "latent-on"])

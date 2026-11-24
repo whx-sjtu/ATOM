@@ -141,9 +141,10 @@ def test_kimi_records_prefill_token_graphs_without_dp_while_its_layers_split(
 
 def test_kimi_buckets_pad_under_256_rows_past_1024_and_stop_at_4096():
     """Native Kimi's own prefill buckets, recorded when ATOM_TOKEN_GRAPH_SIZES
-    is unset. None reaches the 8192 rows from which an eager prefill row-shards
-    its MoE and splits its KDA in_proj, and the largest's BF16 hidden rows
-    (7168 wide) fit one AITER custom all-reduce of its 64 MiB default."""
+    is unset. None reaches the 8192 rows from which an eager prefill splits its
+    KDA in_proj, those that record the row-sharded MoE tail split evenly over 8
+    ranks, and the largest's BF16 hidden rows (7168 wide) fit one AITER custom
+    all-reduce or reduce-scatter of its 64 MiB default."""
     from atom.utils import envs
 
     with _einops(), atom_without_aiter() as load:
@@ -154,7 +155,8 @@ def test_kimi_buckets_pad_under_256_rows_past_1024_and_stop_at_4096():
     assert all(b - a <= 256 for a, b in pairwise(sizes) if b > 1024)
     assert max(sizes) == 4096
     assert max(sizes) < model._KDA_IN_PROJ_SPLIT_MIN_TOKENS
-    assert max(sizes) < envs.ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS
+    floor = envs.ATOM_KIMI_K3_MOE_ROW_SHARD_GRAPH_MIN_TOKENS
+    assert all(s % 8 == 0 for s in sizes if s >= floor)
     assert max(sizes) * 7168 * 2 <= 64 << 20
 
 

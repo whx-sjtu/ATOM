@@ -238,12 +238,13 @@ def test_a_bad_bound_is_refused(monkeypatch, name, value):
         read()
 
 
-def test_the_switch_is_off_by_default(monkeypatch):
+def test_the_switch_is_on_by_default(monkeypatch):
     from atom.utils import envs
     from atom.utils.forward_context import AttentionMetaData
 
     monkeypatch.delenv("ATOM_DSA_ROW_PARALLEL_PREFILL", raising=False)
-    assert envs.ATOM_DSA_ROW_PARALLEL_PREFILL is False
+    assert envs.ATOM_DSA_ROW_PARALLEL_PREFILL is True
+    assert rp.requested() is False
     assert envs.ATOM_DSA_ROW_PARALLEL_PREFILL_MIN_TOKENS == 8192
     assert envs.ATOM_DSA_ROW_PARALLEL_PREFILL_MAX_KV_ROWS == 1 << 18
     assert AttentionMetaData().dsa_row_parallel is None
@@ -400,6 +401,28 @@ def test_a_step_it_does_not_take_runs_the_default_calls(
     assert md.dsa_row_parallel is None and plans == []
 
 
+@pytest.mark.parametrize(
+    "sizes,taken",
+    [
+        ((), True),
+        ((256, 512, *range(1024, 4097, 256)), True),  # Kimi-K3's own
+        ((256, 4096, 16384), False),
+        ((8192, 32768), False),
+    ],
+)
+def test_a_step_a_token_graph_bucket_holds_keeps_the_default_path(
+    monkeypatch, sizes, taken
+):
+    monkeypatch.setitem(aiter_mla.TokenGraph._sizes, "prefill", sizes)
+    b, calls, plans = _builder(monkeypatch)
+    batch = _batch([16384], [16384])
+    md = _metadata(16384)
+    _finish(b, batch, _staged(batch), md)
+    assert (md.dsa_row_parallel is not None) is taken
+    if not taken:
+        assert _names(calls) == _DEFAULT and plans == []
+
+
 def test_layers_not_ready_keep_the_default_path(monkeypatch):
     b, calls, _plans = _builder(monkeypatch)
     b._dsa_row_parallel_layers = False
@@ -474,7 +497,7 @@ def test_the_first_whole_row_plan_is_checked_against_aiters(monkeypatch):
 
 
 def test_the_switch_off_resolves_nothing(monkeypatch):
-    monkeypatch.delenv("ATOM_DSA_ROW_PARALLEL_PREFILL", raising=False)
+    monkeypatch.setenv("ATOM_DSA_ROW_PARALLEL_PREFILL", "0")
     b = object.__new__(aiter_mla.AiterMLAMetadataBuilder)
     warmed = []
     monkeypatch.setattr(rp, "warm_gathered_kv_index", lambda *a: warmed.append(a))
@@ -519,6 +542,16 @@ def test_the_switch_on_where_it_cannot_run_warns(monkeypatch):
     b, config, warmed, warned = _resolvable(monkeypatch, dcp_sparse_prefill_nonps=True)
     assert b._resolve_dsa_row_parallel(config) is False
     assert warmed == [] and len(warned) == 1
+
+
+def test_the_default_where_it_cannot_run_only_logs(monkeypatch):
+    b, config, warmed, warned = _resolvable(monkeypatch, dcp_world_size=1)
+    monkeypatch.delenv("ATOM_DSA_ROW_PARALLEL_PREFILL")
+    logged = []
+    monkeypatch.setattr(aiter_mla.logger, "info", lambda *a: logged.append(a))
+    assert b._resolve_dsa_row_parallel(config) is False
+    assert warmed == [] and warned == []
+    assert [a[1:] for a in logged] == [("DCP is off",)]
 
 
 def _impl(**kw):
@@ -579,6 +612,7 @@ def test_every_sparse_layer_must_be_ready(monkeypatch, change, ready):
         model=SimpleNamespace(modules=lambda: iter(layers))
     )
     b._dsa_row_parallel_layers = None
+    monkeypatch.setenv("ATOM_DSA_ROW_PARALLEL_PREFILL", "1")
     warned = []
     monkeypatch.setattr(aiter_mla.logger, "warning", lambda *a: warned.append(a))
     assert b._dsa_row_parallel_layers_ready() is ready

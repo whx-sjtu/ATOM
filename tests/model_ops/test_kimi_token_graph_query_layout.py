@@ -150,7 +150,9 @@ def runtime(monkeypatch):
         kv_cache_dtype="bf16",
         index_cache_dtype="fp8",
         max_model_len=32,
-        parallel_config=SimpleNamespace(data_parallel_size=1),
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1, decode_context_parallel_size=8
+        ),
         prefill_context_parallel_size=1,
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
@@ -340,9 +342,12 @@ def test_constructor_declines_unsupported_owners(runtime, case):
     assert getattr(owner.attn.impl, "prefill_query_layout", None) is None
 
 
-@pytest.mark.parametrize("case", ["off", "sparse", "quantized", "dense"])
+@pytest.mark.parametrize("case", ["off", "sparse", "no_dcp", "quantized", "dense"])
 def test_constructor_opts_bf16_sparse_layers_into_row_parallel_prefill(runtime, case):
     runtime.envs.ATOM_DSA_ROW_PARALLEL_PREFILL = case != "off"
+    runtime.config.parallel_config.decode_context_parallel_size = (
+        1 if case == "no_dcp" else 8
+    )
     runtime.mode.quantized = case == "quantized"
     runtime.mode.sparse = case != "dense"
     owner = runtime.make()
@@ -352,9 +357,14 @@ def test_constructor_opts_bf16_sparse_layers_into_row_parallel_prefill(runtime, 
         assert getattr(owner.indexer, "row_parallel", False) is opted
 
 
-@pytest.mark.parametrize("case", ["front", "off", "front_off", "pcp", "quantized"])
+@pytest.mark.parametrize(
+    "case", ["front", "off", "front_off", "no_dcp", "pcp", "quantized"]
+)
 def test_constructor_registers_the_front_op_of_row_parallel_layers(runtime, case):
     runtime.envs.ATOM_DSA_ROW_PARALLEL_PREFILL = case != "off"
+    runtime.config.parallel_config.decode_context_parallel_size = (
+        1 if case == "no_dcp" else 8
+    )
     runtime.envs.ATOM_DSA_ROW_PARALLEL_PREFILL_FRONT = case != "front_off"
     runtime.mode.pcp = case == "pcp"
     runtime.mode.quantized = case == "quantized"

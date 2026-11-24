@@ -117,6 +117,7 @@ from atom.utils.forward_context import (
     Context,
     get_forward_context,
 )
+from atom.utils.region_graph import TokenGraph
 from atom.utils.tbo import NUM_TBO_UBATCHES, UBatchSlice
 
 from .backends import (
@@ -451,6 +452,13 @@ def _check_whole_row_plan(
         _aiter_sparse_prefill_plan(
             builder, attn_metadata, num_heads, last_page_lens, work
         )
+
+
+def _log_dsa_row_parallel_off(why: str) -> None:
+    if dsa_row_parallel.requested():
+        logger.warning("%s=1 ignored: %s", dsa_row_parallel.ENV, why)
+    else:
+        logger.info("Row-parallel DSA prefill off: %s", why)
 
 
 class AiterMLAMetadataBuilder(CommonAttentionBuilder):
@@ -2627,8 +2635,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
     def _resolve_dsa_row_parallel(self, config) -> bool:
         """Whether this builder plans row-parallel DSA prefill steps
-        (`ATOM_DSA_ROW_PARALLEL_PREFILL`); warns when the switch is on and
-        this configuration cannot."""
+        (`ATOM_DSA_ROW_PARALLEL_PREFILL`); warns when the switch is set and
+        this configuration cannot, and only logs it when the switch is on
+        by default."""
         if not envs.ATOM_DSA_ROW_PARALLEL_PREFILL:
             return False
         why = dsa_row_parallel.builder_blocker(
@@ -2643,7 +2652,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ),
         )
         if why is not None:
-            logger.warning("%s=1 ignored: %s", dsa_row_parallel.ENV, why)
+            _log_dsa_row_parallel_off(why)
             return False
         self._dsa_row_parallel_min_tokens = dsa_row_parallel.min_tokens_env()
         self._dsa_row_parallel_max_kv_rows = dsa_row_parallel.max_kv_rows_env()
@@ -2688,7 +2697,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             for impl in sparse:
                 why = why or impl.dsa_row_parallel_blocker()
             if why is not None:
-                logger.warning("%s=1 ignored: %s", dsa_row_parallel.ENV, why)
+                _log_dsa_row_parallel_off(why)
             self._dsa_row_parallel_layers = why is None
         return self._dsa_row_parallel_layers
 
@@ -2704,6 +2713,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         if (
             batch.is_dummy_run
             or tokens < self._dsa_row_parallel_min_tokens
+            # A step a recorded prefill bucket holds may replay it, and the
+            # recording's segments (the front among them) run the default path.
+            or TokenGraph.bucket(tokens, "prefill") is not None
             or attn_metadata.ubatches
             or staged.pcp_split
             or staged.index_rows.passes is not None

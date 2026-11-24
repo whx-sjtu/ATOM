@@ -61,19 +61,29 @@ def test_hash_changes_with_kv_cache_dtype():
 def test_hash_keys_the_row_parallel_front(monkeypatch):
     # The front moves the q/kv projections into an opaque op; a front run that
     # loaded a FRONT=0 artifact failed copy_misaligned_inputs. Row-parallel
-    # alone stays inside opaque ops and keeps the artifact.
-    monkeypatch.delenv("ATOM_DSA_ROW_PARALLEL_PREFILL", raising=False)
-    monkeypatch.delenv("ATOM_DSA_ROW_PARALLEL_PREFILL_FRONT", raising=False)
-    base = _hash()
+    # alone stays inside opaque ops and keeps the artifact; without DCP no
+    # layer opts in.
+    def parallel(dcp):
+        return SimpleNamespace(
+            decode_context_parallel_size=dcp, compute_hash=lambda: f"dcp{dcp}"
+        )
 
-    def hashed(row_parallel, front):
-        monkeypatch.setenv("ATOM_DSA_ROW_PARALLEL_PREFILL", row_parallel)
-        monkeypatch.setenv("ATOM_DSA_ROW_PARALLEL_PREFILL_FRONT", front)
-        return _hash()
+    def hashed(row_parallel, front, dcp=8):
+        for name, value in (
+            ("ATOM_DSA_ROW_PARALLEL_PREFILL", row_parallel),
+            ("ATOM_DSA_ROW_PARALLEL_PREFILL_FRONT", front),
+        ):
+            if value is None:
+                monkeypatch.delenv(name, raising=False)
+            else:
+                monkeypatch.setenv(name, value)
+        return _hash(parallel_config=parallel(dcp))
 
-    assert hashed("0", "1") == base
-    assert hashed("1", "0") == base
-    assert hashed("1", "1") != base
+    off = hashed("0", "1")
+    assert hashed("1", "0") == off
+    assert hashed("1", "1") != off
+    assert hashed(None, None) == hashed("1", "1")
+    assert hashed(None, None, dcp=1) == hashed("0", "1", dcp=1)
 
 
 def test_hash_ignores_settings_that_stay_out_of_the_graph():

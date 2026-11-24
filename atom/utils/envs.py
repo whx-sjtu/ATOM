@@ -598,11 +598,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # projects its rows' queries, all-gathers the step's KV rows (at most
     # _MAX_KV_ROWS, each request padded to whole local blocks; a larger step
     # keeps the default path) and attends them over each row's whole top-k,
-    # with no LSE merge. Off by default. Changes numerics: one softmax a row
-    # instead of LSE-merged per-rank partials. The memory profile reserves
-    # the gather at _MAX_KV_ROWS.
+    # with no LSE merge. On by default; Kimi-K3 layers opt in only under
+    # DCP. Changes numerics: one softmax a row instead of LSE-merged
+    # per-rank partials. The memory profile reserves the gather at
+    # _MAX_KV_ROWS.
     "ATOM_DSA_ROW_PARALLEL_PREFILL": lambda: (
-        os.getenv("ATOM_DSA_ROW_PARALLEL_PREFILL", "0") == "1"
+        os.getenv("ATOM_DSA_ROW_PARALLEL_PREFILL", "1") == "1"
     ),
     "ATOM_DSA_ROW_PARALLEL_PREFILL_MIN_TOKENS": lambda: int(
         os.getenv("ATOM_DSA_ROW_PARALLEL_PREFILL_MIN_TOKENS", "8192")
@@ -668,9 +669,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # aiter's combine, which rounds the gated heads to bf16 once instead of
     # rounding the merge and then the gate (within one bf16 ulp; numerics
     # change). Every other path keeps the separate gate kernel. Needs an aiter
-    # whose dcp_lse_combine takes a gate. Off by default; 1 turns it on.
+    # whose dcp_lse_combine takes a gate (else it warns once and keeps the
+    # separate kernel). On by default; 0 keeps the separate kernel everywhere.
     "ATOM_DMLA_GATE_IN_MERGE": lambda: (
-        os.getenv("ATOM_DMLA_GATE_IN_MERGE", "0") == "1"
+        os.getenv("ATOM_DMLA_GATE_IN_MERGE", "1") == "1"
     ),
     # DCP sparse decode: kernel that merges the exchanged top-k candidates into
     # this rank's owned KV slots. "aiter" (default) is flydsl_dcp_topk_merge;
@@ -1128,9 +1130,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # With ATOM_KDA_PREFILL_CKPT_SPLIT, cut every step it can, including those
     # whose rows FlashKDA segments: the segments a cut moves change numerics
-    # (same order against fp32). Off by default.
+    # (same order against fp32). On by default; 0 keeps the head re-run there.
     "ATOM_KDA_PREFILL_CKPT_SPLIT_ALL": lambda: (
-        os.getenv("ATOM_KDA_PREFILL_CKPT_SPLIT_ALL", "0") == "1"
+        os.getenv("ATOM_KDA_PREFILL_CKPT_SPLIT_ALL", "1") == "1"
     ),
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT": lambda: (
         os.getenv("ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT", "1") == "1"
@@ -1412,9 +1414,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")
     ),
-    # Lower row bound for Kimi's sharded attention residual and latent MoE tail.
+    # Lower row bound for Kimi's sharded attention residual and latent MoE tail
+    # on an eager step. With ATOM_KIMI_K3_ROW_SHARD_CUSTOM_COMM=0 the row tail
+    # pays only from 4096 rows.
     "ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS": lambda: int(
-        os.getenv("ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS", "8192")
+        os.getenv("ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS", "2048")
     ),
     # On those row-sharded steps, run the MoE router and latent down projection
     # on each rank's rows and gather them, instead of on every row per rank.
@@ -1431,30 +1435,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Lower row bound for that row sharding inside a prefill token graph: a
     # bucket of at least this many rows records it (and its warmup runs it),
-    # on AITER's custom reduce-scatter and gather. 0 (default) records every
-    # bucket replicated.
+    # on AITER's custom reduce-scatter and gather. 0 records every bucket
+    # replicated.
     "ATOM_KIMI_K3_MOE_ROW_SHARD_GRAPH_MIN_TOKENS": lambda: int(
-        os.getenv("ATOM_KIMI_K3_MOE_ROW_SHARD_GRAPH_MIN_TOKENS", "0")
+        os.getenv("ATOM_KIMI_K3_MOE_ROW_SHARD_GRAPH_MIN_TOKENS", "512")
     ),
     # Eager row-sharded steps reduce-scatter and gather on AITER's custom
     # kernels (pynccl above their size caps) instead of RCCL. Changes the
-    # reduction order. Off by default.
+    # reduction order. On by default; 0 runs them on RCCL.
     "ATOM_KIMI_K3_ROW_SHARD_CUSTOM_COMM": lambda: (
-        os.getenv("ATOM_KIMI_K3_ROW_SHARD_CUSTOM_COMM", "0") == "1"
+        os.getenv("ATOM_KIMI_K3_ROW_SHARD_CUSTOM_COMM", "1") == "1"
     ),
     # On row-sharded steps with the custom collectives (eager under the switch
     # above, and token graphs), reduce-scatter inputs above this many MiB run on
     # pynccl directly. Unlike AITER_CUSTOM_RS_MAX_SIZE it leaves every other
-    # custom reduce-scatter alone. Changes their reduction order. 0 (default)
-    # keeps AITER's choice.
+    # custom reduce-scatter alone. Changes their reduction order. 48 by default
+    # (MI355X TP8's crossover); 0 keeps AITER's choice.
     "ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB": lambda: float(
-        os.getenv("ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB", "0")
+        os.getenv("ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB", "48")
     ),
     # Eager row-sharded steps with the custom collectives reduce-scatter the
     # routed and shared partials as one NCCL group when the shared one runs on
-    # pynccl. Changes the reduction order of both. Off by default.
+    # pynccl. Changes the reduction order of both. On by default; 0 keeps them
+    # apart.
     "ATOM_KIMI_K3_ROW_SHARD_GROUP_RS": lambda: (
-        os.getenv("ATOM_KIMI_K3_ROW_SHARD_GROUP_RS", "0") == "1"
+        os.getenv("ATOM_KIMI_K3_ROW_SHARD_GROUP_RS", "1") == "1"
     ),
     # The next residual mix reads a row-sharded step's zero addends as one zero row.
     # Bit-identical output. On by default; 0 reads the zero tensors themselves.

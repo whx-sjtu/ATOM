@@ -1342,6 +1342,8 @@ class KimiFullAttention(nn.Module):
             and self.indexer is not None
             and not self.fuse_qknorm_quant
             and isinstance(self.attn.impl, MLAAttention)
+            # Config.compute_hash keys the front on the same condition.
+            and atom_config.parallel_config.decode_context_parallel_size > 1
         )
         if dsa_row_parallel:
             # A long sparse prefill may run row-parallel (dsa_row_parallel):

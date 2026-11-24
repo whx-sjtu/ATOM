@@ -3807,11 +3807,13 @@ class Config:
         # The row-parallel prefill front moves Kimi-K3's fused_qkv_a, q/kv norms
         # and the indexer's wq_b into the opaque `kimi_k3_dsa_front` op: another
         # graph, and the pcp hazard above (a front run loading a FRONT=0
-        # artifact trips copy_misaligned_inputs). Keyed only when it may run, so
-        # every other configuration keeps its artifacts.
+        # artifact trips copy_misaligned_inputs). Keyed only when it may run
+        # (Kimi-K3 opts in under DCP only), so every other configuration keeps
+        # its artifacts.
         if (
             envs.ATOM_DSA_ROW_PARALLEL_PREFILL
             and envs.ATOM_DSA_ROW_PARALLEL_PREFILL_FRONT
+            and getattr(self.parallel_config, "decode_context_parallel_size", 1) > 1
         ):
             factors.append("dsa_row_parallel_front")
         # The sparse-attention indexer bakes max_model_len and max_num_seqs into

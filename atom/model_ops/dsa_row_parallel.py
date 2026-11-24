@@ -41,6 +41,7 @@ their kernels may sum in another order.
 """
 
 import logging
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 
@@ -54,6 +55,12 @@ from atom.utils import envs, upload_numpy
 logger = logging.getLogger("atom")
 
 ENV = "ATOM_DSA_ROW_PARALLEL_PREFILL"
+
+
+def requested() -> bool:
+    """Whether `ENV` is set, rather than on by default: only then does a
+    configuration that cannot run it warn."""
+    return ENV in os.environ
 
 
 def min_tokens_env() -> int:
