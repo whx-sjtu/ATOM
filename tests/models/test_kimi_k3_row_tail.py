@@ -70,7 +70,11 @@ def ranks(monkeypatch):
         return local.comm.gather(local.rank, x)
 
     group = SimpleNamespace(
-        reduce_scatter_tensor=reduce_scatter_tensor, all_gather=all_gather
+        reduce_scatter_tensor=reduce_scatter_tensor,
+        all_gather=all_gather,
+        device_communicator=SimpleNamespace(
+            all_gather=lambda x, dim: all_gather(x, dim=dim)
+        ),
     )
     monkeypatch.setattr(sequence_parallel, "get_tp_group", lambda: group)
     monkeypatch.setattr(kimi, "get_tensor_model_parallel_rank", lambda: local.rank)
@@ -340,9 +344,18 @@ class _Attention(nn.Module):
 @pytest.fixture
 def logged(ranks, monkeypatch):
     group = sequence_parallel.get_tp_group()
+
+    def reduce_scatter(x, use_custom=False, dim=0):
+        name = "custom_reduce_scatter" if use_custom else "reduce_scatter"
+        _events.log.append((name, x.shape[0]))
+        return group.reduce_scatter_tensor(x, use_custom=use_custom, dim=dim)
+
     logged_group = SimpleNamespace(
-        reduce_scatter_tensor=_logs("reduce_scatter", group.reduce_scatter_tensor),
+        reduce_scatter_tensor=reduce_scatter,
         all_gather=_logs("all_gather", group.all_gather),
+        device_communicator=SimpleNamespace(
+            all_gather=_logs("custom_all_gather", group.device_communicator.all_gather)
+        ),
     )
     monkeypatch.setattr(sequence_parallel, "get_tp_group", lambda: logged_group)
     all_reduce = _logs("all_reduce", kimi.tensor_model_parallel_all_reduce)
@@ -694,6 +707,118 @@ def test_row_gate_refuses_graph_warmup(ranks, monkeypatch):
         kimi, "get_forward_context", lambda: SimpleNamespace(in_hipgraph=True)
     )
     assert not kimi.KimiSparseMoeBlock.takes_row_tail(block, 8192)
+
+
+def _in_graph(monkeypatch, token_graph=True):
+    """This forward records a prefill token-graph bucket or warms one up, or
+    with ``token_graph`` False is inside some other graph capture."""
+    monkeypatch.setattr(
+        kimi,
+        "get_forward_context",
+        lambda: SimpleNamespace(in_hipgraph=True, context=None, tr_graph="record"),
+    )
+    monkeypatch.setattr(kimi, "prefill_token_graph_capture", lambda: token_graph)
+
+
+@pytest.mark.parametrize(
+    "graph_floor,token_graph,tokens,expected",
+    [
+        (None, True, 4096, False),
+        ("1024", True, 1023, False),
+        ("1024", True, 1024, True),
+        ("1024", False, 4096, False),
+    ],
+    ids=["default-off", "below-floor", "at-floor", "other-capture"],
+)
+def test_row_gate_in_a_graph_takes_the_graph_floor(
+    ranks, monkeypatch, graph_floor, token_graph, tokens, expected
+):
+    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "0")
+    monkeypatch.setenv("ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS", "0")
+    if graph_floor is None:
+        monkeypatch.delenv("ATOM_KIMI_K3_MOE_ROW_SHARD_GRAPH_MIN_TOKENS", raising=False)
+    else:
+        monkeypatch.setenv("ATOM_KIMI_K3_MOE_ROW_SHARD_GRAPH_MIN_TOKENS", graph_floor)
+    _in_graph(monkeypatch, token_graph)
+    block = SimpleNamespace(tp_size=WORLD)
+    assert kimi.KimiSparseMoeBlock.takes_row_tail(block, tokens) is expected
+
+
+def test_graph_floor_leaves_eager_steps_alone(ranks, monkeypatch):
+    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "0")
+    monkeypatch.delenv("ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS")
+    monkeypatch.setenv("ATOM_KIMI_K3_MOE_ROW_SHARD_GRAPH_MIN_TOKENS", "1024")
+    monkeypatch.setattr(kimi, "prefill_token_graph_capture", lambda: True)
+    block = SimpleNamespace(tp_size=WORLD)
+    assert not kimi.KimiSparseMoeBlock.takes_row_tail(block, 4096)
+    assert kimi.KimiSparseMoeBlock.takes_row_tail(block, 8192)
+
+
+@pytest.mark.parametrize("latent", ["0", "1"], ids=["latent-off", "latent-on"])
+@pytest.mark.parametrize("how", ["switch", "token-graph"])
+@pytest.mark.parametrize("tokens", [13, 16])
+def test_custom_collectives_run_the_same_row_path(
+    logged, monkeypatch, how, latent, tokens
+):
+    """Under the switch, and always in a token-graph recording, every
+    reduce-scatter and gather of the row path takes the custom kernels. The
+    stub collectives sum alike, so the outputs match bit for bit."""
+    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "0")
+    monkeypatch.setenv("ATOM_KIMI_K3_MOE_LATENT_ROW_SHARD", latent)
+    layers = _layers(BLOCK + 1)
+    _merge_front(monkeypatch, [layer.block_sparse_moe for layer in layers])
+    inputs = _inputs(tokens)
+
+    def forward(rank):
+        return layers[rank](None, *(x.clone() for x in inputs))
+
+    rccl = logged(forward)
+    if how == "switch":
+        monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_CUSTOM_COMM", "1")
+    else:
+        monkeypatch.setenv("ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS", "100000")
+        monkeypatch.setenv("ATOM_KIMI_K3_MOE_ROW_SHARD_GRAPH_MIN_TOKENS", "8")
+        _in_graph(monkeypatch)
+    custom = logged(forward)
+    renamed = {
+        "reduce_scatter": "custom_reduce_scatter",
+        "all_gather": "custom_all_gather",
+    }
+    for (want, want_log), (got, log) in zip(rccl, custom):
+        assert ("reduce_scatter", -(-tokens // WORLD) * WORLD) in want_log
+        assert log == [(renamed.get(name, name), rows) for name, rows in want_log]
+        assert all(torch.equal(a, b) for a, b in zip(got, want))
+
+
+@pytest.mark.parametrize("latent", ["0", "1"], ids=["latent-off", "latent-on"])
+@pytest.mark.parametrize("layer_num", [4, 5], ids=["block-closes", "mid-block"])
+def test_token_graph_padding_rows_never_reach_real_rows(
+    logged, monkeypatch, latent, layer_num
+):
+    """A step padded to its bucket replays the row path over every bucket row:
+    whatever the padding rows hold, the real rows come out the same."""
+    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "0")
+    monkeypatch.setenv("ATOM_KIMI_K3_MOE_LATENT_ROW_SHARD", latent)
+    monkeypatch.setenv("ATOM_KIMI_K3_MOE_ROW_SHARD_GRAPH_MIN_TOKENS", "16")
+    _in_graph(monkeypatch)
+    layers = _layers(layer_num)
+    _merge_front(monkeypatch, [layer.block_sparse_moe for layer in layers])
+    real, bucket = 13, 16
+    padded = _inputs(bucket)
+    other = tuple(x.clone() for x in padded)
+    gen = torch.Generator().manual_seed(7)
+    for x in other:
+        x[real:] = 4 * torch.randn(x[real:].shape, generator=gen).to(x.dtype)
+    runs = [
+        logged(
+            lambda rank, inputs=inputs: layers[rank](None, *(x.clone() for x in inputs))
+        )
+        for inputs in (padded, other)
+    ]
+    for (a, log), (b, _) in zip(*runs):
+        assert ("custom_reduce_scatter", bucket) in log
+        assert not torch.equal(a[0][real:], b[0][real:])
+        assert all(torch.equal(x[:real], y[:real]) for x, y in zip(a, b))
 
 
 @pytest.mark.parametrize(

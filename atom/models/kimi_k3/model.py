@@ -125,6 +125,15 @@ def _log_latent_rows_unmerged():
     )
 
 
+@lru_cache(maxsize=1)
+def _log_row_tail_in_token_graphs(floor: int):
+    logging.getLogger("atom").info(
+        "Kimi-K3 prefill token graphs of at least %d rows record the "
+        "row-sharded attention residual and MoE tail",
+        floor,
+    )
+
+
 def _text_config(config):
     return getattr(config, "text_config", config)
 
@@ -736,17 +745,41 @@ class KimiSparseMoeBlock(nn.Module):
         return self._split_op_pair(self.split_moe_forward(hidden_states))
 
     def takes_row_tail(self, num_tokens: int) -> bool:
-        """Row-shard with TP outside graph warmup/capture and TBO, above the stream threshold
-        and at least the row floor. Attention residual uses the same gate."""
+        """Row-shard with TP outside TBO, above the stream threshold and at
+        least the row floor: an eager step's, or a prefill token-graph
+        recording's and its warmup's (no other graph warmup or capture).
+        Attention residual uses the same gate."""
         from atom.utils.tbo.ubatching import tbo_active
 
-        return (
-            self.tp_size > 1
-            and num_tokens > envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
-            and num_tokens >= envs.ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS
-            and not get_forward_context().in_hipgraph
-            and not torch.cuda.is_current_stream_capturing()
-            and not tbo_active()
+        if (
+            self.tp_size == 1
+            or num_tokens <= envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
+            or tbo_active()
+        ):
+            return False
+        if (
+            get_forward_context().in_hipgraph
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            floor = envs.ATOM_KIMI_K3_MOE_ROW_SHARD_GRAPH_MIN_TOKENS
+            if 0 < floor <= num_tokens and prefill_token_graph_capture():
+                _log_row_tail_in_token_graphs(floor)
+                return True
+            return False
+        return num_tokens >= envs.ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS
+
+    def row_shards(self, num_tokens: int):
+        """A row-sharded step's rows; its collectives take AITER's custom
+        kernels in a graph and under ATOM_KIMI_K3_ROW_SHARD_CUSTOM_COMM."""
+        from atom.distributed.sequence_parallel import SequenceParallel
+
+        custom = (
+            envs.ATOM_KIMI_K3_ROW_SHARD_CUSTOM_COMM
+            or get_forward_context().in_hipgraph
+            or torch.cuda.is_current_stream_capturing()
+        )
+        return SequenceParallel(
+            num_tokens, self.tp_size, get_tensor_model_parallel_rank(), custom=custom
         )
 
     def _row_sharded_split_moe_forward(
@@ -754,11 +787,7 @@ class KimiSparseMoeBlock(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """`row_sharded_moe` over this step's rows. The second return is zeros:
         the op's schema has no optional tensor."""
-        from atom.distributed.sequence_parallel import SequenceParallel
-
-        rows = SequenceParallel(
-            hidden_states.shape[0], self.tp_size, get_tensor_model_parallel_rank()
-        )
+        rows = self.row_shards(hidden_states.shape[0])
         output = self.row_sharded_moe(hidden_states, rows)
         return output, torch.zeros_like(output)
 
@@ -2892,11 +2921,7 @@ class KimiDecoderLayer(nn.Module):
         if not moe.takes_row_tail(attn_partial.shape[0]):
             attn_out = tensor_model_parallel_all_reduce(attn_partial)
             return self._mlp(attn_out, prefix_sum, block_residual)
-        from atom.distributed.sequence_parallel import SequenceParallel
-
-        rows = SequenceParallel(
-            attn_partial.shape[0], moe.tp_size, get_tensor_model_parallel_rank()
-        )
+        rows = moe.row_shards(attn_partial.shape[0])
         window = self.mlp_attn_res.window(block_residual)
         hidden_rows, prefix_rows = self.mlp_attn_res(
             None if prefix_sum is None else rows.shard(prefix_sum),

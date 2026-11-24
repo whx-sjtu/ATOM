@@ -24,14 +24,20 @@ class SequenceParallel:
 
     Pad to a multiple of the TP size and drop padded rows on gather.
     Per-token work runs locally; consumers needing every row gather first.
+    ``custom`` runs both collectives on AITER's custom kernels where they fit
+    and on pynccl elsewhere, either of which a graph can capture, instead of
+    on RCCL through torch.distributed.
     """
 
-    def __init__(self, num_tokens: int, tp_size: int, tp_rank: int) -> None:
+    def __init__(
+        self, num_tokens: int, tp_size: int, tp_rank: int, custom: bool = False
+    ) -> None:
         self.num_tokens = num_tokens
         self.chunk = -(-num_tokens // tp_size)
         self.pad = self.chunk * tp_size - num_tokens
         self.start = tp_rank * self.chunk
         self.group = get_tp_group()
+        self.custom = custom
 
     def shard(self, x: torch.Tensor) -> torch.Tensor:
         """Replicated `[T, ...]` -> this rank's rows (a view unless padded).
@@ -42,13 +48,16 @@ class SequenceParallel:
 
     def gather(self, x: torch.Tensor) -> torch.Tensor:
         """This rank's rows -> all `[T, ...]` rows."""
-        out = self.group.all_gather(x.contiguous(), use_custom=False, dim=0)
+        if self.custom:
+            out = self.group.device_communicator.all_gather(x.contiguous(), 0)
+        else:
+            out = self.group.all_gather(x.contiguous(), use_custom=False, dim=0)
         return out[: self.num_tokens] if self.pad else out
 
     def scatter(self, x: torch.Tensor) -> torch.Tensor:
         """Per-rank partial sums over all `[T, ...]` rows -> summed local rows."""
         return self.group.reduce_scatter_tensor(
-            _pad_rows(x.contiguous(), self.pad), use_custom=False, dim=0
+            _pad_rows(x.contiguous(), self.pad), use_custom=self.custom, dim=0
         )
 
     @classmethod
