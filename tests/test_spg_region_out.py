@@ -18,7 +18,7 @@ import torch._dynamo  # before Triton may be faked below
 from aiter_stub import atom_without_aiter
 from torch import nn
 
-from atom.utils import forward_context
+from atom.utils import forward_context, region_graph
 from atom.utils.region_graph import TokenGraphQueryLayout
 
 
@@ -340,3 +340,86 @@ def test_the_paged_recurrence_writes_the_buffer(given):
             v.data_ptr(),
         )
     )
+
+
+# The recording pattern on a card: a segment allocates the region's buffer,
+# the region writes it and returns a view at its start, so the next segment
+# reads the buffer itself and a replay copies nothing.
+LIVE = {"scale": 1.0, "rows": 0}
+
+
+class _BufferedRegion(nn.Module):
+    def __init__(self, copy_in):
+        super().__init__()
+        self.a = nn.Linear(64, 64, device="cuda")
+        self.copy_in = copy_in
+
+    @region_graph.eager_region()
+    def region(self, x, buf):
+        n = x.shape[0]
+        result = x * LIVE["scale"]
+        if self.copy_in:  # a kernel that could not take the buffer
+            buf[:n].copy_(result)
+        else:
+            torch.mul(x, LIVE["scale"], out=buf[:n])
+        buf[n : n + LIVE["rows"]] = 1.0  # past the rows read: head tokens
+        return buf[:n]
+
+    def forward(self, x):
+        h = self.a(x)
+        buf = h.new_empty((2 * h.shape[0], h.shape[1]))
+        return self.region(h, buf) * 3.0 + h
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="records a CUDA graph")
+@pytest.mark.parametrize("copy_in", [False, True])
+@torch.inference_mode()
+def test_a_recorded_region_writes_the_segment_buffer_in_place(monkeypatch, copy_in):
+    ctx = SimpleNamespace(in_hipgraph=False, main_stream=torch.cuda.current_stream())
+    monkeypatch.setattr(forward_context, "_forward_context", ctx)
+    torch.manual_seed(0)
+    unit = _BufferedRegion(copy_in)
+    n = 48
+    x = torch.randn(n, 64, device="cuda")
+    unit(x)  # hipBLASLt's first GEMM, outside the capture
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        ctx.main_stream = stream
+        LIVE.update(scale=1.0, rows=5)
+        unit(x)
+        ctx.in_hipgraph = True
+        segments, _ = region_graph._record_segments(
+            unit, x, pool=torch.cuda.graph_pool_handle()
+        )
+        ctx.in_hipgraph = False
+    torch.cuda.current_stream().wait_stream(stream)
+    ctx.main_stream = torch.cuda.current_stream()
+    (eager_step,) = [
+        s for s in segments._steps if isinstance(s, region_graph._EagerStep)
+    ]
+    delivered = eager_step._target
+    assert delivered.data_ptr() == eager_step._arguments["buf"].data_ptr()
+
+    copies = []
+    real_copy = torch.Tensor.copy_
+    monkeypatch.setattr(
+        torch.Tensor,
+        "copy_",
+        lambda self, src, *a, **k: (
+            copies.append(self.data_ptr()),
+            real_copy(self, src, *a, **k),
+        )[1],
+    )
+    for scale, rows in ((0.5, 0), (2.0, 7), (-1.0, 48)):
+        LIVE.update(scale=scale, rows=rows)
+        fresh = torch.randn(n, 64, device="cuda")
+        real_copy(x, fresh)
+        copies.clear()
+        got = segments.replay().clone()
+        assert copies == ([delivered.data_ptr()] if copy_in else [])
+        with torch.inference_mode():
+            want = unit(fresh)
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+    del segments
+    torch.cuda.synchronize()
