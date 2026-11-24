@@ -87,6 +87,27 @@ def test_hash_keys_the_row_parallel_front(monkeypatch):
     assert hashed(None, None, dcp=1) == hashed("0", "1", dcp=1)
 
 
+def test_the_native_engine_kwargs_key_the_row_parallel_front(monkeypatch):
+    # The kwargs LLMEngine builds Config from (-tp 8 -dcp <dcp>): the DCP
+    # size is the top-level one, its ParallelConfig keeps the default.
+    from atom.model_engine.arg_utils import EngineArgs
+
+    monkeypatch.delenv("ATOM_DSA_ROW_PARALLEL_PREFILL", raising=False)
+
+    def hashed(dcp, front):
+        monkeypatch.setenv("ATOM_DSA_ROW_PARALLEL_PREFILL_FRONT", front)
+        kwargs = EngineArgs(
+            model="m", tensor_parallel_size=8, decode_context_parallel_size=dcp
+        )._get_engine_kwargs()
+        return _hash(
+            parallel_config=kwargs["parallel_config"],
+            decode_context_parallel_size=kwargs["decode_context_parallel_size"],
+        )
+
+    assert hashed(8, "1") != hashed(8, "0")
+    assert hashed(1, "1") == hashed(1, "0")
+
+
 def test_hash_ignores_settings_that_stay_out_of_the_graph():
     # These size attention-metadata workspaces, KV pages or the KV pool, all
     # outside the traced graph; changing them must keep the cached artifact.

@@ -14,6 +14,7 @@ def _hash(spec=None):
         compilation_config=None,
         parallel_config=None,
         tensor_parallel_size=8,
+        decode_context_parallel_size=1,
         prefill_context_parallel_size=1,
         sequence_parallel_size=1,
         dcp_config=None,

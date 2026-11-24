@@ -370,6 +370,24 @@ def test_a_native_engine_config_opts_layers_into_row_parallel_prefill(runtime):
     assert owner.dsa_front_name == "layers.0.self_attn.dsa_front"
 
 
+@pytest.mark.parametrize("dcp", [1, 8])
+def test_the_native_engine_kwargs_opt_layers_in_under_dcp(runtime, dcp):
+    # The kwargs LLMEngine builds Config from (-tp 8 -dcp <dcp>).
+    from atom.model_engine.arg_utils import EngineArgs
+
+    kwargs = EngineArgs(
+        model="m", tensor_parallel_size=8, decode_context_parallel_size=dcp
+    )._get_engine_kwargs()
+    runtime.config.parallel_config = kwargs["parallel_config"]
+    runtime.config.decode_context_parallel_size = kwargs[
+        "decode_context_parallel_size"
+    ]
+    runtime.envs.ATOM_DSA_ROW_PARALLEL_PREFILL = True
+    owner = runtime.make()
+    assert getattr(owner.attn.impl, "dsa_row_parallel", False) is (dcp > 1)
+    assert getattr(owner.indexer, "row_parallel", False) is (dcp > 1)
+
+
 @pytest.mark.parametrize(
     "case", ["front", "off", "front_off", "no_dcp", "pcp", "quantized"]
 )
