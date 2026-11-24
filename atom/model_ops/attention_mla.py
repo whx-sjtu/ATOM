@@ -762,6 +762,12 @@ def should_use_persistent_mode(
 
 
 class MLAAttention(nn.Module):
+    # Set by a model whose attention op applies its BF16 output gate
+    # (`forward_gated`).
+    gate_in_merge = False
+    # The gate of the call in flight, until a DCP decode merge takes it.
+    _merge_gate = None
+
     def __init__(
         self,
         num_heads: int,
@@ -1650,7 +1656,14 @@ class MLAAttention(nn.Module):
             self.dcp_comm_backend = "a2a"
 
     def _dcp_merge(
-        self, o, lse, ctx=None, owned_counts=None, quant_dtype=None, decode=False
+        self,
+        o,
+        lse,
+        ctx=None,
+        owned_counts=None,
+        quant_dtype=None,
+        decode=False,
+        gate=None,
     ):
         """Bind this layer's DCP group and backend to ``dcp_ops.dcp_lse_merge``.
         The mailbox backend serves decode only; prefill merges with a2a."""
@@ -1667,6 +1680,7 @@ class MLAAttention(nn.Module):
             ctx=ctx,
             owned_counts=owned_counts,
             quant_dtype=quant_dtype,
+            gate=gate if backend == "mailbox" else None,
         )
 
     def _dcp_fused_quant_dtype(self):
@@ -1704,13 +1718,22 @@ class MLAAttention(nn.Module):
 
     @mark_trace(prefix="dcp_project_merge_out", torch_compile=False)
     def _dcp_project_merge_out(
-        self, o, lse, ctx=None, merge_in_fp32=False, owned_counts=None, decode=False
+        self,
+        o,
+        lse,
+        ctx=None,
+        merge_in_fp32=False,
+        owned_counts=None,
+        decode=False,
+        gate=None,
     ):
         """Shared tail of both DCP paths: PBM projection, merge, o_proj.
 
         With PBM the V up-projection runs on the whole group's head set BEFORE
         the merge, so o_proj then takes an already-projected tensor. Without it
         the merge carries the latent and ``_v_up_proj_and_o_proj`` does both.
+        ``gate`` (see ``dcp_ops.dcp_lse_merge``) reaches a merge that hands its
+        rows straight to o_proj.
         """
         if self.pbm_enabled:
             o = self._v_up_proj(
@@ -1733,6 +1756,7 @@ class MLAAttention(nn.Module):
                 owned_counts=owned_counts,
                 quant_dtype=fused_quant,
                 decode=decode,
+                gate=gate if self.pbm_enabled else None,
             )
         if fused_quant is not None:
             o, o_scale = o
@@ -1809,6 +1833,7 @@ class MLAAttention(nn.Module):
             ctx=self._cp_triton_ctx,
             owned_counts=owned_counts,
             decode=True,
+            gate=None if self._merge_gate is None else self._take_merge_gate,
         )
 
     def _v_up_proj(self, x, W_V=None, W_V_scale=None, num_heads=None):
@@ -4094,6 +4119,26 @@ class MLAAttention(nn.Module):
             positions=positions,
             q_scale=q_scale,
         )
+
+    def forward_gated(self, attend, gate: torch.Tensor) -> torch.Tensor:
+        """``sigmoid(gate) * attend()``. A DCP decode merge that takes the
+        mailbox applies the gate in its combine (`_take_merge_gate`); any
+        other call gets the BF16 gate kernel after it."""
+        self._merge_gate = [gate, False]
+        try:
+            out = attend()
+        finally:
+            _, taken = self._merge_gate
+            self._merge_gate = None
+        if taken:
+            return out
+        from atom.model_ops.triton_fused_sigmoid_mul_quant import sigmoid_mul
+
+        return sigmoid_mul(out, gate)
+
+    def _take_merge_gate(self) -> torch.Tensor:
+        self._merge_gate[1] = True
+        return self._merge_gate[0]
 
 
 @triton.jit(do_not_specialize=["OUT_NUMEL", "TOKEN_ROWS", "KV_INDICES_NUMEL"])

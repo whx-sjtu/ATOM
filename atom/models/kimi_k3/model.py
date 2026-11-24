@@ -1266,6 +1266,18 @@ class KimiFullAttention(nn.Module):
             and o_type in (QuantType.per_Token, QuantType.per_1x128)
             and not _is_e8m0_blockscale(quant_config, o_type)
         )
+        # The attention op applies the BF16 output gate, in the DCP mailbox
+        # combine where a captured decode merge takes it
+        # (`MLAAttention.forward_gated`).
+        self.gate_in_merge = (
+            envs.ATOM_DMLA_GATE_IN_MERGE
+            and not is_plugin_mode()
+            and isinstance(self.attn.impl, MLAAttention)
+            and not self.fuse_sigmoid_mul_quant
+            and not (atom_config.enable_tbo or atom_config.enable_tbo_decode)
+        )
+        if self.gate_in_merge:
+            self.attn.impl.gate_in_merge = True
         # .value, like qknorm_quant_type_value above: comparing the pybind11
         # QuantType inside forward() graph-breaks Dynamo.
         self.o_proj_quant_type_value = (
@@ -1330,6 +1342,10 @@ class KimiFullAttention(nn.Module):
                 positions,
                 projected_k_weights=(projected[3], projected[4]),
             )
+        if self.gate_in_merge:
+            gate = self.g_proj(hidden_states, hidden_states_scale)
+            gated = self.attn(q, kv, k_rope, positions, q_scale=q_scale, qkv=gate)
+            return gated, None
         attn_out = self.attn(q, kv, k_rope, positions, q_scale=q_scale)
         gate = self.g_proj(hidden_states, hidden_states_scale)
         # BF16 output gating uses the shared fused sigmoid/mul. When o_proj

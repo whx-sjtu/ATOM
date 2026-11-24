@@ -1069,7 +1069,31 @@ def unified_attention_with_output_base(
     """The attention: an MLA layer's prefill split on a prefill token-graph
     recording and the warmup forward before it
     (`MLAAttention.records_prefill_split`); otherwise a plain call outside any
-    graph capture, and one TR-graph break (`_attention_region`) inside one."""
+    graph capture, and one TR-graph break (`_attention_region`) inside one.
+
+    An MLA layer with ``gate_in_merge`` passes its output gate as ``qkv`` and
+    gets the gated output back (`MLAAttention.forward_gated`)."""
+    impl = _merge_gate_impl(layer_name, use_mla, qkv)
+    if impl is None:
+        return _unified_attention(q, q_scale, k, v, positions, layer_name, use_mla, qkv)
+    return impl.forward_gated(
+        lambda: _unified_attention(
+            q, q_scale, k, v, positions, layer_name, use_mla, None
+        ),
+        qkv,
+    )
+
+
+def _merge_gate_impl(layer_name: str, use_mla: bool, qkv: torch.Tensor | None):
+    if not use_mla or qkv is None:
+        return None
+    layer = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    return layer.impl if getattr(layer.impl, "gate_in_merge", False) else None
+
+
+def _unified_attention(q, q_scale, k, v, positions, layer_name, use_mla, qkv):
     fwd_ctx = get_forward_context()
     if fwd_ctx.tr_graph is None and not fwd_ctx.in_hipgraph:
         return _attention(q, q_scale, k, v, positions, layer_name, use_mla, qkv)

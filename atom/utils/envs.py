@@ -640,6 +640,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DMLA_QTAIL_PLAN_PATCH": lambda: (
         os.getenv("ATOM_DMLA_QTAIL_PLAN_PATCH", "1") == "1"
     ),
+    # Kimi-K3 full attention with a BF16 o_proj: a captured DCP decode whose
+    # merge takes the mailbox applies the sigmoid(g_proj) output gate inside
+    # aiter's combine, which rounds the gated heads to bf16 once instead of
+    # rounding the merge and then the gate (within one bf16 ulp; numerics
+    # change). Every other path keeps the separate gate kernel. Needs an aiter
+    # whose dcp_lse_combine takes a gate. Off by default; 1 turns it on.
+    "ATOM_DMLA_GATE_IN_MERGE": lambda: (
+        os.getenv("ATOM_DMLA_GATE_IN_MERGE", "0") == "1"
+    ),
     # DCP sparse decode: kernel that merges the exchanged top-k candidates into
     # this rank's owned KV slots. "aiter" (default) is flydsl_dcp_topk_merge;
     # "atom" is atom/model_ops/dcp_topk_merge.py. Same output bit for bit.

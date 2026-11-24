@@ -20,6 +20,8 @@ Also here: the sparse indexer's DCP support -- the decode candidate exchange
 (fused into one aiter op) and the sparse-prefill owned-slot filter.
 """
 
+import functools
+import inspect
 import logging
 
 import numpy as np
@@ -1059,7 +1061,20 @@ def prepare_dcp_mailbox(cp_group, heads, dim, max_tokens) -> bool:
     return True
 
 
-def _dcp_mailbox_merge(cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_dtype):
+@functools.cache
+def _combine_takes_a_gate(combine) -> bool:
+    if "gate" in inspect.signature(combine).parameters:
+        return True
+    logger.warning(
+        "DCP mailbox: this aiter's dcp_lse_combine takes no output gate; "
+        "the gate stays a separate kernel after the merge"
+    )
+    return False
+
+
+def _dcp_mailbox_merge(
+    cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_dtype, gate=None
+):
     """The mailbox merge, or None when this call cannot take it."""
     if cp_group.world_size == 1 or not torch.cuda.is_current_stream_capturing():
         return None
@@ -1076,6 +1091,13 @@ def _dcp_mailbox_merge(cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_d
     from aiter.ops.flydsl.dcp_mailbox import dcp_lse_combine
 
     _MAILBOX_LAUNCHES[key] = _MAILBOX_LAUNCHES.get(key, 0) + 1
+    gated = {}
+    if (
+        gate is not None
+        and quant_dtype is None
+        and _combine_takes_a_gate(dcp_lse_combine)
+    ):
+        gated["gate"] = gate()
     # The combine takes exactly one int32 count per row, where the a2a path
     # accepts any buffer at least `tokens` long.
     out = dcp_lse_combine(
@@ -1084,6 +1106,7 @@ def _dcp_mailbox_merge(cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_d
         cp_attn_lse.to(torch.float32).contiguous(),
         base_e=True,
         row_counts=None if owned_counts is None else owned_counts[:tokens],
+        **gated,
     )
     # No quantizing combine here: hand back the bf16 rows unquantized, which
     # the caller then quantizes as it would without the fused path.
@@ -1121,6 +1144,7 @@ def dcp_lse_merge(
     ctx=None,
     owned_counts=None,
     quant_dtype=None,
+    gate=None,
 ):
     """Reconstruct the global softmax from the per-rank partials.
 
@@ -1142,10 +1166,15 @@ def dcp_lse_merge(
     when its workspace was prepared (``prepare_dcp_mailbox``) and the call
     fits it, else all-to-all. Every input to that choice is the same on every
     rank of the group.
+
+    ``gate`` is a callable a bf16 mailbox merge calls for an output gate
+    [tokens, heads * dim] when its combine can apply one; it then returns the
+    gated rows, ``sigmoid(gate) * merge`` rounded once. A merge that does not
+    call it leaves the gate to the caller.
     """
     if backend == "mailbox":
         merged = _dcp_mailbox_merge(
-            cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_dtype
+            cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_dtype, gate
         )
         if merged is not None:
             return merged
