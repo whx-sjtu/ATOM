@@ -1116,6 +1116,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KDA_PREFILL_SCAN_PREFETCH": lambda: (
         os.getenv("ATOM_KDA_PREFILL_SCAN_PREFETCH", "1") == "1"
     ),
+    # Kimi-K3 KDA prefill with interior checkpoints cuts the recurrence at them
+    # and runs each block on the paged state (kda_ckpt_split), instead of
+    # re-running every checkpoint's head as one more sequence through the
+    # gathered state. Only where the blocks give the head re-run's bits (no
+    # FlashKDA call segmented, cuts on its chunk grid). Off by default; 0
+    # keeps the head re-run.
+    "ATOM_KDA_PREFILL_CKPT_SPLIT": lambda: (
+        os.getenv("ATOM_KDA_PREFILL_CKPT_SPLIT", "0") == "1"
+    ),
+    # With ATOM_KDA_PREFILL_CKPT_SPLIT, cut every step it can, including those
+    # whose rows FlashKDA segments: the segments a cut moves change numerics
+    # (same order against fp32). Off by default.
+    "ATOM_KDA_PREFILL_CKPT_SPLIT_ALL": lambda: (
+        os.getenv("ATOM_KDA_PREFILL_CKPT_SPLIT_ALL", "0") == "1"
+    ),
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT": lambda: (
         os.getenv("ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT", "1") == "1"
     ),

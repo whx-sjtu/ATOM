@@ -2070,12 +2070,22 @@ class KimiKDAAttention(nn.Module):
         """Whether this prefill runs on the slot pool in place
         (``ATOM_KDA_PREFILL_PAGED_STATE``). A fork reads one slot and writes
         another, and interior checkpoints need the heads' final states, so
-        both keep the gather path; end checkpoints read the pool either way."""
+        both keep the gather path unless the builder cut the step at its
+        checkpoints and the cut runs (``kda_split``, `kda_ckpt_split`); end
+        checkpoints read the pool either way."""
         ckpt = getattr(kda_metadata, "ssm_checkpoints", None)
+        split = (ckpt or {}).get("kda_split")
         if (
             not envs.ATOM_KDA_PREFILL_PAGED_STATE
             or getattr(kda_metadata, "has_state_fork", True)
-            or (ckpt is not None and "kda_tokens" in ckpt)
+            or (
+                ckpt is not None
+                and "kda_tokens" in ckpt
+                and not (
+                    split is not None
+                    and split.runs(self.num_local_heads, self.head_dim)
+                )
+            )
             or ssm_state.dtype != torch.float32
             or not ssm_state[0].is_contiguous()
         ):
@@ -2193,6 +2203,23 @@ class KimiKDAAttention(nn.Module):
         Eager and token-graph prefills both come here: the scheduler publishes
         every checkpoint it reserved for the step, whichever path ran it.
         """
+        split = (getattr(kda_metadata, "ssm_checkpoints", None) or {}).get("kda_split")
+        if initial is None and split is not None:
+            from atom.model_ops.kimi_k3.kda_ckpt_split import run_checkpoint_split
+
+            return run_checkpoint_split(
+                self,
+                q,
+                k,
+                v,
+                gate,
+                beta,
+                kda_metadata,
+                mixed_qkv,
+                conv_state,
+                ssm_state,
+                split,
+            )
         state_indices = kda_metadata.non_spec_state_indices_tensor
         query_start_loc = kda_metadata.non_spec_query_start_loc
         ckpt = getattr(kda_metadata, "ssm_checkpoints", None)
