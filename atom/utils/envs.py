@@ -1384,6 +1384,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_K3_ROW_SHARD_CUSTOM_COMM": lambda: (
         os.getenv("ATOM_KIMI_K3_ROW_SHARD_CUSTOM_COMM", "0") == "1"
     ),
+    # On row-sharded steps with the custom collectives (eager under the switch
+    # above, and token graphs), reduce-scatter inputs above this many MiB run on
+    # pynccl directly. Unlike AITER_CUSTOM_RS_MAX_SIZE it leaves every other
+    # custom reduce-scatter alone. Changes their reduction order. 0 (default)
+    # keeps AITER's choice.
+    "ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB": lambda: float(
+        os.getenv("ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB", "0")
+    ),
+    # Eager row-sharded steps with the custom collectives reduce-scatter the
+    # routed and shared partials as one NCCL group when the shared one runs on
+    # pynccl. Changes the reduction order of both. Off by default.
+    "ATOM_KIMI_K3_ROW_SHARD_GROUP_RS": lambda: (
+        os.getenv("ATOM_KIMI_K3_ROW_SHARD_GROUP_RS", "0") == "1"
+    ),
     # The next residual mix reads a row-sharded step's zero addends as one zero row.
     # Bit-identical output. On by default; 0 reads the zero tensors themselves.
     "ATOM_KIMI_K3_ATTN_RES_SKIP_ZERO_ADDENDS": lambda: (

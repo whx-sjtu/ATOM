@@ -73,7 +73,16 @@ def ranks(monkeypatch):
         reduce_scatter_tensor=reduce_scatter_tensor,
         all_gather=all_gather,
         device_communicator=SimpleNamespace(
-            all_gather=lambda x, dim: all_gather(x, dim=dim)
+            all_gather=lambda x, dim: all_gather(x, dim=dim),
+            ca_comm=SimpleNamespace(
+                disabled=False, should_custom_rs=lambda x, dim: True
+            ),
+            pynccl_comm=SimpleNamespace(
+                disabled=False,
+                reduce_scatter=lambda out, x: out.copy_(reduce_scatter_tensor(x)),
+                group_start=lambda: None,
+                group_end=lambda: None,
+            ),
         ),
     )
     monkeypatch.setattr(sequence_parallel, "get_tp_group", lambda: group)
@@ -112,6 +121,8 @@ class _Stub(nn.Module):
 def stub_block_parts(monkeypatch):
     monkeypatch.setenv("ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS", "0")
     monkeypatch.setenv("ATOM_KIMI_K3_MOE_LATENT_ROW_SHARD", "0")
+    monkeypatch.delenv("ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB", raising=False)
+    monkeypatch.delenv("ATOM_KIMI_K3_ROW_SHARD_GROUP_RS", raising=False)
     empty_like = torch.empty_like
 
     def poisoned_empty_like(*args, **kwargs):
@@ -350,11 +361,27 @@ def logged(ranks, monkeypatch):
         _events.log.append((name, x.shape[0]))
         return group.reduce_scatter_tensor(x, use_custom=use_custom, dim=dim)
 
+    comm = group.device_communicator
+
+    def nccl_reduce_scatter(out, x):
+        _events.log.append(("pynccl_reduce_scatter", x.shape[0]))
+        comm.pynccl_comm.reduce_scatter(out, x)
+
+    def nccl_event(name):
+        return lambda: _events.log.append((name, 0))
+
     logged_group = SimpleNamespace(
         reduce_scatter_tensor=reduce_scatter,
         all_gather=_logs("all_gather", group.all_gather),
         device_communicator=SimpleNamespace(
-            all_gather=_logs("custom_all_gather", group.device_communicator.all_gather)
+            all_gather=_logs("custom_all_gather", comm.all_gather),
+            ca_comm=comm.ca_comm,
+            pynccl_comm=SimpleNamespace(
+                disabled=False,
+                reduce_scatter=nccl_reduce_scatter,
+                group_start=nccl_event("nccl_group_start"),
+                group_end=nccl_event("nccl_group_end"),
+            ),
         ),
     )
     monkeypatch.setattr(sequence_parallel, "get_tp_group", lambda: logged_group)
@@ -787,6 +814,128 @@ def test_custom_collectives_run_the_same_row_path(
     for (want, want_log), (got, log) in zip(rccl, custom):
         assert ("reduce_scatter", -(-tokens // WORLD) * WORLD) in want_log
         assert log == [(renamed.get(name, name), rows) for name, rows in want_log]
+        assert all(torch.equal(a, b) for a, b in zip(got, want))
+
+
+# 314 bytes: above a 16-row partial of HIDDEN (512 B), below one of LATENT (256 B)
+_PYNCCL_RS_MIB = "0.0003"
+
+
+def _comm_log(log):
+    return [
+        event
+        for event in log
+        if event[0].endswith("reduce_scatter") or event[0].startswith("nccl_group")
+    ]
+
+
+def _row_layer_forward(monkeypatch, latent, tokens):
+    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "0")
+    monkeypatch.setenv("ATOM_KIMI_K3_MOE_LATENT_ROW_SHARD", latent)
+    layers = _layers(BLOCK + 1)
+    _merge_front(monkeypatch, [layer.block_sparse_moe for layer in layers])
+    inputs = _inputs(tokens)
+
+    def forward(rank):
+        return layers[rank](None, *(x.clone() for x in inputs))
+
+    return forward
+
+
+def test_pynccl_cap_and_group_are_off_by_default(monkeypatch):
+    monkeypatch.delenv("ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB", raising=False)
+    monkeypatch.delenv("ATOM_KIMI_K3_ROW_SHARD_GROUP_RS", raising=False)
+    assert kimi.envs.ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB == 0
+    assert kimi.envs.ATOM_KIMI_K3_ROW_SHARD_GROUP_RS is False
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB", "48")
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_GROUP_RS", "1")
+    assert kimi.envs.ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB == 48
+    assert kimi.envs.ATOM_KIMI_K3_ROW_SHARD_GROUP_RS is True
+
+
+@pytest.mark.parametrize("latent", ["0", "1"], ids=["latent-off", "latent-on"])
+@pytest.mark.parametrize("tokens", [13, 16])
+def test_pynccl_cap_moves_larger_row_scatters_to_pynccl(
+    logged, monkeypatch, latent, tokens
+):
+    """Above the cap the attention and shared reduce-scatters run on pynccl,
+    the smaller latent one stays on the custom kernel; same sums."""
+    forward = _row_layer_forward(monkeypatch, latent, tokens)
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_CUSTOM_COMM", "1")
+    custom = logged(forward)
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB", _PYNCCL_RS_MIB)
+    capped = logged(forward)
+    rows = -(-tokens // WORLD) * WORLD
+    for (want, want_log), (got, log) in zip(custom, capped):
+        assert _comm_log(want_log) == [("custom_reduce_scatter", rows)] * 3
+        assert _comm_log(log) == [
+            ("pynccl_reduce_scatter", rows),
+            ("custom_reduce_scatter", rows),
+            ("pynccl_reduce_scatter", rows),
+        ]
+        assert all(torch.equal(a, b) for a, b in zip(got, want))
+
+
+@pytest.mark.parametrize("latent", ["0", "1"], ids=["latent-off", "latent-on"])
+@pytest.mark.parametrize("tokens", [13, 16])
+def test_group_rs_scatters_routed_and_shared_as_one_nccl_group(
+    logged, monkeypatch, latent, tokens
+):
+    """With the shared reduce-scatter on pynccl, the routed one joins it in
+    one NCCL group after the shared experts ran; same sums. Without (the
+    shared one on the custom kernel) both stay apart."""
+    forward = _row_layer_forward(monkeypatch, latent, tokens)
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_CUSTOM_COMM", "1")
+    base = logged(forward)
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_GROUP_RS", "1")
+    apart = logged(forward)
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB", _PYNCCL_RS_MIB)
+    grouped = logged(forward)
+    rows = -(-tokens // WORLD) * WORLD
+    for (want, _), (got_apart, log_apart), (got, log) in zip(base, apart, grouped):
+        assert _comm_log(log_apart) == [("custom_reduce_scatter", rows)] * 3
+        assert _comm_log(log) == [
+            ("pynccl_reduce_scatter", rows),
+            ("nccl_group_start", 0),
+            ("pynccl_reduce_scatter", rows),
+            ("pynccl_reduce_scatter", rows),
+            ("nccl_group_end", 0),
+        ]
+        names = [name for name, _ in log]
+        assert names.index("shared_experts") < names.index("nccl_group_start")
+        assert all(torch.equal(a, b) for a, b in zip(got_apart, want))
+        assert all(torch.equal(a, b) for a, b in zip(got, want))
+
+
+def test_group_rs_stays_apart_in_token_graphs(logged, monkeypatch):
+    """A token-graph recording keeps the cap but never groups."""
+    forward = _row_layer_forward(monkeypatch, "1", 16)
+    monkeypatch.setenv("ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS", "100000")
+    monkeypatch.setenv("ATOM_KIMI_K3_MOE_ROW_SHARD_GRAPH_MIN_TOKENS", "8")
+    _in_graph(monkeypatch)
+    base = logged(forward)
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB", _PYNCCL_RS_MIB)
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_GROUP_RS", "1")
+    graph = logged(forward)
+    for (want, _), (got, log) in zip(base, graph):
+        assert _comm_log(log) == [
+            ("pynccl_reduce_scatter", 16),
+            ("custom_reduce_scatter", 16),
+            ("pynccl_reduce_scatter", 16),
+        ]
+        assert all(torch.equal(a, b) for a, b in zip(got, want))
+
+
+def test_pynccl_cap_and_group_need_the_custom_collectives(logged, monkeypatch):
+    """On RCCL (ATOM_KIMI_K3_ROW_SHARD_CUSTOM_COMM=0) both switches do nothing."""
+    forward = _row_layer_forward(monkeypatch, "1", 16)
+    base = logged(forward)
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB", _PYNCCL_RS_MIB)
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_GROUP_RS", "1")
+    rccl = logged(forward)
+    for (want, want_log), (got, log) in zip(base, rccl):
+        assert log == want_log
+        assert _comm_log(log) == [("reduce_scatter", 16)] * 3
         assert all(torch.equal(a, b) for a, b in zip(got, want))
 
 

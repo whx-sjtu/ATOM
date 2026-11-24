@@ -134,6 +134,21 @@ def _log_row_tail_in_token_graphs(floor: int):
     )
 
 
+@lru_cache(maxsize=1)
+def _log_row_tail_pynccl_rs(mib: float):
+    logging.getLogger("atom").info(
+        "Kimi-K3 row tail: reduce-scatters above %g MiB run on pynccl", mib
+    )
+
+
+@lru_cache(maxsize=1)
+def _log_row_tail_group_rs():
+    logging.getLogger("atom").info(
+        "Kimi-K3 row tail: the routed and shared reduce-scatters share one "
+        "NCCL group when the shared one runs on pynccl"
+    )
+
+
 def _text_config(config):
     return getattr(config, "text_config", config)
 
@@ -770,17 +785,26 @@ class KimiSparseMoeBlock(nn.Module):
 
     def row_shards(self, num_tokens: int):
         """A row-sharded step's rows; its collectives take AITER's custom
-        kernels in a graph and under ATOM_KIMI_K3_ROW_SHARD_CUSTOM_COMM."""
+        kernels in a graph and under ATOM_KIMI_K3_ROW_SHARD_CUSTOM_COMM, with
+        ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB and, outside graphs,
+        ATOM_KIMI_K3_ROW_SHARD_GROUP_RS on top."""
         from atom.distributed.sequence_parallel import SequenceParallel
 
-        custom = (
-            envs.ATOM_KIMI_K3_ROW_SHARD_CUSTOM_COMM
-            or get_forward_context().in_hipgraph
+        graph = (
+            get_forward_context().in_hipgraph
             or torch.cuda.is_current_stream_capturing()
         )
-        return SequenceParallel(
-            num_tokens, self.tp_size, get_tensor_model_parallel_rank(), custom=custom
+        rows = SequenceParallel(
+            num_tokens,
+            self.tp_size,
+            get_tensor_model_parallel_rank(),
+            custom=envs.ATOM_KIMI_K3_ROW_SHARD_CUSTOM_COMM or graph,
+            pynccl_rs_bytes=int(envs.ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB * (1 << 20)),
+            group_rs=envs.ATOM_KIMI_K3_ROW_SHARD_GROUP_RS and not graph,
         )
+        if rows.pynccl_rs_bytes:
+            _log_row_tail_pynccl_rs(envs.ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB)
+        return rows
 
     def _row_sharded_split_moe_forward(
         self, hidden_states: torch.Tensor
@@ -801,13 +825,24 @@ class KimiSparseMoeBlock(nn.Module):
         """Scatter routed/shared partials, normalize and project local rows,
         add the optional prefix, then gather the sum. Its BF16 rounding differs
         from the next attn_res's FP32 fold and can move MoE routing.
-        `hidden_rows` is this rank's shard of `hidden_states`, if at hand."""
+        `hidden_rows` is this rank's shard of `hidden_states`, if at hand.
+        Under `rows.group_rs` the shared experts run before the routed scatter
+        so that both scatters can share one NCCL group."""
         router_logits, routed_input = self._row_sharded_front(
             hidden_states, rows, hidden_rows
         )
         routed_output = self.experts(routed_input, router_logits)
-        routed_output = self._apply_routed_norm_and_up_proj(rows.scatter(routed_output))
-        output = routed_output + rows.scatter(self.shared_experts(hidden_states))
+        if rows.group_rs:
+            _log_row_tail_group_rs()
+            routed_rows, shared_rows = rows.scatter_pair(
+                routed_output, self.shared_experts(hidden_states)
+            )
+            output = self._apply_routed_norm_and_up_proj(routed_rows) + shared_rows
+        else:
+            routed_output = self._apply_routed_norm_and_up_proj(
+                rows.scatter(routed_output)
+            )
+            output = routed_output + rows.scatter(self.shared_experts(hidden_states))
         if prefix_rows is not None:
             output += prefix_rows
         return rows.gather(output)
