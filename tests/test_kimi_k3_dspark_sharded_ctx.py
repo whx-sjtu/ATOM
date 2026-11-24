@@ -77,7 +77,8 @@ def test_the_context_is_the_whole_projection(monkeypatch, weight, sharded):
     "flag, tp, hidden, sp, on",
     [
         pytest.param("1", 8, 7168, False, True, id="on"),
-        pytest.param(None, 8, 7168, False, False, id="default"),
+        pytest.param(None, 8, 7168, False, True, id="default"),
+        pytest.param("0", 8, 7168, False, False, id="off"),
         pytest.param("1", 1, 7168, False, False, id="tp 1"),
         pytest.param("1", 8, 7170, False, False, id="uneven"),
         pytest.param("1", 8, 7168, True, False, id="ulysses sp"),
