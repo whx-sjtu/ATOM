@@ -976,6 +976,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSPARK_STACKED_CTX_KV_GEMM": lambda: _flag_env(
         "ATOM_DSPARK_STACKED_CTX_KV_GEMM", "1"
     ),
+    # Kimi-K3 DSpark under TP: context_proj split by output column, each rank
+    # projecting hidden / tp columns and an all-gather rebuilding the row,
+    # instead of every rank reading the whole replicated weight. Changes the
+    # accumulation order. Read at model construction.
+    "ATOM_DSPARK_SHARDED_CONTEXT_PROJ": lambda: _flag_env(
+        "ATOM_DSPARK_SHARDED_CONTEXT_PROJ"
+    ),
     # Kimi-K3 DSpark draft: its MLA layers' BF16 W_K absorb bmm of <= 64 rows per
     # head on gfx950 takes an explicit Triton tile instead of aiter's untuned
     # default. The target's layers keep aiter's. Same output. On by default; 0

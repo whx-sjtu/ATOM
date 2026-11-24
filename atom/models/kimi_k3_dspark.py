@@ -557,6 +557,8 @@ class KimiK3DSpark(DSparkDraftModel):
     # Set from its switch at construction; a draft built without `__init__`
     # keeps the whole-logits gather.
     sharded_markov = False
+    # Likewise: replicated without `__init__`.
+    context_proj_sharded = False
 
     packed_modules_mapping: ClassVar[dict[str, tuple[str, int]]] = {
         "q_a_proj": ("fused_qkv_a_proj", 0),
@@ -592,8 +594,13 @@ class KimiK3DSpark(DSparkDraftModel):
         # Replicated, matching the reference and ATOM's other drafts: the aux
         # hidden states arrive replicated (they are the target's residual
         # stream), so a row-parallel split would trade memory for an all-reduce
-        # on every drafting step.
-        self.context_proj = ReplicatedLinear(
+        # on every drafting step. ATOM_DSPARK_SHARDED_CONTEXT_PROJ splits it by
+        # output column instead, gathered in `project_context`.
+        self.context_proj_sharded = self._can_shard_context_proj()
+        context_proj = (
+            ColumnParallelLinear if self.context_proj_sharded else ReplicatedLinear
+        )
+        self.context_proj = context_proj(
             config.target_hidden_size * config.num_target_layers,
             self.hidden_size,
             bias=False,
@@ -656,7 +663,24 @@ class KimiK3DSpark(DSparkDraftModel):
         the same projected tensor to all five, which each apply their own KV
         projection to it.
         """
-        return self.context_norm(linear_out(self.context_proj(self.concat_taps(taps))))
+        ctx = linear_out(self.context_proj(self.concat_taps(taps)))
+        if self.context_proj_sharded:
+            ctx = get_tp_group().all_gather(
+                ctx, use_custom=envs.ATOM_USE_CUSTOM_ALL_GATHER, dim=-1
+            )
+        return self.context_norm(ctx)
+
+    def _can_shard_context_proj(self) -> bool:
+        """Whether every TP rank may project its own ``hidden / tp`` output
+        columns of the context: the taps are the same on every rank (the
+        target's residual stream), which Ulysses SP does not keep."""
+        tp = get_tp_group().world_size
+        return (
+            envs.ATOM_DSPARK_SHARDED_CONTEXT_PROJ
+            and tp > 1
+            and self.hidden_size % tp == 0
+            and not sp_is_enabled()
+        )
 
     def write_context_rows(self, ctx_hidden, positions, slot_mapping) -> None:
         """One GEMM over the stacked kv rows of every layer instead of one
