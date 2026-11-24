@@ -26,18 +26,30 @@ class SequenceParallel:
     Per-token work runs locally; consumers needing every row gather first.
     ``custom`` runs both collectives on AITER's custom kernels where they fit
     and on pynccl elsewhere, either of which a graph can capture, instead of
-    on RCCL through torch.distributed.
+    on RCCL through torch.distributed. With ``custom``, reduce-scatter inputs
+    above ``pynccl_rs_bytes`` (0: none) go straight to pynccl, and
+    ``group_rs`` lets `scatter_pair` issue two reduce-scatters as one NCCL
+    group.
     """
 
     def __init__(
-        self, num_tokens: int, tp_size: int, tp_rank: int, custom: bool = False
+        self,
+        num_tokens: int,
+        tp_size: int,
+        tp_rank: int,
+        custom: bool = False,
+        pynccl_rs_bytes: int = 0,
+        group_rs: bool = False,
     ) -> None:
         self.num_tokens = num_tokens
+        self.tp_size = tp_size
         self.chunk = -(-num_tokens // tp_size)
         self.pad = self.chunk * tp_size - num_tokens
         self.start = tp_rank * self.chunk
         self.group = get_tp_group()
         self.custom = custom
+        self.pynccl_rs_bytes = pynccl_rs_bytes if custom else 0
+        self.group_rs = group_rs and custom
 
     def shard(self, x: torch.Tensor) -> torch.Tensor:
         """Replicated `[T, ...]` -> this rank's rows (a view unless padded).
@@ -56,9 +68,49 @@ class SequenceParallel:
 
     def scatter(self, x: torch.Tensor) -> torch.Tensor:
         """Per-rank partial sums over all `[T, ...]` rows -> summed local rows."""
-        return self.group.reduce_scatter_tensor(
-            _pad_rows(x.contiguous(), self.pad), use_custom=self.custom, dim=0
-        )
+        return self._scatter_padded(_pad_rows(x.contiguous(), self.pad))
+
+    def scatter_pair(
+        self, a: torch.Tensor, b: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`scatter(a), scatter(b)`; under ``group_rs``, when `b` runs on
+        pynccl, both as one NCCL group (so `a` runs on pynccl too)."""
+        a, b = (_pad_rows(x.contiguous(), self.pad) for x in (a, b))
+        if self.group_rs and self._on_pynccl(b):
+            out_a, out_b = self._pynccl_scatter(a, b)
+            return out_a, out_b
+        return self._scatter_padded(a), self._scatter_padded(b)
+
+    def _scatter_padded(self, x: torch.Tensor) -> torch.Tensor:
+        if self.pynccl_rs_bytes and self._on_pynccl(x):
+            return self._pynccl_scatter(x)[0]
+        return self.group.reduce_scatter_tensor(x, use_custom=self.custom, dim=0)
+
+    def _on_pynccl(self, x: torch.Tensor) -> bool:
+        """Whether reducing `x` belongs on pynccl: above ``pynccl_rs_bytes``,
+        or where AITER's custom kernel would hand it to pynccl itself."""
+        comm = self.group.device_communicator
+        if comm.pynccl_comm is None or comm.pynccl_comm.disabled:
+            return False
+        if self.pynccl_rs_bytes and x.nbytes > self.pynccl_rs_bytes:
+            return True
+        ca = comm.ca_comm
+        return ca is None or ca.disabled or not ca.should_custom_rs(x, 0)
+
+    def _pynccl_scatter(self, *xs: torch.Tensor) -> list[torch.Tensor]:
+        """Reduce-scatter each padded input on pynccl, as one group if several."""
+        nccl = self.group.device_communicator.pynccl_comm
+        outs = [x.new_empty((x.shape[0] // self.tp_size, *x.shape[1:])) for x in xs]
+        if len(xs) == 1:
+            nccl.reduce_scatter(outs[0], xs[0])
+            return outs
+        nccl.group_start()
+        try:
+            for out, x in zip(outs, xs):
+                nccl.reduce_scatter(out, x)
+        finally:
+            nccl.group_end()
+        return outs
 
     @classmethod
     def maybe(cls, num_tokens: int) -> "SequenceParallel | None":
