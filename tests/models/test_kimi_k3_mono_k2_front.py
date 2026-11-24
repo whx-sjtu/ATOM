@@ -19,6 +19,7 @@ from atom.models.kimi_k3.mono import runner
 from atom.models.kimi_k3.mono.config import MAX_ROWS, groups
 from atom.models.kimi_k3.mono.kernels import layer as k2
 from atom.models.kimi_k3.mono.kernels.stages import moe
+from atom.mono.device import gemv
 from atom.mono.device.sync import POLL_MAX
 from atom.mono.plan.execution import THREADS
 from atom.mono.plan.trace import Space
@@ -56,13 +57,14 @@ def _runner(front):
     return obj
 
 
-@pytest.mark.parametrize("rows", [1, 4, 5, 15, 16, 17, 20, 35, 60, 64])
+@pytest.mark.parametrize("rows", [1, 4, 5, 9, 10, 15, 16, 17, 20, 35, 60, 64])
 def test_keys_take_a_switch_where_it_changes_the_code(rows):
     on = {name: True for name in k2.FRONT}
     key = _runner(on)._k2_keys(rows, 5)[7]
     assert key.early_ahead == (k2.EARLY_AHEAD if groups(rows) > 1 else 0)
     assert key.latq_batch == (moe.latq_passes(rows) > 1)
-    assert key.early_yield
+    assert key.early_yield == (10 <= rows <= 16)
+    assert k2.yield_pays(rows) == (groups(rows) == 1 and len(gemv.slabs(moe.HIDDEN, rows)) > 1)
     off = _runner({name: False for name in k2.FRONT})._k2_keys(rows, 5)[7]
     assert off == k2.K2Build(tokens=rows, nblocks=3, qlen=5)
     assert k2.symbol(off) == k2.symbol(k2.K2Build(tokens=rows, nblocks=3, qlen=5))
@@ -114,8 +116,10 @@ def _resources(launcher):
     return kernel_resources(_code_object(artifact._ir_text))
 
 
-@pytest.mark.parametrize("rows", [5, 20, 60])
+@pytest.mark.parametrize("rows", [5, 10, 20, 60])
 def test_compile_keeps_the_front_and_resources(rows, tmp_path, monkeypatch):
+    """Each switch alone and all three, also where the runner leaves
+    ``early_yield`` off (``layer.yield_pays``)."""
     monkeypatch.setenv("ARCH", "gfx950")
     monkeypatch.setenv("FLYDSL_RUNTIME_CACHE_DIR", str(tmp_path))
     cuda_was_initialized = torch.cuda.is_initialized()
@@ -123,7 +127,8 @@ def test_compile_keeps_the_front_and_resources(rows, tmp_path, monkeypatch):
     arms = {"off": {}, **{n: {n: True} for n in k2.FRONT}, "all": dict.fromkeys(k2.FRONT, True)}
     seen = {}
     for arm, on in arms.items():
-        key = k2.K2Build(tokens=rows, nblocks=4, qlen=5, **base, **k2.front_at(rows, on))
+        front = {**k2.front_at(rows, on), "early_yield": bool(on.get("early_yield"))}
+        key = k2.K2Build(tokens=rows, nblocks=4, qlen=5, **base, **front)
         launcher = k2.build(key)
         rec = trace(launcher, k2.ABI)
         assert not rec.unnamed

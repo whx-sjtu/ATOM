@@ -193,14 +193,22 @@ FRONT = ("early_ahead", "latq_batch", "early_yield")
 EARLY_AHEAD = 3
 
 
+def yield_pays(rows: int) -> bool:
+    """``early_yield`` only within one token group whose x the shared gate/up
+    stages in two slabs or more: with one slab it has no x to hold back, and
+    past one group the router's and latent's units hold its tasks back longer
+    than its x costs them."""
+    return groups(rows) == 1 and len(gemv.slabs(k2b.HIDDEN, rows)) > 1
+
+
 def front_at(rows: int, on) -> dict:
     """The front switches ``on`` (field -> on) a ``rows``-row build takes, each
-    only where it changes the code: staging past one token group, two latent
-    passes or more."""
+    only where it changes the code (staging past one token group, two latent
+    passes or more) or, ``early_yield``, where it pays (``yield_pays``)."""
     return {
         "early_ahead": EARLY_AHEAD if on.get("early_ahead") and groups(rows) > 1 else 0,
         "latq_batch": bool(on.get("latq_batch")) and k2b.latq_passes(rows) > 1,
-        "early_yield": bool(on.get("early_yield")),
+        "early_yield": bool(on.get("early_yield")) and yield_pays(rows),
     }
 
 
