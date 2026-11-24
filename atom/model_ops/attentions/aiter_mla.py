@@ -79,6 +79,7 @@ from atom.model_ops.indexer import (
     RowSplit,
     concat_rows,
     fp4_rows,
+    fp4_stage,
     fp8_rows,
     packed_concat_rows,
 )
@@ -649,6 +650,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             rows = torch.arange(block, dtype=torch.int32, device=self.device)
             self._fp4_scale_row_lut = fp4_index_scale_rows(rows, block)
             decompose_slots_triton(rows[:1], 1, block, self._fp4_scale_row_lut)
+        # `fp4_stage` reads each staged slot's key row (`stage_row_of`).
+        self._fp4_stage_rows = bool(
+            envs.ATOM_SPG_INDEXER_STAGE
+            and self._fp4_scale_row_lut is not None
+            and model_runner.config.index_cache_layout == MFMA
+        )
+        if self._fp4_stage_rows:
+            fp4_stage.warmup(self.device)
 
         # DCP decode all-gathers Q on the head dim, so the head count reaching
         # mla_decode_fwd (and thus the persistent decode metadata) is the padded
@@ -2230,6 +2239,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 fp4_scale_byte(slots.long()[:, None], chunk),
             )
             names = ("page", "row", "scale_at")
+            if getattr(self, "_fp4_stage_rows", False):
+                attn_metadata.dcp_indexer_fp4_stage_row_of = fp4_stage.stage_row_of(
+                    slots[len(read) :], int(first_page[bs]) * block
+                )
         for side, cut in (
             ("read", slice(0, len(read))),
             ("stage", slice(len(read), None)),

@@ -32,6 +32,7 @@ from atom.utils.forward_context import get_forward_context
 from atom.utils.region_graph import eager_region
 from atom.utils.tbo.ubatching import tbo_active
 
+from . import fp4_stage
 from .layout import MFMA, PRESHUFFLE
 from .nope import indexer_nope_quant_and_cache
 from .rows import IndexCache
@@ -99,6 +100,30 @@ def _dcp_stage_indexer_fp4_prefill(
     staged_scale = kv_cache_scale.new_zeros(pages, *kv_cache_scale.shape[1:])
     staged_scale[page, :, :, scale_row] = scale
     return staged, staged_scale
+
+
+def _dcp_stage_indexer_fp4_mfma_fused(
+    kv_cache: torch.Tensor,
+    kv_cache_scale: torch.Tensor,
+    prefill_metadata,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`_dcp_stage_indexer_fp4_prefill`'s MFMA branch in two launches around
+    the all-gather, byte for byte (`fp4_stage`)."""
+    rows = fp4_stage.pack_rows(
+        kv_cache,
+        kv_cache_scale,
+        prefill_metadata.dcp_indexer_fp4_read_page,
+        prefill_metadata.dcp_indexer_fp4_read_row,
+        prefill_metadata.dcp_indexer_fp4_read_scale_at,
+    )
+    rows = get_dcp_group().all_gather(rows, dim=0)
+    return fp4_stage.stage_rows(
+        rows,
+        prefill_metadata.dcp_indexer_gather_index,
+        prefill_metadata.dcp_indexer_fp4_stage_row_of,
+        kv_cache,
+        kv_cache_scale,
+    )
 
 
 @eager_region()
@@ -525,9 +550,18 @@ def _index_cache(indexer, kv_cache, attn_metadata, is_prefill) -> IndexCache:
     scales = indexer.k_cache.kv_cache_scale
     layout = indexer._index_cache_layout
     if is_prefill and get_dcp_world_size() > 1:
-        kv_cache, scales = _dcp_stage_indexer_fp4_prefill(
-            kv_cache, scales, attn_metadata, layout
-        )
+        if (
+            layout == MFMA
+            and getattr(attn_metadata, "dcp_indexer_fp4_stage_row_of", None) is not None
+            and fp4_stage.supports(kv_cache, scales)
+        ):
+            kv_cache, scales = _dcp_stage_indexer_fp4_mfma_fused(
+                kv_cache, scales, attn_metadata
+            )
+        else:
+            kv_cache, scales = _dcp_stage_indexer_fp4_prefill(
+                kv_cache, scales, attn_metadata, layout
+            )
     return IndexCache(kv_cache, scales, block, layout)
 
 
