@@ -16,6 +16,8 @@ import pytest
 import torch
 from torch import nn
 
+from atom.config import ParallelConfig
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -150,9 +152,10 @@ def runtime(monkeypatch):
         kv_cache_dtype="bf16",
         index_cache_dtype="fp8",
         max_model_len=32,
-        parallel_config=SimpleNamespace(
-            data_parallel_size=1, decode_context_parallel_size=8
-        ),
+        # As the native engine builds it: the DCP size is the top-level one,
+        # ParallelConfig keeps its default.
+        parallel_config=ParallelConfig(),
+        decode_context_parallel_size=8,
         prefill_context_parallel_size=1,
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
@@ -345,9 +348,7 @@ def test_constructor_declines_unsupported_owners(runtime, case):
 @pytest.mark.parametrize("case", ["off", "sparse", "no_dcp", "quantized", "dense"])
 def test_constructor_opts_bf16_sparse_layers_into_row_parallel_prefill(runtime, case):
     runtime.envs.ATOM_DSA_ROW_PARALLEL_PREFILL = case != "off"
-    runtime.config.parallel_config.decode_context_parallel_size = (
-        1 if case == "no_dcp" else 8
-    )
+    runtime.config.decode_context_parallel_size = 1 if case == "no_dcp" else 8
     runtime.mode.quantized = case == "quantized"
     runtime.mode.sparse = case != "dense"
     owner = runtime.make()
@@ -357,14 +358,24 @@ def test_constructor_opts_bf16_sparse_layers_into_row_parallel_prefill(runtime, 
         assert getattr(owner.indexer, "row_parallel", False) is opted
 
 
+def test_a_native_engine_config_opts_layers_into_row_parallel_prefill(runtime):
+    # EngineArgs.parallel_config() never sets the DCP size; only the top-level
+    # Config field has it (-dcp 8 at -tp 8).
+    runtime.envs.ATOM_DSA_ROW_PARALLEL_PREFILL = True
+    assert runtime.config.parallel_config.decode_context_parallel_size == 1
+    assert runtime.config.decode_context_parallel_size == 8
+    owner = runtime.make()
+    assert owner.attn.impl.dsa_row_parallel is True
+    assert owner.indexer.row_parallel is True
+    assert owner.dsa_front_name == "layers.0.self_attn.dsa_front"
+
+
 @pytest.mark.parametrize(
     "case", ["front", "off", "front_off", "no_dcp", "pcp", "quantized"]
 )
 def test_constructor_registers_the_front_op_of_row_parallel_layers(runtime, case):
     runtime.envs.ATOM_DSA_ROW_PARALLEL_PREFILL = case != "off"
-    runtime.config.parallel_config.decode_context_parallel_size = (
-        1 if case == "no_dcp" else 8
-    )
+    runtime.config.decode_context_parallel_size = 1 if case == "no_dcp" else 8
     runtime.envs.ATOM_DSA_ROW_PARALLEL_PREFILL_FRONT = case != "front_off"
     runtime.mode.pcp = case == "pcp"
     runtime.mode.quantized = case == "quantized"

@@ -3813,7 +3813,7 @@ class Config:
         if (
             envs.ATOM_DSA_ROW_PARALLEL_PREFILL
             and envs.ATOM_DSA_ROW_PARALLEL_PREFILL_FRONT
-            and getattr(self.parallel_config, "decode_context_parallel_size", 1) > 1
+            and self.decode_context_parallel_size > 1
         ):
             factors.append("dsa_row_parallel_front")
         # The sparse-attention indexer bakes max_model_len and max_num_seqs into

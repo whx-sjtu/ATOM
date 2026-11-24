@@ -14,6 +14,7 @@ def _hash(**overrides):
         "compilation_config": None,
         "parallel_config": None,
         "tensor_parallel_size": 4,
+        "decode_context_parallel_size": 1,
         "prefill_context_parallel_size": 1,
         "sequence_parallel_size": 1,
         "dcp_config": None,
@@ -62,11 +63,11 @@ def test_hash_keys_the_row_parallel_front(monkeypatch):
     # The front moves the q/kv projections into an opaque op; a front run that
     # loaded a FRONT=0 artifact failed copy_misaligned_inputs. Row-parallel
     # alone stays inside opaque ops and keeps the artifact; without DCP no
-    # layer opts in.
-    def parallel(dcp):
-        return SimpleNamespace(
-            decode_context_parallel_size=dcp, compute_hash=lambda: f"dcp{dcp}"
-        )
+    # layer opts in. The DCP size is the top-level field: the native engine's
+    # ParallelConfig keeps its default of 1.
+    parallel = SimpleNamespace(
+        decode_context_parallel_size=1, compute_hash=lambda: "native"
+    )
 
     def hashed(row_parallel, front, dcp=8):
         for name, value in (
@@ -77,7 +78,7 @@ def test_hash_keys_the_row_parallel_front(monkeypatch):
                 monkeypatch.delenv(name, raising=False)
             else:
                 monkeypatch.setenv(name, value)
-        return _hash(parallel_config=parallel(dcp))
+        return _hash(parallel_config=parallel, decode_context_parallel_size=dcp)
 
     off = hashed("0", "1")
     assert hashed("1", "0") == off
