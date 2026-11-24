@@ -5,6 +5,7 @@ import functools
 import inspect
 import logging
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -48,6 +49,7 @@ from atom.kv_transfer.disaggregation.pd_producer import (
 from atom.kv_transfer.disaggregation.pd_producer import mooncake_pd_producer_configured
 from atom.kv_transfer.disaggregation.sharded_transfer import DCPShardPlan
 from atom.model_engine.scheduler import ScheduledBatch
+from atom.model_ops import dsa_row_parallel
 from atom.model_ops.attention_mla import (
     _MLA_MIN_HEADS,
     _MLA_SPLIT_BUDGET_AUTO,
@@ -460,6 +462,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     # field, as tests do.
     _indexer_fp4 = False
     mtp_keeps_selection = False
+    _dsa_row_parallel = False
 
     def _global_num_draft_layers(self) -> int:
         """Return draft layers in the target MLA pool across all PP stages."""
@@ -736,6 +739,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     sparse_metadata_rebuild=self.sparse_dcp_metadata_rebuild,
                 ),
             )
+        self._dsa_row_parallel = self._resolve_dsa_row_parallel(config)
 
         max_seqlen_qo = getattr(model_runner, "num_spec_tokens", 0) + 1
         (
@@ -2550,6 +2554,157 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         for name, buffer in work.items():
             setattr(attn_metadata, f"sparse_prefill_{name}", buffer)
 
+    def _resolve_dsa_row_parallel(self, config) -> bool:
+        """Whether this builder plans row-parallel DSA prefill steps
+        (`ATOM_DSA_ROW_PARALLEL_PREFILL`); warns when the switch is on and
+        this configuration cannot."""
+        if not envs.ATOM_DSA_ROW_PARALLEL_PREFILL:
+            return False
+        why = dsa_row_parallel.builder_blocker(
+            is_sparse=self.is_sparse,
+            dcp_world_size=self.dcp_world_size,
+            kv_cache_dtype=config.kv_cache_dtype,
+            mla_page_size=self.block_size,
+            indexer_fp4=self._indexer_fp4,
+            index_kpool=self.index_kpool,
+            persistent_plan=(
+                self.sparse_dcp_metadata_rebuild and not self.dcp_sparse_prefill_nonps
+            ),
+        )
+        if why is not None:
+            logger.warning("%s=1 ignored: %s", dsa_row_parallel.ENV, why)
+            return False
+        self._dsa_row_parallel_min_tokens = dsa_row_parallel.min_tokens_env()
+        self._dsa_row_parallel_max_kv_rows = dsa_row_parallel.max_kv_rows_env()
+        self._dsa_row_parallel_layers = None
+        self._dsa_row_parallel_interleave = config.dcp_config.interleave_size
+        dsa_row_parallel.warm_gathered_kv_index(
+            self.dcp_world_size,
+            self._dsa_row_parallel_interleave,
+            self.index_topk_out,
+            self.device,
+        )
+        logger.info(
+            "Row-parallel DSA prefill: steps of >= %d new tokens and <= %d "
+            "gathered KV rows",
+            self._dsa_row_parallel_min_tokens,
+            self._dsa_row_parallel_max_kv_rows,
+        )
+        return True
+
+    def _dsa_row_parallel_layers_ready(self) -> bool:
+        """Whether every sparse MLA layer forwarding under this builder's
+        prefill metadata can run a row-parallel step, decided at the first
+        step that would take one (after the weights load). Every DCP rank runs
+        the same model, so every rank answers alike."""
+        if self._dsa_row_parallel_layers is None:
+            runner = self.model_runner
+            models = [getattr(runner, "model", None)]
+            drafter = getattr(runner, "drafter", None)
+            if drafter is not None and not drafter.is_block_drafter:
+                models.append(drafter.model)
+            sparse = [
+                module
+                for model in models
+                if model is not None
+                for module in model.modules()
+                if isinstance(module, MLAAttention) and module.is_sparse_mla
+            ]
+            why = "no sparse MLA layer" if not sparse else None
+            for impl in sparse:
+                why = why or impl.dsa_row_parallel_blocker()
+            if why is not None:
+                logger.warning("%s=1 ignored: %s", dsa_row_parallel.ENV, why)
+            self._dsa_row_parallel_layers = why is None
+        return self._dsa_row_parallel_layers
+
+    def _dsa_row_parallel_step(
+        self, batch: PrefillBatch, attn_metadata: AttentionMetaData, staged
+    ) -> "dsa_row_parallel.DsaRowParallel | None":
+        """This step's row-parallel plan, or None to run the default path.
+
+        Every input is the step's batch, identical across the DCP group, so
+        every rank decides alike and gathers the same rows."""
+        tokens = len(staged.sparse_counts)
+        bs = batch.scheduled_bs
+        if (
+            batch.is_dummy_run
+            or tokens < self._dsa_row_parallel_min_tokens
+            or attn_metadata.ubatches
+            or staged.pcp_split
+            or staged.index_rows.passes is not None
+            or staged.index_rows.rows != tokens
+            or len(batch.block_tables) < bs
+        ):
+            return None
+        world, block = self.dcp_world_size, self.model_runner.block_size
+        context_lens = batch.context_lens[:bs]
+        rows = dsa_row_parallel.gathered_kv_rows(context_lens, world, block)
+        if rows > self._dsa_row_parallel_max_kv_rows:
+            return None
+        if not self._dsa_row_parallel_layers_ready():
+            return None
+        kv = dsa_row_parallel.gathered_kv_plan(
+            context_lens, batch.block_tables[:bs], world, block, self.device
+        )
+        split = RowSplit.of(tokens, self.dcp_rank, world)
+        host = self.model_runner.forward_vars["sparse_kv_indptr"].np[: tokens + 1]
+        own, kv_base = dsa_row_parallel.own_kv_indptr(host, split.first, split.end)
+        n = split.end - split.first
+        kv_indptr = upload_numpy(own, self.device)
+        cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q[: n + 1]
+        last_page_lens = attn_metadata.sparse_kv_last_page_lens[:n]
+        work = self._dsa_row_parallel_work_plan(
+            cu_seqlens_q, kv_indptr, own, last_page_lens
+        )
+        return dsa_row_parallel.DsaRowParallel(
+            num_tokens=tokens,
+            first=split.first,
+            end=split.end,
+            stride=split.stride,
+            kv=kv,
+            kv_base=kv_base,
+            kv_indptr=kv_indptr,
+            cu_seqlens_q=cu_seqlens_q,
+            last_page_lens=last_page_lens,
+            no_slots=torch.full((n,), -1, dtype=torch.int64, device=self.device),
+            work=work,
+        )
+
+    def _dsa_row_parallel_work_plan(
+        self, cu_seqlens_q, kv_indptr, host_indptr, last_page_lens
+    ) -> dict[str, torch.Tensor]:
+        """The persistent sparse prefill's work plan over this rank's rows of
+        a row-parallel step, each over its whole top-k, into the step's
+        buffers (the default path's plan, which the step does not build): as
+        `_sparse_prefill_work_plan` plans the step's rows."""
+        var = self.model_runner.forward_vars
+        work = {name: var[f"sparse_prefill_{name}"] for name in PERSISTENT_WORK_BUFFERS}
+        rows = kv_indptr.numel() - 1
+        meta = SimpleNamespace(
+            sparse_cu_seqlens_q=cu_seqlens_q, sparse_kv_indptr=kv_indptr
+        )
+        heads = self.sparse_prefill_num_heads
+        rows_per_cu = None
+        if envs.ATOM_MLA_SPARSE_PREFILL_ROW_PLAN and getattr(
+            self, "_whole_row_plan_ok", True
+        ):
+            rows_per_cu = whole_row_plan_rows_per_cu(
+                host_indptr,
+                self._sparse_prefill_kv_granularity,
+                work["work_indptr"].numel() - 1,
+            )
+        if rows_per_cu is None:
+            _aiter_sparse_prefill_plan(self, meta, heads, last_page_lens, work)
+            return work
+        ref = None
+        if not getattr(self, "_whole_row_plan_checked", False):
+            ref = {name: buffer.clone() for name, buffer in work.items()}
+        plan_whole_rows(kv_indptr, rows, rows_per_cu, work)
+        if ref is not None:
+            _check_whole_row_plan(self, meta, heads, last_page_lens, work, ref)
+        return work
+
     def _finish_prefill_batch(self, batch, attn_metadata, prefix=""):
         super()._finish_prefill_batch(batch, attn_metadata, prefix)
         bs = batch.scheduled_bs
@@ -2561,12 +2716,20 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 gathers = self._dcp_pass_gathers(attn_metadata, bs, prefix, passes)
             elif self.dcp_world_size > 1:
                 self._build_dcp_indexer_prefill_meta(attn_metadata, bs, prefix)
-            self._sparse_prefill_work_plan(
-                attn_metadata,
-                prefix,
-                self.sparse_prefill_num_heads,
-                attn_metadata.sparse_kv_last_page_lens,
+            row_parallel = (
+                self._dsa_row_parallel_step(batch, attn_metadata, staged)
+                if self._dsa_row_parallel and not prefix
+                else None
             )
+            if row_parallel is not None:
+                attn_metadata.dsa_row_parallel = row_parallel
+            else:
+                self._sparse_prefill_work_plan(
+                    attn_metadata,
+                    prefix,
+                    self.sparse_prefill_num_heads,
+                    attn_metadata.sparse_kv_last_page_lens,
+                )
             if staged.pcp_split:
                 self._apply_pcp_reindex(
                     attn_metadata, batch.scheduled_tokens, staged.sparse_counts, prefix

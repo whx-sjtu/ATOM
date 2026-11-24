@@ -152,9 +152,11 @@ def runtime(monkeypatch):
         prefill_context_parallel_size=1,
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
+    envs = SimpleNamespace(ATOM_DSA_ROW_PARALLEL_PREFILL=False)
     namespace = {
         "torch": torch,
         "nn": nn,
+        "envs": envs,
         "MLAAttention": MLA,
         "MLAModules": SimpleNamespace,
         "Attention": Attention,
@@ -273,6 +275,7 @@ def runtime(monkeypatch):
         make=make,
         bind=bind,
         mode=mode,
+        envs=envs,
         config=config,
         ctx=ctx,
         args=args,
@@ -314,6 +317,18 @@ def test_constructor_declines_unsupported_owners(runtime, case):
     runtime.mode.plugin = case == "plugin"
     owner = runtime.make(4 if case == "draft" else 0)
     assert getattr(owner.attn.impl, "prefill_query_layout", None) is None
+
+
+@pytest.mark.parametrize("case", ["off", "sparse", "quantized", "dense"])
+def test_constructor_opts_bf16_sparse_layers_into_row_parallel_prefill(runtime, case):
+    runtime.envs.ATOM_DSA_ROW_PARALLEL_PREFILL = case != "off"
+    runtime.mode.quantized = case == "quantized"
+    runtime.mode.sparse = case != "dense"
+    owner = runtime.make()
+    opted = case == "sparse"
+    assert getattr(owner.attn.impl, "dsa_row_parallel", False) is opted
+    if owner.indexer is not None:
+        assert getattr(owner.indexer, "row_parallel", False) is opted
 
 
 @pytest.mark.parametrize(

@@ -1,0 +1,399 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""Row-parallel DSA prefill under DCP (``ATOM_DSA_ROW_PARALLEL_PREFILL``).
+
+A sparse prefill under DCP replicates its query side: with query replication
+(QREP) every rank projects every row's query heads, attends the 1/dcp of each
+row's top-k it holds, returning the LSE, and the group merges the partials.
+Row-parallel splits the rows instead, contiguously as the indexer already does
+(``RowSplit.of``: rank r takes ``[r * ceil(T / dcp), ...)``). Each rank
+
+  1. scores its rows only and maps their whole top-k to rows of the gathered
+     KV (no candidate exchange, no ownership filter);
+  2. writes every new token's KV at the slots it owns, as QREP does, and
+     projects and absorbs its rows' queries for all the group's heads;
+  3. all-gathers the step's KV rows -- every prefill request's
+     ``[0, context_len)`` from the DCP-sharded fp8 cache, 576 B a token, as
+     #3547's "kv" transport does;
+  4. attends its rows over their whole top-k: no LSE, nothing to merge;
+  5. projects V for its rows (all heads) and hands each rank its heads of
+     every row back in one bf16 all-to-all -- the layout QREP's merge leaves
+     for the gate and o_proj.
+
+The front of the layer (``fused_qkv_a``, the indexer's ``wq_b``) still runs
+on every row: it is traced into the compiled graph that decode shares.
+
+Numerics: a row's softmax runs over its whole top-k in one kernel call, as
+without DCP, instead of eight LSE-merged partials. Every other rounding (fp8
+query and KV codes, bf16 latent, bf16 V projection) is the same as QREP's.
+"""
+
+import logging
+from collections.abc import Mapping
+from dataclasses import dataclass
+
+import numpy as np
+import torch
+import triton
+import triton.language as tl
+
+from atom.utils import envs, upload_numpy
+
+logger = logging.getLogger("atom")
+
+ENV = "ATOM_DSA_ROW_PARALLEL_PREFILL"
+
+
+def min_tokens_env() -> int:
+    n = envs.ATOM_DSA_ROW_PARALLEL_PREFILL_MIN_TOKENS
+    if n < 1:
+        raise ValueError(f"{ENV}_MIN_TOKENS={n}: must be >= 1")
+    return n
+
+
+def max_kv_rows_env() -> int:
+    cap = envs.ATOM_DSA_ROW_PARALLEL_PREFILL_MAX_KV_ROWS
+    if cap < 1:
+        raise ValueError(f"{ENV}_MAX_KV_ROWS={cap}: must be >= 1")
+    return cap
+
+
+def builder_blocker(
+    *,
+    is_sparse: bool,
+    dcp_world_size: int,
+    kv_cache_dtype: str,
+    mla_page_size: int,
+    indexer_fp4: bool,
+    index_kpool: int,
+    persistent_plan: bool,
+) -> str | None:
+    """Why a metadata builder cannot plan row-parallel steps, or None.
+
+    The gathered KV is fp8 cache rows read at page size 1; the indexer's
+    rows must be FP4 paged rows, which score each row against the whole key
+    set in one pass; the plan goes into the persistent sparse-prefill work
+    buffers. Plugins and PCP keep the default path: PCP rewrites the token
+    order the row split reads.
+    """
+    from atom.distributed.pcp_utils import pcp_is_enabled
+    from atom.plugin import is_plugin_mode
+
+    if not is_sparse:
+        return "no sparse (DSA) attention"
+    if dcp_world_size <= 1:
+        return "DCP is off"
+    if not kv_cache_dtype.startswith("fp8"):
+        return "a non-fp8 KV cache"
+    if mla_page_size != 1:
+        return f"MLA page size {mla_page_size}"
+    if not indexer_fp4:
+        return "a non-FP4 indexer"
+    if index_kpool > 1:
+        return "a pooled indexer"
+    if not persistent_plan:
+        return "no persistent DCP sparse prefill plan"
+    if is_plugin_mode():
+        return "plugin mode"
+    if pcp_is_enabled():
+        return "PCP"
+    return None
+
+
+# ───────────────────────────── the step's KV rows, all-gathered (#3547) ──
+
+
+@dataclass(frozen=True)
+class GatheredKV:
+    """The gathered KV's layout: rank ``r``'s rows of request ``i`` land at
+    ``r * rows_pad + shard_base[i] + local_index``."""
+
+    slot_ids: torch.Tensor  # int32 [rows_pad], this rank's rows, padded per request
+    shard_base: torch.Tensor  # int32 [num_requests + 1], exclusive cumsum
+    rows_pad: int
+
+
+def padded_local_lens(context_lens, world: int, block_size: int) -> np.ndarray:
+    """Each request's length on one DCP rank padded to whole local blocks: the
+    same on every rank, since every rank holds ceil(len / (block_size *
+    world)) blocks of it."""
+    context_lens = np.asarray(context_lens, dtype=np.int64)
+    return -(-context_lens // (block_size * world)) * block_size
+
+
+def gathered_kv_rows(context_lens, world: int, block_size: int) -> int:
+    """Rows of the gathered KV: every rank's padded share."""
+    return world * int(padded_local_lens(context_lens, world, block_size).sum())
+
+
+def gathered_kv_plan(
+    context_lens, block_tables, world: int, block_size: int, device
+) -> GatheredKV:
+    """The gathered KV's layout for a prefill step.
+
+    Every input is the step's batch, identical on every DCP rank, so every
+    rank gathers the same row count. Padding rows read allocated slots and
+    are never selected. Raises if a block table is shorter than its context:
+    those blocks already hold the step's KV.
+    """
+    padded = padded_local_lens(context_lens, world, block_size)
+    if len(block_tables) < len(padded):
+        raise ValueError(f"{len(block_tables)} block tables for {len(padded)} requests")
+    # Upload each request's local blocks, not its slots, and expand on the
+    # GPU: 4 B a local block keeps the upload under the pageable-copy cliff.
+    blocks = []
+    for i, n in enumerate(padded.tolist()):
+        block_ids = np.asarray(block_tables[i], dtype=np.int32)
+        if len(block_ids) * block_size < n:
+            raise ValueError(f"request {i}: {len(block_ids)} blocks for {n} local rows")
+        blocks.append(block_ids[: n // block_size])
+    shard_base = np.zeros(len(padded) + 1, dtype=np.int32)
+    np.cumsum(padded, out=shard_base[1:])
+    block_ids = upload_numpy(np.concatenate(blocks), device)
+    offsets = torch.arange(block_size, dtype=torch.int32, device=device)
+    return GatheredKV(
+        slot_ids=(block_ids[:, None] * block_size + offsets).view(-1),
+        shard_base=upload_numpy(shard_base, device),
+        rows_pad=int(shard_base[-1]),
+    )
+
+
+def gather_kv(cp_group, kv_cache: torch.Tensor, plan: GatheredKV) -> torch.Tensor:
+    """All-gather the step's KV rows: ``[world * rows_pad, 1, d]`` in the
+    cache dtype, rank-major. fp8 rows travel as bytes; the gather is a copy."""
+    from atom.model_ops.dcp_ops import dcp_all_gather, dcp_gather_compressed_kv
+
+    local = dcp_gather_compressed_kv(kv_cache, plan.slot_ids)
+    return dcp_all_gather(cp_group, local, 0).unsqueeze(1)
+
+
+@triton.jit(do_not_specialize=["rows_pad", "out_numel"])
+def _gathered_kv_index_kernel(
+    dsa_kv_indptr,  # int32 [num_tokens + 1], absolute offsets into the output
+    batch_id_per_q_token,  # int32 [num_tokens]
+    topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS], positions in the request
+    shard_base,  # int32 [num_requests + 1]
+    out_kv_indices,  # int32
+    rows_pad,
+    out_numel,
+    DCP_WORLD: tl.constexpr,
+    INTERLEAVE: tl.constexpr,
+    NUM_TOPK_TOKENS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    ti_stride0: tl.int64,
+    ti_stride1: tl.constexpr,
+):
+    """Each candidate's row in the gathered KV, written where the dcp=1
+    prefill writes its cache slot: the same positions and the same zero for an
+    invalid one (negative, or past the request's padded rows), so the
+    attention reads the same rows in the same order."""
+    token_id = tl.program_id(0)
+    col_id = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    req_id = tl.load(batch_id_per_q_token + token_id)
+    valid_req = req_id >= 0
+    kv_start = tl.load(dsa_kv_indptr + token_id)
+    kv_len = tl.load(dsa_kv_indptr + token_id + 1) - kv_start
+    indice = tl.load(topk_indices + token_id * ti_stride0 + col_id * ti_stride1)
+    base = tl.load(shard_base + req_id, mask=valid_req, other=0)
+    end = tl.load(shard_base + req_id + 1, mask=valid_req, other=0)
+    owner = (indice // INTERLEAVE) % DCP_WORLD
+    local = (indice // (INTERLEAVE * DCP_WORLD)) * INTERLEAVE + indice % INTERLEAVE
+    row = owner * rows_pad + base + local
+    out_offset = kv_start + col_id
+    store_mask = (col_id < kv_len) & (out_offset < out_numel)
+    valid = valid_req & store_mask & (indice >= 0) & (base + local < end)
+    tl.store(out_kv_indices + out_offset, tl.where(valid, row, 0), mask=store_mask)
+
+
+def gathered_kv_index(
+    dsa_kv_indptr: torch.Tensor,
+    batch_id_per_q_token: torch.Tensor,
+    topk_indices: torch.Tensor,
+    plan: GatheredKV,
+    world: int,
+    out: torch.Tensor,
+    num_topk_tokens: int,
+    interleave: int = 1,
+    block_n: int = 128,
+) -> torch.Tensor:
+    """Map a sparse-prefill top-k (positions in each token's request) to rows
+    of the gathered KV (``gather_kv``), at ``dsa_kv_indptr``'s offsets into
+    ``out``. Any run of rows: slice all three row inputs alike."""
+    assert topk_indices.dtype == torch.int32
+    assert topk_indices.shape[1] == num_topk_tokens
+    assert num_topk_tokens % block_n == 0
+    num_tokens = min(
+        dsa_kv_indptr.shape[0] - 1,
+        batch_id_per_q_token.shape[0],
+        topk_indices.shape[0],
+    )
+    if num_tokens == 0:
+        return out
+    ti_stride0, ti_stride1 = topk_indices.stride()
+    _gathered_kv_index_kernel[(num_tokens, num_topk_tokens // block_n)](
+        dsa_kv_indptr,
+        batch_id_per_q_token,
+        topk_indices,
+        plan.shard_base,
+        out,
+        plan.rows_pad,
+        out.numel(),
+        world,
+        interleave,
+        num_topk_tokens,
+        block_n,
+        ti_stride0,
+        ti_stride1,
+    )
+    return out
+
+
+def warm_gathered_kv_index(world: int, interleave: int, num_topk_tokens: int, device):
+    """Compile the index kernel with one candidate-free token: dummy runs
+    build no plan, so the first live row-parallel step would JIT it."""
+    zeros = torch.zeros(2, dtype=torch.int32, device=device)
+    gathered_kv_index(
+        zeros,
+        zeros[:1],
+        torch.zeros(1, num_topk_tokens, dtype=torch.int32, device=device),
+        GatheredKV(slot_ids=zeros[:0], shard_base=zeros, rows_pad=0),
+        world,
+        zeros[:0],
+        num_topk_tokens,
+        interleave,
+    )
+
+
+# ─────────────────────────────────────────────── the step's plan ──
+
+
+@dataclass
+class DsaRowParallel:
+    """A row-parallel prefill step, built by the metadata builder: this
+    rank's rows ``[first, end)`` of ``num_tokens``, ``stride`` rows a rank
+    (``RowSplit.of``), the gathered KV, and the attention's arguments over
+    this rank's rows. ``kv_indptr`` is the rows' ``sparse_kv_indptr`` rebased
+    to 0; their candidates start at ``kv_base`` of ``sparse_kv_indices``."""
+
+    num_tokens: int
+    first: int
+    end: int
+    stride: int
+    kv: GatheredKV
+    kv_base: int
+    kv_indptr: torch.Tensor  # int32 [end - first + 1]
+    cu_seqlens_q: torch.Tensor  # int32 [end - first + 1]
+    last_page_lens: torch.Tensor  # int32 [end - first]
+    no_slots: torch.Tensor  # int64 [end - first], all -1
+    work: Mapping[str, torch.Tensor]
+
+    @property
+    def rows(self) -> int:
+        return self.end - self.first
+
+
+def own_kv_indptr(
+    host_indptr: np.ndarray, first: int, end: int
+) -> tuple[np.ndarray, int]:
+    """Rows ``[first, end)``'s slice of the step's host ``sparse_kv_indptr``,
+    rebased to 0, and the offset it was rebased by."""
+    own = host_indptr[first : end + 1].astype(np.int64)
+    base = int(own[0])
+    return (own - base).astype(np.int32), base
+
+
+# ───────────────────────────────────────── layer helpers ──
+
+
+def write_kv(
+    kv_c: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    k_scale: torch.Tensor,
+) -> None:
+    """``kv_cache[slot] = e4m3([kv_c, k_pe] / k_scale)`` for every slot >= 0:
+    ``mla_q_tail_and_cache``'s KV half, by the same kernel with no query
+    heads, so the same codes.
+
+    ``kv_cache`` is ``[blocks, block_size, L + R]``; scales as there."""
+    from atom.model_ops.triton_mla_q_tail_cache import (
+        _BLOCK_H,
+        _BLOCK_T,
+        _NUM_WARPS,
+        _mla_q_tail_and_cache_kernel,
+    )
+
+    num_tokens = kv_c.shape[0]
+    kv_c = kv_c.reshape(num_tokens, -1)
+    k_pe = k_pe.reshape(num_tokens, -1)
+    l, r = kv_c.shape[1], k_pe.shape[1]
+    assert kv_cache.shape[-1] == l + r and slot_mapping.dtype == torch.int64
+    assert slot_mapping.shape[0] == num_tokens
+    for t in (kv_c, k_pe, kv_cache):
+        assert t.stride(-1) == 1
+    if num_tokens == 0:
+        return
+    on_device = k_scale.is_cuda
+    if on_device:
+        inv_k = 1.0
+    else:
+        inv_k, k_scale = 1.0 / float(k_scale), slot_mapping
+    _mla_q_tail_and_cache_kernel[(triton.cdiv(num_tokens, _BLOCK_T), 1)](
+        k_pe,  # q_pe: no heads, never read
+        kv_c,
+        k_pe,
+        kv_cache,
+        kv_cache,  # q_out: no heads, never written
+        slot_mapping,
+        k_scale,  # q_scale: never read
+        k_scale,
+        1.0,
+        inv_k,
+        num_tokens,
+        0,
+        kv_cache.shape[1],
+        0,
+        0,
+        kv_c.stride(0),
+        k_pe.stride(0),
+        0,
+        0,
+        kv_cache.stride(0),
+        kv_cache.stride(1),
+        L=l,
+        R=r,
+        BLOCK_T=_BLOCK_T,
+        BLOCK_H=_BLOCK_H,
+        # The q-tail call's bound is its q_out's, the same fp8 type here.
+        FP8_MAX=torch.finfo(kv_cache.dtype).max,
+        SCALES_ON_DEVICE=on_device,
+        num_warps=_NUM_WARPS,
+    )
+
+
+def rows_to_heads(projected: torch.Tensor, num_rows: int, cp_group) -> torch.Tensor:
+    """Each rank's rows of all heads to every row of this rank's heads.
+
+    ``projected``: ``[world * h, stride, v]`` head-major, this rank's
+    ``stride`` rows. Returns ``[num_rows, h * v]``, rows in order: rank r's
+    rows are rows ``[r * stride, (r + 1) * stride)``. Rows past the step's
+    tokens -- a rank's tail, or the layer input's padding -- are not
+    defined."""
+    world = cp_group.world_size
+    heads, stride, v = projected.shape
+    send = projected.view(world, heads // world, stride, v)
+    recv = torch.empty_like(send)
+    torch.distributed.all_to_all_single(recv, send, group=cp_group.device_group)
+    out = recv.permute(0, 2, 1, 3).reshape(world * stride, -1)
+    if out.shape[0] >= num_rows:
+        return out[:num_rows]
+    return torch.nn.functional.pad(out, (0, 0, 0, num_rows - out.shape[0]))
+
+
+def scratch_bytes(max_kv_rows: int, world: int, entry_bytes: int) -> int:
+    """The gathered KV at the cap and this rank's share of it, for the memory
+    profile, whose dummy run attends nothing. Every other row-parallel buffer
+    is smaller than the QREP one it replaces, which is not profiled either."""
+    return (max_kv_rows + -(-max_kv_rows // world)) * entry_bytes

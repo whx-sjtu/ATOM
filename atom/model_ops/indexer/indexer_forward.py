@@ -26,6 +26,7 @@ from atom.model_ops.dcp_ops import (
     dcp_decode_candidate_exchange_fused,
     triton_filter_and_convert_dcp_index_prefill,
 )
+from atom.model_ops.dsa_row_parallel import gathered_kv_index
 from atom.model_ops.sparse_indexer_fp4 import FP4_QUANT_BLOCK_SIZE, fp4_q_scale_shape
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.forward_context import get_forward_context
@@ -384,6 +385,22 @@ def sparse_attn_indexer(
             cache_layout=indexer_module._index_cache_layout,
         )
         return
+    row_parallel = getattr(attn_metadata, "dsa_row_parallel", None)
+    if row_parallel is not None and context.is_prefill:
+        return _row_parallel_select(
+            indexer_module,
+            q_quant,
+            q_fp4_scale,
+            weights_mqa,
+            kv_cache,
+            attn_metadata,
+            row_parallel,
+            topk_indices,
+            topk_tokens,
+            weights_scale,
+            stable_topk,
+            cp_kv_cache_interleave_size,
+        )
     rows = attn_metadata.index_rows
     if (
         indexer_module.exchange_stream is not None
@@ -531,6 +548,57 @@ def _dcp_prefill_exchange(
             cp_kv_cache_interleave_size=interleave_size,
         )
     metadata.index_exchange_done = exchange.record_event()
+
+
+def _row_parallel_select(
+    indexer,
+    query,
+    query_scale,
+    weights,
+    kv_cache,
+    metadata,
+    plan,
+    topk_indices,
+    topk,
+    weight_scale,
+    stable,
+    interleave_size,
+):
+    """A row-parallel prefill step (`dsa_row_parallel`): score this rank's
+    rows -- the rows its attention runs -- and map their whole top-k to rows
+    of the step's gathered KV. Nothing is exchanged or filtered."""
+    if not getattr(indexer, "row_parallel", False):
+        raise RuntimeError(
+            "a row-parallel prefill step reached an indexer that did not opt in"
+        )
+    rows = metadata.index_rows
+    split = rows.split
+    assert not split.stripe and (split.first, split.end) == (plan.first, plan.end)
+    topk_indices = score_topk(
+        (
+            (query.unsqueeze(1), query_scale.unsqueeze(1))
+            if indexer._indexer_fp4
+            else query
+        ),
+        weights,
+        _index_cache(indexer, kv_cache, metadata, True),
+        rows._replace(split=split._replace(world=1)),
+        topk=topk,
+        weight_scale=weight_scale,
+        stable=stable,
+        out=topk_indices[: rows.out_rows],
+    )
+    own = slice(plan.first, plan.end)
+    gathered_kv_index(
+        metadata.sparse_kv_indptr[plan.first : plan.end + 1],
+        metadata.batch_id_per_q_token[own],
+        topk_indices[own],
+        plan.kv,
+        get_dcp_world_size(),
+        out=metadata.sparse_kv_indices,
+        num_topk_tokens=topk,
+        interleave=interleave_size,
+    )
 
 
 def _exchange_stream(stream):
