@@ -1108,3 +1108,87 @@ def test_pad_in_place_keeps_the_row_tail_bit_for_bit(
         assert log == want_log
         assert all(map(torch.equal, _bits(got), _bits(want)))
         assert pads == [(HIDDEN, False), (LATENT, padded), (HIDDEN, padded)]
+
+
+class _Stream:
+    """CPU stand-in for a CUDA stream: logs its joins."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def wait_stream(self, other) -> None:
+        _events.log.append((f"{self.name} waits {other.name}", 0))
+
+
+class _OnStream:
+    def __init__(self, stream) -> None:
+        self.stream = stream
+
+    def __enter__(self):
+        _events.log.append((f"on {self.stream.name}", 0))
+
+    def __exit__(self, *exc):
+        _events.log.append((f"off {self.stream.name}", 0))
+
+
+@pytest.mark.parametrize("layer_num", [4, 5], ids=["block-closes", "mid-block"])
+@pytest.mark.parametrize("tokens", [8, 13])
+def test_zeros_beside_gather_are_written_on_alt_while_it_runs(
+    logged, monkeypatch, tokens, layer_num
+):
+    """The zero addends are allocated and filled on the second stream after
+    the tail's last add and before its gather, and the layer waits for them
+    before it returns: same outputs, the gather in between."""
+    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "4")
+    monkeypatch.setenv("ATOM_KIMI_K3_ATTN_RES_SKIP_ZERO_ADDENDS", "0")
+    layers = _layers(layer_num)
+    inputs = _inputs(tokens)
+    base = logged(lambda rank: layers[rank](None, *(x.clone() for x in inputs)))
+
+    main, alt = _Stream("main"), _Stream("alt")
+    monkeypatch.setattr(
+        kimi.KimiDecoderLayer, "_zero_addends_stream", lambda self, like: alt
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: main)
+    monkeypatch.setattr(torch.cuda, "stream", _OnStream)
+    chunk = -(-tokens // WORLD)
+    rows = logged(lambda rank: layers[rank](None, *(x.clone() for x in inputs)))
+    for (want, want_log), (got, log) in zip(base, rows):
+        assert all(map(torch.equal, _bits(got), _bits(want)))
+        routed, shared = got[1:3]
+        assert not routed.any() and not shared.any()
+        assert routed.data_ptr() != shared.data_ptr()
+        assert want_log[-1] == ("all_gather", chunk)
+        assert log == want_log[:-1] + [
+            ("alt waits main", 0),
+            ("on alt", 0),
+            ("off alt", 0),
+            ("all_gather", chunk),
+            ("main waits alt", 0),
+        ]
+
+
+@pytest.mark.parametrize(
+    "on,alt,cuda,graph,capturing,stream",
+    [
+        ("1", True, True, False, False, True),
+        ("0", True, True, False, False, False),
+        ("1", False, True, False, False, False),
+        ("1", True, False, False, False, False),
+        ("1", True, True, True, False, False),
+        ("1", True, True, False, True, False),
+    ],
+    ids=["on", "off", "no-alt", "cpu", "graph-warmup", "capture"],
+)
+def test_zeros_beside_gather_gate(monkeypatch, on, alt, cuda, graph, capturing, stream):
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_TAIL_ZEROS_BESIDE_GATHER", on)
+    monkeypatch.setattr(
+        kimi, "get_forward_context", lambda: SimpleNamespace(in_hipgraph=graph)
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    second = _Stream("alt") if alt else None
+    layer = SimpleNamespace(block_sparse_moe=SimpleNamespace(alt_stream=second))
+    got = kimi.KimiDecoderLayer._zero_addends_stream(
+        layer, SimpleNamespace(is_cuda=cuda)
+    )
+    assert got is (second if stream else None)

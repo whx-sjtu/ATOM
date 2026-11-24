@@ -51,6 +51,7 @@ from atom.model_ops.fla_ops.replayssm import (
 from atom.model_ops.kimi_k3.attention_residual import (
     ColumnTail,
     materialize_column_output,
+    register_zero_addends,
     zero_addends,
 )
 from atom.model_ops.kimi_k3.flash_kda_tuning import (
@@ -821,13 +822,15 @@ class KimiSparseMoeBlock(nn.Module):
         rows,
         prefix_rows: torch.Tensor | None = None,
         hidden_rows: torch.Tensor | None = None,
+        before_gather: Callable[[], None] | None = None,
     ) -> torch.Tensor:
         """Scatter routed/shared partials, normalize and project local rows,
         add the optional prefix, then gather the sum. Its BF16 rounding differs
         from the next attn_res's FP32 fold and can move MoE routing.
         `hidden_rows` is this rank's shard of `hidden_states`, if at hand.
         Under `rows.group_rs` the shared experts run before the routed scatter
-        so that both scatters can share one NCCL group."""
+        so that both scatters can share one NCCL group.
+        `before_gather` runs just before the gather is queued."""
         router_logits, routed_input = self._row_sharded_front(
             hidden_states, rows, hidden_rows
         )
@@ -851,6 +854,8 @@ class KimiSparseMoeBlock(nn.Module):
             )
         if prefix_rows is not None:
             output += prefix_rows
+        if before_gather is not None:
+            before_gather()
         return rows.gather(output)
 
     def _row_sharded_shared(self, hidden_states: torch.Tensor, rows) -> torch.Tensor:
@@ -2818,10 +2823,46 @@ class KimiDecoderLayer(nn.Module):
             None if window is None else rows.shard(window),
             rows.scatter(attn_partial),
         )
+        alt = self._zero_addends_stream(attn_partial)
+        if alt is None:
+            residual = moe.row_sharded_moe(
+                rows.gather(hidden_rows), rows, prefix_rows, hidden_rows
+            )
+            return residual, *zero_addends(residual)
+        pair = []
+
+        def zeros_beside_gather():
+            # Allocated before the gather is queued: none of its blocks is theirs.
+            pair.extend(attn_partial.new_empty(attn_partial.shape) for _ in range(2))
+            alt.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(alt):
+                for zeros in pair:
+                    zeros.zero_()
+
         residual = moe.row_sharded_moe(
-            rows.gather(hidden_rows), rows, prefix_rows, hidden_rows
+            rows.gather(hidden_rows),
+            rows,
+            prefix_rows,
+            hidden_rows,
+            zeros_beside_gather,
         )
-        return residual, *zero_addends(residual)
+        torch.cuda.current_stream().wait_stream(alt)
+        return residual, *register_zero_addends(tuple(pair))
+
+    def _zero_addends_stream(self, like: torch.Tensor) -> torch.cuda.Stream | None:
+        """The stream that writes a row-sharded step's zero addends while the
+        tail's last gather runs (ATOM_KIMI_K3_ROW_TAIL_ZEROS_BESIDE_GATHER), or
+        None for the current stream: off, no `alt_stream`, or in a graph."""
+        alt = self.block_sparse_moe.alt_stream
+        if (
+            not envs.ATOM_KIMI_K3_ROW_TAIL_ZEROS_BESIDE_GATHER
+            or alt is None
+            or not like.is_cuda
+            or get_forward_context().in_hipgraph
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        return alt
 
     def forward(
         self,

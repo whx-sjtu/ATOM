@@ -1374,6 +1374,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_K3_ATTN_RES_SKIP_ZERO_ADDENDS": lambda: (
         os.getenv("ATOM_KIMI_K3_ATTN_RES_SKIP_ZERO_ADDENDS", "1") == "1"
     ),
+    # Eager row-sharded Kimi steps write their two zero addends on the second
+    # stream while the tail's last gather runs. Same values. Off by default.
+    "ATOM_KIMI_K3_ROW_TAIL_ZEROS_BESIDE_GATHER": lambda: (
+        os.getenv("ATOM_KIMI_K3_ROW_TAIL_ZEROS_BESIDE_GATHER", "0") == "1"
+    ),
     # Row sharding pads a reduce-scatter input by zeroing only its pad rows, and
     # Kimi's row tail has its experts write into an already padded buffer.
     # Same values. Off by default.
