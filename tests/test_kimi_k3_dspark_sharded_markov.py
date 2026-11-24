@@ -166,8 +166,8 @@ def test_not_under_ulysses_sp(ops, monkeypatch):
     assert not _model()._sharded_markov_greedy()
 
 
-@pytest.mark.parametrize("flag, on", [(None, False), ("1", True), ("0", False)])
-def test_the_switch_is_off_by_default(monkeypatch, flag, on):
+@pytest.mark.parametrize("flag, on", [(None, True), ("1", True), ("0", False)])
+def test_the_switch_is_on_by_default(monkeypatch, flag, on):
     if flag is None:
         monkeypatch.delenv("ATOM_DSPARK_SHARDED_MARKOV", raising=False)
     else:
