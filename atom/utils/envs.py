@@ -1023,6 +1023,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # index_select, zero fills and index_put after the all-gather.
     # Bit-identical. Off by default; 1 enables.
     "ATOM_SPG_INDEXER_STAGE": lambda: (os.getenv("ATOM_SPG_INDEXER_STAGE", "0") == "1"),
+    # Kimi-K3 KDA prefill state glue on the gather path: the initial-state
+    # gather reads has_initial_state's bytes in place (no int8 cast); with
+    # interior checkpoints one kernel gathers each sequence's initial state
+    # (rows', then heads') -- K-first in memory when FlashKDA would copy it
+    # so -- instead of a gather, an index_select and FlashKDA's transpose;
+    # the final states are written back with the builder's int64 slots.
+    # Bit-identical. Off by default; 1 enables.
+    "ATOM_SPG_KDA_STATE": lambda: (os.getenv("ATOM_SPG_KDA_STATE", "0") == "1"),
     # Kimi-K3 KDA prefill reads and writes the recurrent state in the slot pool
     # directly (FlashKDA's paged state_cache) instead of gathering it, copying
     # it K-first and scattering the final state back. Steps with a state fork
