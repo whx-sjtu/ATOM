@@ -132,6 +132,13 @@ K2_HANDOFF_ENVS = {
     "ATOM_MONO_K2_LN_SQ": "ln_sq",
 }
 
+# K2's front switches (``k2.FRONT``), off by default: env -> K2Build field
+K2_FRONT_ENVS = {
+    "ATOM_MONO_K2_EARLY_AHEAD": "early_ahead",
+    "ATOM_MONO_K2_LATQ_BATCH": "latq_batch",
+    "ATOM_MONO_K2_EARLY_YIELD": "early_yield",
+}
+
 # K1's KDA tail switches (``k1.KDA_TAIL``): env -> KdaPreBuild field
 K1_KDA_TAIL_ENVS = {
     "ATOM_MONO_K1_OWN_QK": "own_qk",
@@ -240,6 +247,7 @@ class K3MonoDecodeRunner:
     k1_w_ahead = False
     k1_tail = MappingProxyType({})  # KdaPreBuild field -> on (``K1_KDA_TAIL_ENVS``)
     handoffs = MappingProxyType({})  # K2Build field -> on (``K2_HANDOFF_ENVS``)
+    front = MappingProxyType({})  # K2Build field -> on (``K2_FRONT_ENVS``)
 
     def __init__(self, model, drafter=None, metadata_builder=None) -> None:
         group = get_tp_group().cpu_group
@@ -252,6 +260,9 @@ class K3MonoDecodeRunner:
         }
         self.handoffs = {
             name: _agree_env(env, group) for env, name in K2_HANDOFF_ENVS.items()
+        }
+        self.front = {
+            name: _agree_env(env, group) for env, name in K2_FRONT_ENVS.items()
         }
         bind_agreed(lambda: self._bind(model, drafter, metadata_builder), group)
         peer_bytes = k2.peer_bytes(self.max_rows, self.k2_peer_extra)
@@ -525,6 +536,7 @@ class K3MonoDecodeRunner:
                 ug_place=self.ug_place,
                 diag=self.debug,
                 **k2.handoffs_at(rows, self.handoffs),
+                **k2.front_at(rows, self.front),
             )
             for p in self.plans
             if p.moe is not None

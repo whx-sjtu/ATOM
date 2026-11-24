@@ -122,6 +122,16 @@ class K2Build:
     # lnorm's sums of squares from the owner beside LATG (LSQ): no hop
     # between a rank's lnorm tasks (``k2b.stage_lnorm_batched``)
     ln_sq: bool = field(default=False, metadata={"sym": "lq"})
+    # The front switches (``FRONT``), the same sums as well, each named in the
+    # symbol only when on. Past one token group, the router's and latent's x
+    # staged this many units ahead of their MFMAs (``k2b.early_units``; 0:
+    # one, the default)
+    early_ahead: int = field(default=0, metadata={"sym": "ea"})
+    # two of the latent's 512-block passes a poll (``k2b.load_latq``)
+    latq_batch: bool = field(default=False, metadata={"sym": "lb"})
+    # the shared gate/up stages x once this rank's router and latent tasks
+    # multiplied theirs (ESTG, ``k2b.early_compute``): x's bandwidth to them
+    early_yield: bool = field(default=False, metadata={"sym": "ey"})
     diag: bool = field(default=False, metadata={"sym": "g"})
     timeline: bool = field(default=False, metadata={"sym": "t"})
 
@@ -176,6 +186,22 @@ LATQ_FIRST_ROWS = 15
 def handoffs_at(rows: int, on) -> dict:
     """The hand-off switches ``on`` (field -> on) a ``rows``-row build takes."""
     return {**on, "latq_first": bool(on.get("latq_first")) and rows <= LATQ_FIRST_ROWS}
+
+
+FRONT = ("early_ahead", "latq_batch", "early_yield")
+# ``early_ahead``'s depth when its switch is on (``front_at``)
+EARLY_AHEAD = 3
+
+
+def front_at(rows: int, on) -> dict:
+    """The front switches ``on`` (field -> on) a ``rows``-row build takes, each
+    only where it changes the code: staging past one token group, two latent
+    passes or more."""
+    return {
+        "early_ahead": EARLY_AHEAD if on.get("early_ahead") and groups(rows) > 1 else 0,
+        "latq_batch": bool(on.get("latq_batch")) and k2b.latq_passes(rows) > 1,
+        "early_yield": bool(on.get("early_yield")),
+    }
 
 
 def peer_extra(key: K2Build) -> tuple:
@@ -303,7 +329,7 @@ def symbol(key: K2Build) -> str:
     sym = symbol_params(key)
     if key.early_paired:
         del sym["ep"]
-    for name in HANDOFFS:
+    for name in HANDOFFS + FRONT:
         if not getattr(key, name):
             del sym[_SYM[name]]
     return kernel_symbol("k3_mono_k2", **sym)
@@ -442,6 +468,9 @@ def build(key: K2Build):
             "batch_polls": key.batch_polls,
             "route_parts": key.route_parts,
             "ln_sq": key.ln_sq,
+            "early_ahead": key.early_ahead,
+            "latq_batch": key.latq_batch,
+            "early_yield": key.early_yield,
             "put": mb.put,
             "put_bf": mb.put_bf,
             "put_words": mb.put_words,
@@ -517,6 +546,8 @@ def build(key: K2Build):
             "shrdy",
         ):
             c[region] = sreg(scratch, lay[region][0], region)
+        if const_expr(key.early_yield):
+            c["estg"] = sreg(scratch, lay["estg"][0], "estg")
         on, tls = key.timeline, lds.tls.ptr
         stamp_begin(on, tls, tid, TL_POINTS)
         # ---- o_proj on every CTA (``o_slot``)
