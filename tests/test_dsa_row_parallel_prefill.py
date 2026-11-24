@@ -245,7 +245,7 @@ def test_the_switch_is_on_by_default(monkeypatch):
     monkeypatch.delenv("ATOM_DSA_ROW_PARALLEL_PREFILL", raising=False)
     assert envs.ATOM_DSA_ROW_PARALLEL_PREFILL is True
     assert rp.requested() is False
-    assert envs.ATOM_DSA_ROW_PARALLEL_PREFILL_MIN_TOKENS == 8192
+    assert envs.ATOM_DSA_ROW_PARALLEL_PREFILL_MIN_TOKENS == 4096
     assert envs.ATOM_DSA_ROW_PARALLEL_PREFILL_MAX_KV_ROWS == 1 << 18
     assert AttentionMetaData().dsa_row_parallel is None
     assert aiter_mla.AiterMLAMetadataBuilder._dsa_row_parallel is False
@@ -423,6 +423,26 @@ def test_a_step_a_token_graph_bucket_holds_keeps_the_default_path(
         assert _names(calls) == _DEFAULT and plans == []
 
 
+@pytest.mark.parametrize(
+    "tokens,taken",
+    [(4095, False), (4096, False), (4097, True), (6144, True), (8191, True)],
+)
+def test_by_default_the_eager_steps_past_kimi_k3_buckets_run_row_parallel(
+    monkeypatch, tokens, taken
+):
+    monkeypatch.delenv("ATOM_DSA_ROW_PARALLEL_PREFILL_MIN_TOKENS", raising=False)
+    monkeypatch.setitem(
+        aiter_mla.TokenGraph._sizes, "prefill", (256, 512, *range(1024, 4097, 256))
+    )
+    b, calls, plans = _builder(monkeypatch, min_tokens=rp.min_tokens_env())
+    batch = _batch([65536 + tokens], [tokens])
+    md = _metadata(tokens)
+    _finish(b, batch, _staged(batch), md)
+    assert (md.dsa_row_parallel is not None) is taken
+    if not taken:
+        assert _names(calls) == _DEFAULT and plans == []
+
+
 def test_the_first_row_parallel_step_is_logged_once(monkeypatch):
     monkeypatch.setitem(aiter_mla.TokenGraph._sizes, "prefill", ())
     logged = []
@@ -545,12 +565,12 @@ def _resolvable(monkeypatch, **kw):
 @pytest.mark.parametrize("front", ["0", "1"])
 def test_the_switch_on_warms_the_index_kernel(monkeypatch, front):
     b, config, warmed, warned = _resolvable(monkeypatch)
-    monkeypatch.setenv("ATOM_DSA_ROW_PARALLEL_PREFILL_MIN_TOKENS", "4096")
+    monkeypatch.setenv("ATOM_DSA_ROW_PARALLEL_PREFILL_MIN_TOKENS", "6144")
     monkeypatch.setenv("ATOM_DSA_ROW_PARALLEL_PREFILL_FRONT", front)
     assert b._resolve_dsa_row_parallel(config) is True
     assert warmed == [((8, 1, TOPK, "cpu"), {"new_rows": front == "1"})]
     assert warned == [] and b._dsa_row_parallel_front is (front == "1")
-    assert b._dsa_row_parallel_min_tokens == 4096
+    assert b._dsa_row_parallel_min_tokens == 6144
     assert b._dsa_row_parallel_max_kv_rows == 1 << 18
 
 

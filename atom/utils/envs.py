@@ -605,8 +605,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSA_ROW_PARALLEL_PREFILL": lambda: (
         os.getenv("ATOM_DSA_ROW_PARALLEL_PREFILL", "1") == "1"
     ),
+    # A step a recorded prefill token-graph bucket holds keeps the default
+    # path whatever this is; Kimi-K3's buckets end at 4096.
     "ATOM_DSA_ROW_PARALLEL_PREFILL_MIN_TOKENS": lambda: int(
-        os.getenv("ATOM_DSA_ROW_PARALLEL_PREFILL_MIN_TOKENS", "8192")
+        os.getenv("ATOM_DSA_ROW_PARALLEL_PREFILL_MIN_TOKENS", "4096")
     ),
     "ATOM_DSA_ROW_PARALLEL_PREFILL_MAX_KV_ROWS": lambda: int(
         os.getenv("ATOM_DSA_ROW_PARALLEL_PREFILL_MAX_KV_ROWS", str(1 << 18))
