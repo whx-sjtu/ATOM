@@ -62,6 +62,69 @@ def test_the_hook_serves_a_step_with_the_launcher_and_otherwise_the_own_forward(
     assert modules[9].calls == ["q"]
 
 
+class _FrontIndexer:
+    """``Indexer.forward``'s signature since PF3-RPA's front (``projected_q``)."""
+
+    prefix = "layers.4.indexer"
+
+    def __init__(self):
+        self.calls = []
+        self.k_cache = SimpleNamespace(
+            kv_cache=[torch.zeros(4)], kv_cache_scale=torch.zeros(1)
+        )
+        self.sparse_kv_indices_buffer = torch.zeros(4, dtype=torch.int32)
+        self.dcp_sparse_kv_indptr_buffer = torch.zeros(2, dtype=torch.int32)
+        self.dcp_owned_counts_buffer = torch.zeros(1, dtype=torch.int32)
+
+    def forward(self, hidden_states, qr, qr_scale, positions, rotary_emb=None, *,
+                projected_k_weights=None, projected_q=None):  # fmt: skip
+        self.calls.append((qr, projected_k_weights, projected_q))
+
+
+def _front_call(monkeypatch, module, projected_q):
+    """Kimi-K3's DSA layer calling its hooked indexer (``model.py``), the
+    registered op run as its eager body (it is registered for CUDA only)."""
+    monkeypatch.setattr(
+        bind,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(
+            compilation_config=SimpleNamespace(
+                static_forward_context={module.prefix: module}
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        torch.ops.aiter, "mono_dsa_indexer", bind.mono_dsa_indexer, raising=False
+    )
+    h, q, pos = torch.zeros(3, 8), torch.zeros(3, 6), torch.zeros(3, dtype=torch.int64)
+    k, w = torch.zeros(3, 4), torch.zeros(3, 2)
+    module.forward(h, q, None, pos, projected_k_weights=(k, w), projected_q=projected_q)
+    return q, k, w
+
+
+@pytest.mark.parametrize("front", [False, True])
+def test_a_hooked_indexer_takes_projected_q_to_its_own_forward(monkeypatch, front):
+    """PF3-RPA's front passes ``projected_q`` (None without the front): the
+    hooked forward takes it, and a step the launcher does not serve hands it to
+    the indexer's own forward; a served step launches on ``qr`` as before."""
+    module = _FrontIndexer()
+    hook, launched = _hook(monkeypatch, {4: module})
+    projected_q = torch.ones(3, 16) if front else None
+    q, k, w = _front_call(monkeypatch, module, projected_q)
+    [(qr, (k_got, w_got), q_got)] = module.calls
+    assert qr is q and k_got is k and w_got is w and q_got is projected_q
+    assert not launched
+    with hook.serving("launcher"):
+        _front_call(monkeypatch, module, projected_q)
+    assert len(module.calls) == 1 and len(launched) == 1
+
+
+def test_the_registered_indexer_op_takes_projected_q():
+    schema = torch.ops.aiter.mono_dsa_indexer.default._schema
+    arg = schema.arguments[-1]
+    assert arg.name == "projected_q" and str(arg.type) == "Optional[Tensor]"
+
+
 def test_removing_the_hook_gives_back_the_class_forward(monkeypatch):
     modules = {4: _Indexer()}
     hook, _ = _hook(monkeypatch, modules)

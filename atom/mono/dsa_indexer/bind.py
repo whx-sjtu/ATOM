@@ -343,9 +343,13 @@ class IndexerHook:
             self._launcher = None
 
     def dispatch(self, layer_id, module, hidden_states, qr, qr_scale, positions, k,
-                 weights) -> None:  # fmt: skip
-        """One layer's indexer this step: the mono launch, or its own forward."""
+                 weights, projected_q=None) -> None:  # fmt: skip
+        """One layer's indexer this step: the mono launch, or its own forward.
+        ``projected_q`` (the caller ran wq_b: Kimi-K3's row-parallel DSA front)
+        goes to the own forward only; the launch projects ``qr`` itself, and a
+        step it serves is never a row-parallel one (those are >= 8192 tokens)."""
         if self._launcher is None:
+            extra = {} if projected_q is None else {"projected_q": projected_q}
             type(module).forward(
                 module,
                 hidden_states,
@@ -353,6 +357,7 @@ class IndexerHook:
                 qr_scale,
                 positions,
                 projected_k_weights=(k, weights),
+                **extra,
             )
             return
         args = launch_args(
@@ -366,7 +371,7 @@ def _routed_forward(module):
     """``module``'s forward while hooked: its operands into the opaque op."""
 
     def forward(hidden_states, qr, qr_scale, positions, rotary_emb=None, *,
-                projected_k_weights=None):  # fmt: skip
+                projected_k_weights=None, projected_q=None):  # fmt: skip
         k, weights = projected_k_weights
         torch.ops.aiter.mono_dsa_indexer(
             hidden_states,
@@ -381,6 +386,7 @@ def _routed_forward(module):
             module.sparse_kv_indices_buffer,
             module.dcp_sparse_kv_indptr_buffer,
             module.dcp_owned_counts_buffer,
+            projected_q,
         )
 
     return forward
@@ -399,6 +405,7 @@ def mono_dsa_indexer(
     sparse_kv_indices_buffer: torch.Tensor,
     dcp_sparse_kv_indptr_buffer: torch.Tensor,
     dcp_owned_counts_buffer: torch.Tensor,
+    projected_q: torch.Tensor | None = None,
 ) -> None:
     """A hooked layer's indexer (``IndexerHook.dispatch``). The buffers it
     writes are arguments only to be declared mutated: the MLA reads them next,
@@ -407,7 +414,10 @@ def mono_dsa_indexer(
         layer_name
     ]
     hook, layer_id = module.__dict__[_HOOKED]
-    hook.dispatch(layer_id, module, hidden_states, qr, qr_scale, positions, k, weights)
+    hook.dispatch(
+        layer_id, module, hidden_states, qr, qr_scale, positions, k, weights,
+        projected_q,
+    )  # fmt: skip
 
 
 direct_register_custom_op(
