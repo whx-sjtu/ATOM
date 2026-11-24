@@ -1342,6 +1342,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MOE_ELIDE_FULL_ROW_COUNT": lambda: (
         os.getenv("ATOM_MOE_ELIDE_FULL_ROW_COUNT", "1").lower() == "1"
     ),
+    # Lower row bound for that row sharding inside a prefill token graph: a
+    # bucket of at least this many rows records it (and its warmup runs it),
+    # on AITER's custom reduce-scatter and gather. 0 (default) records every
+    # bucket replicated.
+    "ATOM_KIMI_K3_MOE_ROW_SHARD_GRAPH_MIN_TOKENS": lambda: int(
+        os.getenv("ATOM_KIMI_K3_MOE_ROW_SHARD_GRAPH_MIN_TOKENS", "0")
+    ),
+    # Eager row-sharded steps reduce-scatter and gather on AITER's custom
+    # kernels (pynccl above their size caps) instead of RCCL. Changes the
+    # reduction order. Off by default.
+    "ATOM_KIMI_K3_ROW_SHARD_CUSTOM_COMM": lambda: (
+        os.getenv("ATOM_KIMI_K3_ROW_SHARD_CUSTOM_COMM", "0") == "1"
+    ),
     # The next residual mix reads a row-sharded step's zero addends as one zero row.
     # Bit-identical output. On by default; 0 reads the zero tensors themselves.
     "ATOM_KIMI_K3_ATTN_RES_SKIP_ZERO_ADDENDS": lambda: (
