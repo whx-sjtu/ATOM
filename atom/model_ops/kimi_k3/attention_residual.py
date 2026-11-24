@@ -610,9 +610,15 @@ def zero_addends(like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     the same kernel and values, without their HBM traffic. Any other reader,
     and any copy a compiler makes of them, still reads the zeros themselves.
     """
+    return register_zero_addends((torch.zeros_like(like), torch.zeros_like(like)))
+
+
+def register_zero_addends(
+    pair: tuple[torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`zero_addends` for two zero tensors the caller wrote itself."""
     from atom.utils import envs
 
-    pair = (torch.zeros_like(like), torch.zeros_like(like))
     if envs.ATOM_KIMI_K3_ATTN_RES_SKIP_ZERO_ADDENDS:
         if _ZERO_ADDENDS:
             _log_zero_addends_once("missed", _ZERO_ADDENDS_MISSED)

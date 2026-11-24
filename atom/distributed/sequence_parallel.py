@@ -13,10 +13,21 @@ from atom.utils import envs
 
 
 def _pad_rows(x: torch.Tensor, missing: int) -> torch.Tensor:
-    """`x` with `missing` zero rows appended on dim 0, for any rank."""
+    """`x` with `missing` zero rows appended on dim 0, for any rank.
+
+    Under ``ATOM_ROW_SHARD_PAD_IN_PLACE`` only the appended rows are zeroed,
+    and the rows of a `SequenceParallel.padded_rows` buffer are that buffer."""
     if not missing:
         return x
-    return nn.functional.pad(x, (0, 0) * (x.dim() - 1) + (0, missing))
+    if not envs.ATOM_ROW_SHARD_PAD_IN_PLACE:
+        return nn.functional.pad(x, (0, 0) * (x.dim() - 1) + (0, missing))
+    padded = getattr(x, "_padded_rows_of", None)
+    if padded is not None and padded.shape[0] == x.shape[0] + missing:
+        return padded
+    out = x.new_empty((x.shape[0] + missing, *x.shape[1:]))
+    out[: x.shape[0]].copy_(x)
+    out[x.shape[0] :].zero_()
+    return out
 
 
 class SequenceParallel:
@@ -130,3 +141,17 @@ class SequenceParallel:
         if tp_size == 1:
             return None
         return cls(num_tokens, tp_size, get_tensor_model_parallel_rank())
+
+    def padded_rows(self, like: torch.Tensor) -> torch.Tensor | None:
+        """Under ``ATOM_ROW_SHARD_PAD_IN_PLACE``, on a step with pad rows, an
+        uninitialized `[T, *like.shape[1:]]` tensor for a producer to write the
+        partials `scatter` reduces into: the leading rows of a buffer whose pad
+        rows are zero, which `scatter` reduces without copying. Otherwise None.
+        """
+        if not self.pad or not envs.ATOM_ROW_SHARD_PAD_IN_PLACE:
+            return None
+        buffer = like.new_empty((self.num_tokens + self.pad, *like.shape[1:]))
+        buffer[self.num_tokens :].zero_()
+        rows = buffer[: self.num_tokens]
+        rows._padded_rows_of = buffer
+        return rows
