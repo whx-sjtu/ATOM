@@ -10,6 +10,7 @@ from atom.utils import envs
 BIT_EXACT = (
     "ATOM_SPG_INDEXER_STAGE",
     "ATOM_SPG_KDA_STATE",
+    "ATOM_SPG_KDA_PACK",
 )
 ON_BY_DEFAULT = ()
 

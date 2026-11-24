@@ -1449,6 +1449,10 @@ _FLASH_KDA_FLAGS = (
     "use_beta_sigmoid_in_kernel",
 )
 
+# `gather_kda_inputs` beats torch's per-tensor gathers only up to about this
+# many recurrence rows; past it the gathers are faster.
+_KDA_PACK_MAX_ROWS = 8192
+
 
 def _direct_flash_kda_cps(q, v, cu, safe_gate, lower_bound, A_log, flags):
     """The segment length `KimiKDAAttention._chunk_kda` hands `flash_kda_fwd`
@@ -1900,9 +1904,14 @@ class KimiKDAAttention(nn.Module):
         num_tokens = q.shape[1]
         if ckpt is not None and "kda_tokens" in ckpt:
             tokens, cu = ckpt["kda_tokens"], ckpt["kda_cu"]
-            q, k, v, gate, beta = (
-                x.index_select(1, tokens) for x in (q, k, v, gate, beta)
-            )
+            if envs.ATOM_SPG_KDA_PACK and tokens.shape[0] <= _KDA_PACK_MAX_ROWS:
+                from atom.model_ops.kimi_k3 import gather_kda_inputs
+
+                q, k, v, gate, beta = gather_kda_inputs(tokens, q, k, v, gate, beta)
+            else:
+                q, k, v, gate, beta = (
+                    x.index_select(1, tokens) for x in (q, k, v, gate, beta)
+                )
             if not expanded:
                 initial = initial.index_select(0, ckpt["kda_rows"])
         out, state = self._run_kda(q, k, v, gate, beta, initial, cu, True)

@@ -1031,6 +1031,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the final states are written back with the builder's int64 slots.
     # Bit-identical. Off by default; 1 enables.
     "ATOM_SPG_KDA_STATE": lambda: (os.getenv("ATOM_SPG_KDA_STATE", "0") == "1"),
+    # SPG: with interior checkpoints the KDA prefill gathers q, k, v, gate and
+    # beta (widened to fp32) for its rows and heads in one kernel instead of
+    # five index_selects and a cast. Bit-identical. Off by default; 1 enables.
+    "ATOM_SPG_KDA_PACK": lambda: (os.getenv("ATOM_SPG_KDA_PACK", "0") == "1"),
     # Kimi-K3 KDA prefill reads and writes the recurrent state in the slot pool
     # directly (FlashKDA's paged state_cache) instead of gathering it, copying
     # it K-first and scattering the final state back. Steps with a state fork
