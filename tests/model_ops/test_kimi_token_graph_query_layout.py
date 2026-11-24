@@ -200,6 +200,9 @@ def runtime(monkeypatch):
         "Indexer",
     ):
         namespace[name] = Projection
+    # The output gate in the merge has its own tests (test_dcp_gate_in_merge.py);
+    # other switches may share this envs.
+    namespace.setdefault("envs", SimpleNamespace()).ATOM_DMLA_GATE_IN_MERGE = False
     _load(
         "atom/models/kimi_k3/model.py",
         {"_text_config", "KimiFullAttention", "_linear_into"},
@@ -225,6 +228,8 @@ def runtime(monkeypatch):
             "_mla_token_graph_forward",
             "_fits",
             "unified_attention_with_output_base",
+            "_merge_gate_impl",
+            "_unified_attention",
             "_attention",
             "_attention_region",
         },

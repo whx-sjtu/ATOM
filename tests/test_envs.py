@@ -498,3 +498,11 @@ def test_dmla_qtail_plan_patch_default_on(monkeypatch):
     assert _get_envs().ATOM_DMLA_QTAIL_PLAN_PATCH is True
     monkeypatch.setenv("ATOM_DMLA_QTAIL_PLAN_PATCH", "0")
     assert _get_envs().ATOM_DMLA_QTAIL_PLAN_PATCH is False
+
+
+def test_dmla_gate_in_merge_default_off(monkeypatch):
+    """The output gate in the mailbox combine changes numerics: off unless 1."""
+    monkeypatch.delenv("ATOM_DMLA_GATE_IN_MERGE", raising=False)
+    assert _get_envs().ATOM_DMLA_GATE_IN_MERGE is False
+    monkeypatch.setenv("ATOM_DMLA_GATE_IN_MERGE", "1")
+    assert _get_envs().ATOM_DMLA_GATE_IN_MERGE is True

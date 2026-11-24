@@ -112,6 +112,90 @@ def test_empty_rows_are_masked_by_the_combine(monkeypatch, capturing):
     assert torch.equal(seen["lse"], lse)
 
 
+def _gated_combine(monkeypatch, takes_a_gate=True):
+    """A prepared workspace whose combine records the gate it is handed."""
+    group = _group()
+    key = dcp_ops._mailbox_key(group, 4, 128)
+    monkeypatch.setitem(dcp_ops._MAILBOX_WORKSPACES, key, SimpleNamespace(max_tokens=8))
+    handed = []
+
+    def combine(ws, o, l, base_e, row_counts=None, gate=None):
+        handed.append(gate)
+        return "combined"
+
+    def old_combine(ws, o, l, base_e, row_counts=None):
+        handed.append(None)
+        return "combined"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.ops.flydsl.dcp_mailbox",
+        SimpleNamespace(dcp_lse_combine=combine if takes_a_gate else old_combine),
+    )
+    return group, handed
+
+
+class _Gate:
+    """The gate callable a DCP decode hands its merge."""
+
+    def __init__(self):
+        self.tensor, self.calls = torch.ones(2, 512, dtype=torch.bfloat16), 0
+
+    def __call__(self):
+        self.calls += 1
+        return self.tensor
+
+
+@needs_dcp_ops
+def test_a_mailbox_merge_applies_the_gate_in_its_combine(monkeypatch, capturing):
+    group, handed = _gated_combine(monkeypatch)
+    gate = _Gate()
+    out = torch.zeros(2, 16, 128, dtype=torch.bfloat16)
+    lse = torch.zeros(2, 16)
+    assert dcp_ops.dcp_lse_merge(out, lse, group, "mailbox", gate=gate) == "combined"
+    assert gate.calls == 1 and handed == [gate.tensor]
+
+
+@needs_dcp_ops
+def test_an_aiter_combine_without_a_gate_leaves_it_to_the_caller(
+    monkeypatch, capturing
+):
+    """Warned once, and the decode keeps the gate kernel after the merge."""
+    warned = []
+    monkeypatch.setattr(
+        dcp_ops, "logger", SimpleNamespace(warning=lambda *a: warned.append(a))
+    )
+    group, handed = _gated_combine(monkeypatch, takes_a_gate=False)
+    gate = _Gate()
+    out = torch.zeros(2, 16, 128, dtype=torch.bfloat16)
+    lse = torch.zeros(2, 16)
+    for _ in range(3):  # three MLA layers
+        assert dcp_ops.dcp_lse_merge(out, lse, group, "mailbox", gate=gate) == (
+            "combined"
+        )
+    assert gate.calls == 0 and handed == [None] * 3
+    assert len(warned) == 1 and "no output gate" in warned[0][0]
+
+
+@needs_dcp_ops
+@pytest.mark.parametrize("case", ["eager", "too wide", "fp32", "fused quant"])
+def test_a_merge_the_mailbox_combine_does_not_gate_leaves_the_gate(
+    monkeypatch, a2a_calls, case
+):
+    capturing = case != "eager"
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    group, handed = _gated_combine(monkeypatch)
+    gate = _Gate()
+    tokens = 9 if case == "too wide" else 2
+    dtype = torch.float32 if case == "fp32" else torch.bfloat16
+    out = torch.zeros(tokens, 16, 128, dtype=dtype)
+    lse = torch.zeros(tokens, 16)
+    quant = torch.float8_e4m3fn if case == "fused quant" else None
+    dcp_ops.dcp_lse_merge(out, lse, group, "mailbox", quant_dtype=quant, gate=gate)
+    assert gate.calls == 0
+    assert handed == ([None] if case == "fused quant" else [])
+
+
 @needs_dcp_ops
 def test_an_eager_step_is_all_to_all(monkeypatch, a2a_calls):
     """An eager call re-traces the FlyDSL kernel on the host every time (tens
@@ -271,8 +355,9 @@ def _merge_layer(monkeypatch, seen):
         owned_counts=None,
         quant_dtype=None,
         head_major=False,
+        gate=None,
     ):
-        assert not head_major
+        assert not head_major and gate is None
         seen.append((backend, quant_dtype))
         return o if quant_dtype is None else (o, None)
 
@@ -352,6 +437,7 @@ def _worker(rank, world, init, results):
     # 8 tokens: one token a CTA; 49: multi-token CTAs ending in a partial tile
     for tokens in (8, 49):
         _check_mailbox_merge(rank, world, group, heads, dim, tokens)
+        _check_gated_merge(rank, world, group, heads, dim, tokens)
     torch.cuda.synchronize()
     dist.barrier()
     results[rank] = True
@@ -408,6 +494,40 @@ def _check_mailbox_merge(rank, world, group, heads, dim, tokens):
         torch.testing.assert_close(rows, ref, rtol=1e-2, atol=1e-2)
     else:
         assert rows.dtype == torch.float8_e4m3fn and scale.shape[0] == tokens
+
+
+def _check_gated_merge(rank, world, group, heads, dim, tokens):
+    """A captured mailbox merge offered an output gate applies it in the
+    combine: sigmoid(gate) times what all-to-all merges."""
+    gen = torch.Generator(device="cuda").manual_seed(200 + rank)
+    out = torch.empty(tokens, world * heads, dim, device="cuda", dtype=torch.bfloat16)
+    lse = torch.empty(tokens, world * heads, device="cuda")
+    gate = torch.empty(tokens, heads * dim, device="cuda", dtype=torch.bfloat16)
+
+    def draw():
+        out.copy_(torch.randn(out.shape, device="cuda", generator=gen))
+        lse.copy_(torch.randn(lse.shape, device="cuda", generator=gen) * 3)
+        gate.copy_(torch.randn(gate.shape, device="cuda", generator=gen) * 2)
+
+    taken = []
+
+    def take():
+        taken.append(gate)
+        return gate
+
+    draw()
+    graph, side = torch.cuda.CUDAGraph(), torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side), torch.cuda.graph(graph, stream=side):
+        got = dcp_ops.dcp_lse_merge(out, lse, group, "mailbox", gate=take)
+    torch.cuda.current_stream().wait_stream(side)
+    assert taken == [gate]
+    for _ in range(2):
+        draw()
+        graph.replay()
+        merged = dcp_ops.dcp_lse_merge(out, lse, group, "a2a")
+        ref = merged.float() * torch.sigmoid(gate.float()).view(merged.shape)
+        torch.testing.assert_close(got.float(), ref, rtol=1e-2, atol=1e-2)
 
 
 @needs_dcp_ops
