@@ -283,6 +283,8 @@ def test_prefill_row_count_selects_projection_and_transport_together(
     transport = {
         "torch": torch,
         "triton": SimpleNamespace(next_power_of_2=lambda n: 1 << (n - 1).bit_length()),
+        # SPG's head-major LSE kernel has its own tests (test_spg_dcp_lse.py)
+        "envs": SimpleNamespace(ATOM_SPG_DCP_LSE=False),
     }
     exec(  # noqa: S102 - real transport wrapper, with collectives/kernels stubbed
         compile(ast.Module(body=functions, type_ignores=[]), str(path), "exec"),
@@ -345,6 +347,8 @@ def test_head_major_exchange_preserves_partials_and_fp32_lse(
     namespace = {
         "torch": torch,
         "triton": SimpleNamespace(next_power_of_2=lambda n: 1 << (n - 1).bit_length()),
+        # SPG's head-major LSE kernel has its own tests (test_spg_dcp_lse.py)
+        "envs": SimpleNamespace(ATOM_SPG_DCP_LSE=False),
     }
     exec(  # noqa: S102 - execute only the checked-in CPU wrapper bodies
         compile(ast.Module(body=functions, type_ignores=[]), str(path), "exec"),

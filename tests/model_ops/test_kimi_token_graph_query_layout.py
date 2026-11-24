@@ -200,11 +200,14 @@ def runtime(monkeypatch):
         "eager_region": graph["eager_region"],
         "mark_spliting_op": lambda **kw: lambda f: f,
         "fake_": lambda *args: None,
+        # SPG's region-out recording path has its own tests (test_spg_region_out.py)
+        "envs": SimpleNamespace(ATOM_SPG_REGION_OUT=False),
     }
     _load(
         "atom/model_ops/base_attention.py",
         {
             "_mla_token_graph_forward",
+            "_fits",
             "unified_attention_with_output_base",
             "_attention",
             "_attention_region",

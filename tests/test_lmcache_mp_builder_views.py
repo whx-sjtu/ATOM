@@ -215,6 +215,7 @@ def mla_builder_cls():
             IndexRows=object,
             concat_rows=noop,
             fp4_rows=noop,
+            fp4_stage=noop,
             fp8_rows=noop,
             packed_concat_rows=noop,
         ),
