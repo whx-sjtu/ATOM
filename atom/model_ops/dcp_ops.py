@@ -777,10 +777,16 @@ def cp_lse_a2a_head_major(
     assert h_total % n_ranks == 0
     h_local = h_total // n_ranks
     dtype, dev = cp_attn_out.dtype, cp_attn_out.device
-    cp_attn_lse = cp_attn_lse.contiguous().to(torch.float32)
-    if owned_counts is not None:
-        cp_attn_lse = mask_empty_dcp_lse(cp_attn_lse, owned_counts[:b])
-    send, send_lse = cp_attn_out.contiguous(), cp_attn_lse.t().contiguous()
+    if envs.ATOM_SPG_DCP_LSE:
+        send_lse = dcp_head_major_lse(
+            cp_attn_lse, None if owned_counts is None else owned_counts[:b]
+        )
+    else:
+        cp_attn_lse = cp_attn_lse.contiguous().to(torch.float32)
+        if owned_counts is not None:
+            cp_attn_lse = mask_empty_dcp_lse(cp_attn_lse, owned_counts[:b])
+        send_lse = cp_attn_lse.t().contiguous()
+    send = cp_attn_out.contiguous()
     recv, recv_lse = torch.empty_like(send), torch.empty_like(send_lse)
     group = cp_group.device_group
     torch.distributed.all_to_all_single(recv, send, group=group)
@@ -961,6 +967,59 @@ def mask_empty_dcp_lse(
 ) -> torch.Tensor:
     """Mark dummy-backed local rows as absent before the DCP softmax merge."""
     return cp_attn_lse.masked_fill(owned_counts[:, None] == 0, float("-inf"))
+
+
+@triton.jit(do_not_specialize=["B"])
+def _dcp_head_major_lse_kernel(
+    lse_ptr,  # [B, H], any strides
+    counts_ptr,  # [B] owned_counts (unused when HAS_COUNTS=False)
+    out_ptr,  # [H, B] float32
+    B,
+    H,
+    stride_b,
+    stride_h,
+    HAS_COUNTS: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    rows = tl.program_id(0) * BLOCK_B + tl.arange(0, BLOCK_B)
+    heads = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = (rows[:, None] < B) & (heads[None, :] < H)
+    lse = tl.load(
+        lse_ptr + rows[:, None].to(tl.int64) * stride_b + heads[None, :] * stride_h,
+        mask=mask,
+    ).to(tl.float32)
+    if HAS_COUNTS:
+        empty = tl.load(counts_ptr + rows, mask=rows < B, other=1) == 0
+        lse = tl.where(empty[:, None], float("-inf"), lse)
+    tl.store(out_ptr + heads[None, :].to(tl.int64) * B + rows[:, None], lse, mask=mask)
+
+
+def dcp_head_major_lse(
+    cp_attn_lse: torch.Tensor, owned_counts: torch.Tensor | None
+) -> torch.Tensor:
+    """``mask_empty_dcp_lse(cp_attn_lse.float(), owned_counts).t().contiguous()``
+    in one kernel: the ``[H, B]`` FP32 LSE `cp_lse_a2a_head_major` sends.
+    A select and copies: bit-identical."""
+    b, h = cp_attn_lse.shape
+    out = torch.empty((h, b), dtype=torch.float32, device=cp_attn_lse.device)
+    if b == 0 or h == 0:
+        return out
+    block_b, block_h = 64, min(triton.next_power_of_2(h), 32)
+    has_counts = owned_counts is not None
+    _dcp_head_major_lse_kernel[(triton.cdiv(b, block_b), triton.cdiv(h, block_h))](
+        cp_attn_lse,
+        owned_counts if has_counts else cp_attn_lse,
+        out,
+        b,
+        h,
+        cp_attn_lse.stride(0),
+        cp_attn_lse.stride(1),
+        HAS_COUNTS=has_counts,
+        BLOCK_B=block_b,
+        BLOCK_H=block_h,
+    )
+    return out
 
 
 # ─────────────────────────────────────────── mailbox merge backend ──

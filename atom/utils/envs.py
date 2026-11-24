@@ -1035,6 +1035,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # beta (widened to fp32) for its rows and heads in one kernel instead of
     # five index_selects and a cast. Bit-identical. Off by default; 1 enables.
     "ATOM_SPG_KDA_PACK": lambda: (os.getenv("ATOM_SPG_KDA_PACK", "0") == "1"),
+    # SPG: the DCP head-major prefill merge builds the [H, B] FP32 LSE it sends
+    # (empty rows masked to -inf) in one kernel instead of an eq, a masked_fill
+    # (clone + fill) and a transpose copy. Bit-identical. Off by default; 1
+    # enables.
+    "ATOM_SPG_DCP_LSE": lambda: (os.getenv("ATOM_SPG_DCP_LSE", "0") == "1"),
     # Kimi-K3 KDA prefill reads and writes the recurrent state in the slot pool
     # directly (FlashKDA's paged state_cache) instead of gathering it, copying
     # it K-first and scattering the final state back. Steps with a state fork
