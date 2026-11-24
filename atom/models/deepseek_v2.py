@@ -1680,6 +1680,7 @@ class Indexer(nn.Module):
         rotary_emb=None,
         *,
         projected_k_weights: tuple[torch.Tensor, torch.Tensor] | None = None,
+        projected_q: torch.Tensor | None = None,
     ) -> None:
         # Under PCP, route the whole indexer through the Dynamo-opaque
         # `sparse_attn_indexer_pcp` op so the runtime `_pcp_active()` branch
@@ -1705,6 +1706,7 @@ class Indexer(nn.Module):
             positions,
             rotary_emb,
             projected_k_weights=projected_k_weights,
+            projected_q=projected_q,
         )
 
     def forward_impl(
@@ -1716,13 +1718,15 @@ class Indexer(nn.Module):
         rotary_emb=None,
         *,
         projected_k_weights: tuple[torch.Tensor, torch.Tensor] | None = None,
+        projected_q: torch.Tensor | None = None,
     ) -> None:
         # The opaque PCP op can't pass a module, so it relies on
         # the bound `self.rotary_emb`; direct callers (non-PCP / plugins) may still
         # pass their own rope explicitly, which takes precedence.
         if rotary_emb is None:
             rotary_emb = self.rotary_emb
-        q = self.wq_b(qr, qr_scale)
+        # `projected_q`: the caller ran wq_b (`kimi_k3_dsa_front`).
+        q = self.wq_b(qr, qr_scale) if projected_q is None else projected_q
         q = q.view(-1, self.n_head, self.head_dim)
 
         if self.external_k_weights:

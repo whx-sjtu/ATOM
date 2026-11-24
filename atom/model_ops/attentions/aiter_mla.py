@@ -463,6 +463,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     _indexer_fp4 = False
     mtp_keeps_selection = False
     _dsa_row_parallel = False
+    _dsa_row_parallel_front = False
 
     def _global_num_draft_layers(self) -> int:
         """Return draft layers in the target MLA pool across all PP stages."""
@@ -2578,17 +2579,20 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self._dsa_row_parallel_max_kv_rows = dsa_row_parallel.max_kv_rows_env()
         self._dsa_row_parallel_layers = None
         self._dsa_row_parallel_interleave = config.dcp_config.interleave_size
+        self._dsa_row_parallel_front = envs.ATOM_DSA_ROW_PARALLEL_PREFILL_FRONT
         dsa_row_parallel.warm_gathered_kv_index(
             self.dcp_world_size,
             self._dsa_row_parallel_interleave,
             self.index_topk_out,
             self.device,
+            new_rows=self._dsa_row_parallel_front,
         )
         logger.info(
             "Row-parallel DSA prefill: steps of >= %d new tokens and <= %d "
-            "gathered KV rows",
+            "gathered KV rows, front on the rank's rows: %d",
             self._dsa_row_parallel_min_tokens,
             self._dsa_row_parallel_max_kv_rows,
+            self._dsa_row_parallel_front,
         )
         return True
 
@@ -2638,8 +2642,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         ):
             return None
         world, block = self.dcp_world_size, self.model_runner.block_size
-        context_lens = batch.context_lens[:bs]
+        split = RowSplit.of(tokens, self.dcp_rank, world)
+        front = self._dsa_row_parallel_front
+        # The front's new rows travel after each rank's shard of the cache.
+        context_lens = (batch.cached_lens if front else batch.context_lens)[:bs]
         rows = dsa_row_parallel.gathered_kv_rows(context_lens, world, block)
+        rows += world * split.stride if front else 0
         if rows > self._dsa_row_parallel_max_kv_rows:
             return None
         if not self._dsa_row_parallel_layers_ready():
@@ -2647,7 +2655,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         kv = dsa_row_parallel.gathered_kv_plan(
             context_lens, batch.block_tables[:bs], world, block, self.device
         )
-        split = RowSplit.of(tokens, self.dcp_rank, world)
+        if front:
+            kv = dsa_row_parallel.with_new_rows(
+                kv, context_lens, batch.seqlens_q[:bs], split.stride, self.device
+            )
         host = self.model_runner.forward_vars["sparse_kv_indptr"].np[: tokens + 1]
         own, kv_base = dsa_row_parallel.own_kv_indptr(host, split.first, split.end)
         n = split.end - split.first
@@ -2669,6 +2680,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             last_page_lens=last_page_lens,
             no_slots=torch.full((n,), -1, dtype=torch.int64, device=self.device),
             work=work,
+            new_slots=(
+                torch.arange(
+                    kv.rows_pad, kv.rows_pad + n, dtype=torch.int64, device=self.device
+                )
+                if front
+                else None
+            ),
         )
 
     def _dsa_row_parallel_work_plan(

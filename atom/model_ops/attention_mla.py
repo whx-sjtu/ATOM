@@ -1839,8 +1839,18 @@ class MLAAttention(nn.Module):
         """A row-parallel DSA prefill step (atom/model_ops/dsa_row_parallel.py):
         this rank's rows, all the group's heads, over each row's whole top-k
         of the gathered KV; then each rank's heads of every row, by one
-        all-to-all. Returns what the QREP sparse prefill does."""
-        from atom.model_ops.dsa_row_parallel import gather_kv, rows_to_heads, write_kv
+        all-to-all. Returns what the QREP sparse prefill does.
+
+        On a front step (`plan.front`) only this rank's rows of ``k_nope`` and
+        ``k_rope`` are read: they are all the front computed."""
+        from atom.model_ops.dsa_row_parallel import (
+            gather_kv,
+            gather_local_kv,
+            local_kv,
+            rows_to_heads,
+            write_kv,
+            write_new_kv,
+        )
 
         if (
             q_scale is not None
@@ -1856,8 +1866,14 @@ class MLAAttention(nn.Module):
         width = self.kv_lora_rank + self.qk_rope_head_dim
         own = slice(plan.first, plan.end)
         cache = kv_cache.view(kv_cache.shape[0], -1, width)
-        # Every new token's KV at the slots this rank owns, as QREP writes it.
-        write_kv(k_nope, k_rope, cache, attn_metadata.slot_mapping, self._k_scale)
+        if plan.front:
+            # This rank's rows' KV codes go after its shard, to every rank.
+            local = local_kv(kv_cache, plan.kv)
+            tail_cache, tail_slots = local.view(-1, 1, width), plan.new_slots
+        else:
+            # Every new token's KV at the slots this rank owns, as QREP writes it.
+            write_kv(k_nope, k_rope, cache, attn_metadata.slot_mapping, self._k_scale)
+            tail_cache, tail_slots = cache, plan.no_slots
         q_nope, q_rope = self._q_proj_and_k_up_proj(q[own], group=True, k_up_proj=False)
         q_out = torch.empty(
             (plan.rows, self.qrep_num_heads, width),
@@ -1868,14 +1884,18 @@ class MLAAttention(nn.Module):
             q_rope,
             k_nope[own],
             k_rope[own],
-            cache,
+            tail_cache,
             q_out,
-            plan.no_slots,
+            tail_slots,
             self._k_scale,
             self._q_scale,
         )
         mla_absorb_q_pack(q_nope.transpose(0, 1), self.W_K_qrep, q_out, self._q_scale)
-        kv = gather_kv(self.dcp_group, kv_cache, plan.kv)
+        if plan.front:
+            kv = gather_local_kv(self.dcp_group, local)
+            write_new_kv(kv, kv_cache, attn_metadata.slot_mapping, plan.kv)
+        else:
+            kv = gather_kv(self.dcp_group, kv_cache, plan.kv)
         kernel_q = self._pad_sparse_prefill_query_heads(q_out)
         o = torch.empty(
             (plan.rows, kernel_q.shape[1], self.kv_lora_rank),

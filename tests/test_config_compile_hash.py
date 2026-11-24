@@ -58,6 +58,24 @@ def test_hash_changes_with_kv_cache_dtype():
     assert _hash(kv_cache_dtype="bf16") != _hash()
 
 
+def test_hash_keys_the_row_parallel_front(monkeypatch):
+    # The front moves the q/kv projections into an opaque op; a front run that
+    # loaded a FRONT=0 artifact failed copy_misaligned_inputs. Row-parallel
+    # alone stays inside opaque ops and keeps the artifact.
+    monkeypatch.delenv("ATOM_DSA_ROW_PARALLEL_PREFILL", raising=False)
+    monkeypatch.delenv("ATOM_DSA_ROW_PARALLEL_PREFILL_FRONT", raising=False)
+    base = _hash()
+
+    def hashed(row_parallel, front):
+        monkeypatch.setenv("ATOM_DSA_ROW_PARALLEL_PREFILL", row_parallel)
+        monkeypatch.setenv("ATOM_DSA_ROW_PARALLEL_PREFILL_FRONT", front)
+        return _hash()
+
+    assert hashed("0", "1") == base
+    assert hashed("1", "0") == base
+    assert hashed("1", "1") != base
+
+
 def test_hash_ignores_settings_that_stay_out_of_the_graph():
     # These size attention-metadata workspaces, KV pages or the KV pool, all
     # outside the traced graph; changing them must keep the cached artifact.

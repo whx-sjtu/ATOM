@@ -32,6 +32,7 @@ from einops import rearrange
 from torch import nn
 
 from atom.config import Config, QuantizationConfig, get_current_atom_config
+from atom.distributed.pcp_utils import pcp_is_enabled
 
 # Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`, the
 # Dynamo-opaque custom op that dispatches the MoE between single- and dual-stream
@@ -81,6 +82,7 @@ from atom.model_ops.utils import atom_parameter
 from atom.models.deepseek_v2 import (
     FusedIndexerProjection,
     Indexer,
+    _fuse_rmsnorm_quant,
     indexer_projection_fusable,
 )
 from atom.models.kimi_k3.mono.plan import kda_metadata as step_kda_metadata
@@ -233,6 +235,14 @@ def _extract_layer_idx(prefix: str) -> int:
         if part.isdigit():
             return int(part)
     return 0
+
+
+def _linear_into(layer, x: torch.Tensor, out: torch.Tensor) -> None:
+    """``out[:] = layer(x)``, in place where ``layer``'s GEMM takes ``out=``."""
+    if layer.supports_out():
+        layer(x, out=out)
+    else:
+        out.copy_(layer(x))
 
 
 # RMSNorm+quant fusion is scheme-agnostic: the aiter fused RMSNorm kernels
@@ -1327,12 +1337,13 @@ class KimiFullAttention(nn.Module):
         )
         if self.indexer is not None:
             self.indexer.quantized_q = self.fuse_qknorm_quant
-        if (
+        dsa_row_parallel = (
             envs.ATOM_DSA_ROW_PARALLEL_PREFILL
             and self.indexer is not None
             and not self.fuse_qknorm_quant
             and isinstance(self.attn.impl, MLAAttention)
-        ):
+        )
+        if dsa_row_parallel:
             # A long sparse prefill may run row-parallel (dsa_row_parallel):
             # q reaches the attention unscaled, so a rank projects its own rows.
             self.attn.impl.dsa_row_parallel = True
@@ -1370,6 +1381,77 @@ class KimiFullAttention(nn.Module):
         self.o_proj_quant_type_value = (
             o_type.value if self.fuse_sigmoid_mul_quant else QuantType.No.value
         )
+        # The front -- fused_qkv_a, the q_a/kv_a norms, the indexer's wq_b --
+        # in `kimi_k3_dsa_front`, which a row-parallel step runs on the rank's
+        # rows (ATOM_DSA_ROW_PARALLEL_PREFILL_FRONT). PCP's indexer op
+        # projects q itself.
+        self.dsa_front_name = None
+        if (
+            dsa_row_parallel
+            and envs.ATOM_DSA_ROW_PARALLEL_PREFILL_FRONT
+            and not self.fuse_input_norm_quant
+            and not pcp_is_enabled()
+        ):
+            self.dsa_front_name = f"{prefix}.dsa_front"
+            cc = get_current_atom_config().compilation_config
+            if self.dsa_front_name in cc.static_forward_context:
+                raise ValueError(f"Duplicate layer: {self.dsa_front_name}")
+            cc.static_forward_context[self.dsa_front_name] = self
+
+    def dsa_front(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """`kimi_k3_dsa_front`: ``fused_qkv_a``'s output, the normed q_a and
+        kv_a, and the indexer's ``wq_b`` of q_a, each over every row. On a
+        front row-parallel step (`DsaRowParallel.front`) they are this rank's
+        rows' -- and the index keys every row's; the other rows are undefined,
+        and nothing reads them."""
+
+        def norms(q_c, kv_c):
+            (q, _), _, kv, _ = _fuse_rmsnorm_quant(
+                q_c,
+                self.q_a_layernorm.weight,
+                self.q_a_layernorm.eps,
+                kv_c,
+                self.kv_a_layernorm.weight,
+                self.kv_a_layernorm.eps,
+                None,
+                dtype_quant=self.qknorm_dtype,
+                shuffle=False,
+                scale_shuffle_padding=False,
+                group_size=128,
+                quant_type=self.qknorm_quant_type_value,
+                output_unquantized_inp1=False,
+                transpose_scale=True,
+            )
+            return q, kv
+
+        q_end = self.q_lora_rank
+        kv_end = q_end + self.kv_lora_rank
+        plan = getattr(get_forward_context().attn_metadata, "dsa_row_parallel", None)
+        if plan is None or not plan.front:
+            projected = self.fused_qkv_a_proj(hidden_states)
+            q, kv = norms(projected[:, :q_end], projected[:, q_end:kv_end])
+            return projected, q, kv, self.indexer.wq_b(q)
+
+        own = slice(plan.first, plan.end)
+        rows = hidden_states.shape[0]
+        projected = hidden_states.new_empty(rows, sum(self.projection_split_sizes))
+        _linear_into(self.fused_qkv_a_proj, hidden_states[own], projected[own])
+        # Every row's index keys: the indexer caches them at this rank's slots.
+        k_start = sum(self.projection_split_sizes[:3])
+        k_width = self.projection_split_sizes[3]
+        index_k = self.fused_qkv_a_proj.make_row_view(k_start, k_width)
+        projected[:, k_start : k_start + k_width].copy_(index_k(hidden_states))
+        q_own, kv_own = norms(projected[own, :q_end], projected[own, q_end:kv_end])
+        q = hidden_states.new_empty(rows, q_own.shape[1])
+        kv = hidden_states.new_empty(rows, kv_own.shape[1])
+        q[own], kv[own] = q_own, kv_own
+        index_q = hidden_states.new_empty(
+            rows, self.indexer.n_head * self.indexer.head_dim
+        )
+        _linear_into(self.indexer.wq_b, q_own, index_q[own])
+        return projected, q, kv, index_q
 
     def _gated_core(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
@@ -1379,7 +1461,6 @@ class KimiFullAttention(nn.Module):
         # deepseek_v2 pattern: one _fuse_rmsnorm_quant kernel does q_a norm +
         # kv_a norm (+ q-activation quant), then q's scale is forwarded into the
         # MLA module (q_proj consumes it).
-        from atom.models.deepseek_v2 import _fuse_rmsnorm_quant
 
         # hidden_states is a (fp8, scale) tuple when input_layernorm fused the
         # quant; both fused_qkv_a_proj and g_proj consume it directly.
@@ -1387,38 +1468,46 @@ class KimiFullAttention(nn.Module):
         if isinstance(hidden_states, tuple):
             hidden_states, hidden_states_scale = hidden_states
 
-        projected = torch.split(
-            self.fused_qkv_a_proj(hidden_states, hidden_states_scale),
-            self.projection_split_sizes,
-            dim=-1,
-        )
-        q_c, kv_c, k_rope = projected[:3]
-        q_shuffle = False
-        q_scale_shuffle_padding = False
-        if self.qknorm_dtype == dtypes.fp4x2:
-            from atom.model_ops.linear import use_triton_gemm
-            from atom.models.deepseek_v2 import _mxfp4_activation_quant_layout
+        index_q = None
+        if self.dsa_front_name is not None:
+            projected, q, kv, index_q = torch.ops.aiter.kimi_k3_dsa_front(
+                hidden_states, self.dsa_front_name
+            )
+            projected = torch.split(projected, self.projection_split_sizes, dim=-1)
+            k_rope, q_scale = projected[2], None
+        else:
+            projected = torch.split(
+                self.fused_qkv_a_proj(hidden_states, hidden_states_scale),
+                self.projection_split_sizes,
+                dim=-1,
+            )
+            q_c, kv_c, k_rope = projected[:3]
+            q_shuffle = False
+            q_scale_shuffle_padding = False
+            if self.qknorm_dtype == dtypes.fp4x2:
+                from atom.model_ops.linear import use_triton_gemm
+                from atom.models.deepseek_v2 import _mxfp4_activation_quant_layout
 
-            if not use_triton_gemm() or uses_mxfp4_n32k4_scale(self.q_b_proj):
-                q_shuffle, q_scale_shuffle_padding = _mxfp4_activation_quant_layout(
-                    q_c.shape[0]
-                )
-        (q, q_scale), _, kv, _ = _fuse_rmsnorm_quant(
-            q_c,
-            self.q_a_layernorm.weight,
-            self.q_a_layernorm.eps,
-            kv_c,
-            self.kv_a_layernorm.weight,
-            self.kv_a_layernorm.eps,
-            None,
-            dtype_quant=self.qknorm_dtype,
-            shuffle=q_shuffle,
-            scale_shuffle_padding=q_scale_shuffle_padding,
-            group_size=128,
-            quant_type=self.qknorm_quant_type_value,
-            output_unquantized_inp1=False,
-            transpose_scale=True,
-        )
+                if not use_triton_gemm() or uses_mxfp4_n32k4_scale(self.q_b_proj):
+                    q_shuffle, q_scale_shuffle_padding = _mxfp4_activation_quant_layout(
+                        q_c.shape[0]
+                    )
+            (q, q_scale), _, kv, _ = _fuse_rmsnorm_quant(
+                q_c,
+                self.q_a_layernorm.weight,
+                self.q_a_layernorm.eps,
+                kv_c,
+                self.kv_a_layernorm.weight,
+                self.kv_a_layernorm.eps,
+                None,
+                dtype_quant=self.qknorm_dtype,
+                shuffle=q_shuffle,
+                scale_shuffle_padding=q_scale_shuffle_padding,
+                group_size=128,
+                quant_type=self.qknorm_quant_type_value,
+                output_unquantized_inp1=False,
+                transpose_scale=True,
+            )
         if self.indexer is not None:
             # Projection weights retain checkpoint precision; the indexer owns
             # the FP8 MQA/cache representation.
@@ -1428,6 +1517,7 @@ class KimiFullAttention(nn.Module):
                 q_scale,
                 positions,
                 projected_k_weights=(projected[3], projected[4]),
+                projected_q=index_q,
             )
         attn_out = self.attn(q, kv, k_rope, positions, q_scale=q_scale)
         gate = self.g_proj(hidden_states, hidden_states_scale)

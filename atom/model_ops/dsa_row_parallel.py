@@ -21,17 +21,28 @@ Row-parallel splits the rows instead, contiguously as the indexer already does
      every row back in one bf16 all-to-all -- the layout QREP's merge leaves
      for the gate and o_proj.
 
-The front of the layer (``fused_qkv_a``, the indexer's ``wq_b``) still runs
-on every row: it is traced into the compiled graph that decode shares.
+With ``ATOM_DSA_ROW_PARALLEL_PREFILL_FRONT`` (on by default) the front of the
+layer runs on this rank's rows too (``torch.ops.aiter.kimi_k3_dsa_front``):
+``fused_qkv_a``, the q/kv norms and the indexer's ``wq_b``. Only the index
+keys -- 128 of ``fused_qkv_a``'s 2304 columns -- are projected for every row:
+the indexer's fused writer caches them at the slots this rank owns, which lie
+in every rank's rows. The new tokens' KV then comes from their own ranks: step
+2 writes this rank's rows' codes after its shard of the gathered KV (``block_
+rows`` = shard rows + ``new_stride``), step 3 gathers both at once, and each
+rank copies its owned slots out of the gathered rows (``write_new_kv``). With
+it off the front runs on every row, as without row-parallel; it is traced
+into the compiled graph that decode shares.
 
 Numerics: a row's softmax runs over its whole top-k in one kernel call, as
 without DCP, instead of eight LSE-merged partials. Every other rounding (fp8
-query and KV codes, bf16 latent, bf16 V projection) is the same as QREP's.
+query and KV codes, bf16 latent, bf16 V projection) is the same as QREP's;
+the front's GEMMs see this rank's rows, or the index-key columns, only, so
+their kernels may sum in another order.
 """
 
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
@@ -107,11 +118,21 @@ def builder_blocker(
 @dataclass(frozen=True)
 class GatheredKV:
     """The gathered KV's layout: rank ``r``'s rows of request ``i`` land at
-    ``r * rows_pad + shard_base[i] + local_index``."""
+    ``r * block_rows + shard_base[i] + local_index``. With new rows
+    (``new_stride > 0``), the step's token ``j`` follows its rank's shard, at
+    ``(j // new_stride) * block_rows + rows_pad + j % new_stride``, and the
+    shard holds each request's positions before ``new_meta[0]``."""
 
     slot_ids: torch.Tensor  # int32 [rows_pad], this rank's rows, padded per request
     shard_base: torch.Tensor  # int32 [num_requests + 1], exclusive cumsum
     rows_pad: int
+    new_stride: int = 0
+    # int32 [3, num_requests]: cached lens, first token, new tokens.
+    new_meta: torch.Tensor | None = None
+
+    @property
+    def block_rows(self) -> int:
+        return self.rows_pad + self.new_stride
 
 
 def padded_local_lens(context_lens, world: int, block_size: int) -> np.ndarray:
@@ -159,6 +180,26 @@ def gathered_kv_plan(
     )
 
 
+def with_new_rows(
+    kv: GatheredKV, cached_lens, seqlens_q, new_stride: int, device
+) -> GatheredKV:
+    """``kv`` -- planned over ``cached_lens`` -- with the step's new tokens
+    after each rank's shard, ``new_stride`` rows a rank (``RowSplit.of``)."""
+    cached_lens = np.asarray(cached_lens, dtype=np.int64)
+    seqlens_q = np.asarray(seqlens_q, dtype=np.int64)
+    if new_stride < 1 or cached_lens.shape != seqlens_q.shape:
+        raise ValueError(
+            f"new rows: stride {new_stride}, {cached_lens.shape} cached lens, "
+            f"{seqlens_q.shape} new lens"
+        )
+    first = np.zeros_like(seqlens_q)
+    np.cumsum(seqlens_q[:-1], out=first[1:])
+    meta = np.stack([cached_lens, first, seqlens_q]).astype(np.int32)
+    return replace(
+        kv, new_stride=new_stride, new_meta=upload_numpy(meta.reshape(-1), device)
+    )
+
+
 def gather_kv(cp_group, kv_cache: torch.Tensor, plan: GatheredKV) -> torch.Tensor:
     """All-gather the step's KV rows: ``[world * rows_pad, 1, d]`` in the
     cache dtype, rank-major. fp8 rows travel as bytes; the gather is a copy."""
@@ -168,26 +209,112 @@ def gather_kv(cp_group, kv_cache: torch.Tensor, plan: GatheredKV) -> torch.Tenso
     return dcp_all_gather(cp_group, local, 0).unsqueeze(1)
 
 
-@triton.jit(do_not_specialize=["rows_pad", "out_numel"])
+def local_kv(kv_cache: torch.Tensor, plan: GatheredKV) -> torch.Tensor:
+    """This rank's block of a gathered KV with new rows, ``[block_rows, d]``:
+    its shard read from ``kv_cache``, then ``new_stride`` rows for the caller
+    to write its rows' new KV into."""
+    d = kv_cache.shape[-1]
+    local = torch.empty(
+        (plan.block_rows, d), dtype=kv_cache.dtype, device=kv_cache.device
+    )
+    torch.index_select(
+        kv_cache.view(-1, d).view(torch.uint8),
+        0,
+        plan.slot_ids,
+        out=local[: plan.rows_pad].view(torch.uint8),
+    )
+    return local
+
+
+def gather_local_kv(cp_group, local: torch.Tensor) -> torch.Tensor:
+    """All-gather every rank's ``local_kv`` block: ``[world * block_rows, 1, d]``."""
+    from atom.model_ops.dcp_ops import dcp_all_gather
+
+    return dcp_all_gather(cp_group, local, 0).unsqueeze(1)
+
+
+@triton.jit(do_not_specialize=["num_tokens", "block_rows", "rows_pad", "new_stride"])
+def _write_new_kv_kernel(
+    kv,  # int32 words [world * block_rows, WORDS]
+    kv_cache,  # int32 words [slots, WORDS]
+    slot_mapping,  # int64 [num_tokens]
+    num_tokens,
+    block_rows,
+    rows_pad,
+    new_stride,
+    kv_stride: tl.int64,
+    cache_stride: tl.int64,
+    WORDS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    token = tl.program_id(0)
+    slot = tl.load(slot_mapping + token)
+    row = (token // new_stride) * block_rows + rows_pad + token % new_stride
+    cols = tl.arange(0, BLOCK)
+    mask = (cols < WORDS) & (slot >= 0)
+    words = tl.load(kv + row * kv_stride + cols, mask=mask)
+    tl.store(kv_cache + slot * cache_stride + cols, words, mask=mask)
+
+
+def write_new_kv(
+    kv: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    plan: GatheredKV,
+) -> None:
+    """``kv_cache[slot_mapping[j]] = `` token ``j``'s row of the gathered
+    ``kv`` for every slot >= 0: this rank's owned slots of the step's new
+    tokens, the codes their own ranks wrote. Bytes are copied."""
+    d = kv_cache.shape[-1]
+    assert kv.shape[-1] == d and d % 4 == 0 and plan.new_stride > 0
+    assert slot_mapping.dtype == torch.int64
+    num_tokens = slot_mapping.shape[0]
+    if num_tokens == 0:
+        return
+    src = kv.reshape(-1, d).view(torch.int32)
+    dst = kv_cache.view(-1, d).view(torch.int32)
+    words = d // 4
+    _write_new_kv_kernel[(num_tokens,)](
+        src,
+        dst,
+        slot_mapping,
+        num_tokens,
+        plan.block_rows,
+        plan.rows_pad,
+        plan.new_stride,
+        src.stride(0),
+        dst.stride(0),
+        WORDS=words,
+        BLOCK=triton.next_power_of_2(words),
+    )
+
+
+@triton.jit(do_not_specialize=["block_rows", "rows_pad", "new_stride", "out_numel"])
 def _gathered_kv_index_kernel(
     dsa_kv_indptr,  # int32 [num_tokens + 1], absolute offsets into the output
     batch_id_per_q_token,  # int32 [num_tokens]
     topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS], positions in the request
     shard_base,  # int32 [num_requests + 1]
+    new_meta,  # int32 [3, num_requests] (NEW_ROWS)
     out_kv_indices,  # int32
+    block_rows,
     rows_pad,
+    new_stride,
+    num_requests,
     out_numel,
     DCP_WORLD: tl.constexpr,
     INTERLEAVE: tl.constexpr,
     NUM_TOPK_TOKENS: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    NEW_ROWS: tl.constexpr,
     ti_stride0: tl.int64,
     ti_stride1: tl.constexpr,
 ):
     """Each candidate's row in the gathered KV, written where the dcp=1
     prefill writes its cache slot: the same positions and the same zero for an
-    invalid one (negative, or past the request's padded rows), so the
-    attention reads the same rows in the same order."""
+    invalid one (negative, or past the request's padded rows -- with new
+    rows, past its new tokens), so the attention reads the same rows in the
+    same order."""
     token_id = tl.program_id(0)
     col_id = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
     req_id = tl.load(batch_id_per_q_token + token_id)
@@ -199,10 +326,20 @@ def _gathered_kv_index_kernel(
     end = tl.load(shard_base + req_id + 1, mask=valid_req, other=0)
     owner = (indice // INTERLEAVE) % DCP_WORLD
     local = (indice // (INTERLEAVE * DCP_WORLD)) * INTERLEAVE + indice % INTERLEAVE
-    row = owner * rows_pad + base + local
+    row = owner * block_rows + base + local
+    in_range = base + local < end
+    if NEW_ROWS:
+        cached = tl.load(new_meta + req_id, mask=valid_req, other=0)
+        first = tl.load(new_meta + num_requests + req_id, mask=valid_req, other=0)
+        count = tl.load(new_meta + 2 * num_requests + req_id, mask=valid_req, other=0)
+        new = indice >= cached
+        token = first + indice - cached
+        new_row = (token // new_stride) * block_rows + rows_pad + token % new_stride
+        row = tl.where(new, new_row, row)
+        in_range = tl.where(new, indice - cached < count, in_range)
     out_offset = kv_start + col_id
     store_mask = (col_id < kv_len) & (out_offset < out_numel)
-    valid = valid_req & store_mask & (indice >= 0) & (base + local < end)
+    valid = valid_req & store_mask & (indice >= 0) & in_range
     tl.store(out_kv_indices + out_offset, tl.where(valid, row, 0), mask=store_mask)
 
 
@@ -231,33 +368,48 @@ def gathered_kv_index(
     if num_tokens == 0:
         return out
     ti_stride0, ti_stride1 = topk_indices.stride()
+    new_rows = plan.new_meta is not None
     _gathered_kv_index_kernel[(num_tokens, num_topk_tokens // block_n)](
         dsa_kv_indptr,
         batch_id_per_q_token,
         topk_indices,
         plan.shard_base,
+        plan.new_meta if new_rows else plan.shard_base,
         out,
+        plan.block_rows,
         plan.rows_pad,
+        plan.new_stride,
+        plan.shard_base.numel() - 1,
         out.numel(),
         world,
         interleave,
         num_topk_tokens,
         block_n,
+        new_rows,
         ti_stride0,
         ti_stride1,
     )
     return out
 
 
-def warm_gathered_kv_index(world: int, interleave: int, num_topk_tokens: int, device):
+def warm_gathered_kv_index(
+    world: int, interleave: int, num_topk_tokens: int, device, new_rows: bool = False
+):
     """Compile the index kernel with one candidate-free token: dummy runs
-    build no plan, so the first live row-parallel step would JIT it."""
-    zeros = torch.zeros(2, dtype=torch.int32, device=device)
+    build no plan, so the first live row-parallel step would JIT it. With
+    ``new_rows``, that variant and ``write_new_kv`` too."""
+    zeros = torch.zeros(3, dtype=torch.int32, device=device)
+    plan = GatheredKV(slot_ids=zeros[:0], shard_base=zeros[:2], rows_pad=0)
+    if new_rows:
+        plan = replace(plan, new_stride=1, new_meta=zeros)
+        no_slot = torch.full((1,), -1, dtype=torch.int64, device=device)
+        rows = torch.zeros(1, 4, dtype=torch.uint8, device=device)
+        write_new_kv(rows, rows, no_slot, plan)
     gathered_kv_index(
-        zeros,
+        zeros[:2],
         zeros[:1],
         torch.zeros(1, num_topk_tokens, dtype=torch.int32, device=device),
-        GatheredKV(slot_ids=zeros[:0], shard_base=zeros, rows_pad=0),
+        plan,
         world,
         zeros[:0],
         num_topk_tokens,
@@ -274,7 +426,10 @@ class DsaRowParallel:
     rank's rows ``[first, end)`` of ``num_tokens``, ``stride`` rows a rank
     (``RowSplit.of``), the gathered KV, and the attention's arguments over
     this rank's rows. ``kv_indptr`` is the rows' ``sparse_kv_indptr`` rebased
-    to 0; their candidates start at ``kv_base`` of ``sparse_kv_indices``."""
+    to 0; their candidates start at ``kv_base`` of ``sparse_kv_indices``.
+    ``front``: the front runs on these rows (``ATOM_DSA_ROW_PARALLEL_PREFILL_
+    FRONT``); ``kv`` then carries the new rows, which the q tail writes at
+    ``new_slots`` of this rank's ``local_kv`` block."""
 
     num_tokens: int
     first: int
@@ -287,10 +442,15 @@ class DsaRowParallel:
     last_page_lens: torch.Tensor  # int32 [end - first]
     no_slots: torch.Tensor  # int64 [end - first], all -1
     work: Mapping[str, torch.Tensor]
+    new_slots: torch.Tensor | None = None  # int64 [end - first], kv.rows_pad + i
 
     @property
     def rows(self) -> int:
         return self.end - self.first
+
+    @property
+    def front(self) -> bool:
+        return self.new_slots is not None
 
 
 def own_kv_indptr(
@@ -395,5 +555,6 @@ def rows_to_heads(projected: torch.Tensor, num_rows: int, cp_group) -> torch.Ten
 def scratch_bytes(max_kv_rows: int, world: int, entry_bytes: int) -> int:
     """The gathered KV at the cap and this rank's share of it, for the memory
     profile, whose dummy run attends nothing. Every other row-parallel buffer
-    is smaller than the QREP one it replaces, which is not profiled either."""
+    is smaller than the QREP one it replaces, which is not profiled either.
+    New rows count against the cap (``block_rows``)."""
     return (max_kv_rows + -(-max_kv_rows // world)) * entry_bytes

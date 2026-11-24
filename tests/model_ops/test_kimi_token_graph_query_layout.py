@@ -84,7 +84,9 @@ def runtime(monkeypatch):
         graph,
     )
     layout = graph["TokenGraphQueryLayout"]
-    mode = SimpleNamespace(plugin=False, quantized=False, sparse=True, fail=False)
+    mode = SimpleNamespace(
+        plugin=False, quantized=False, sparse=True, fail=False, pcp=False
+    )
     seen = []
 
     class MLA(nn.Module):
@@ -152,11 +154,23 @@ def runtime(monkeypatch):
         prefill_context_parallel_size=1,
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
-    envs = SimpleNamespace(ATOM_DSA_ROW_PARALLEL_PREFILL=False)
+    envs = SimpleNamespace(
+        ATOM_DSA_ROW_PARALLEL_PREFILL=False, ATOM_DSA_ROW_PARALLEL_PREFILL_FRONT=True
+    )
+    normed = []
+
+    def fuse_rmsnorm_quant(q_c, q_w, q_eps, kv_c, kv_w, kv_eps, res, **kw):
+        normed.append(kw)
+        return (q_c * q_w, None), None, kv_c * kv_w, None
+
     namespace = {
         "torch": torch,
         "nn": nn,
         "envs": envs,
+        "pcp_is_enabled": lambda: mode.pcp,
+        "get_current_atom_config": lambda: config,
+        "get_forward_context": context["get_forward_context"],
+        "_fuse_rmsnorm_quant": fuse_rmsnorm_quant,
         "MLAAttention": MLA,
         "MLAModules": SimpleNamespace,
         "Attention": Attention,
@@ -188,9 +202,9 @@ def runtime(monkeypatch):
         namespace[name] = Projection
     _load(
         "atom/models/kimi_k3/model.py",
-        {"_text_config", "KimiFullAttention"},
+        {"_text_config", "KimiFullAttention", "_linear_into"},
         namespace,
-        {"__init__"},
+        {"__init__", "dsa_front", "_gated_core"},
     )
     receiver = {
         "torch": torch,
@@ -276,6 +290,8 @@ def runtime(monkeypatch):
         bind=bind,
         mode=mode,
         envs=envs,
+        namespace=namespace,
+        normed=normed,
         config=config,
         ctx=ctx,
         args=args,
@@ -329,6 +345,221 @@ def test_constructor_opts_bf16_sparse_layers_into_row_parallel_prefill(runtime, 
     assert getattr(owner.attn.impl, "dsa_row_parallel", False) is opted
     if owner.indexer is not None:
         assert getattr(owner.indexer, "row_parallel", False) is opted
+
+
+@pytest.mark.parametrize("case", ["front", "off", "front_off", "pcp", "quantized"])
+def test_constructor_registers_the_front_op_of_row_parallel_layers(runtime, case):
+    runtime.envs.ATOM_DSA_ROW_PARALLEL_PREFILL = case != "off"
+    runtime.envs.ATOM_DSA_ROW_PARALLEL_PREFILL_FRONT = case != "front_off"
+    runtime.mode.pcp = case == "pcp"
+    runtime.mode.quantized = case == "quantized"
+    owner = runtime.make()
+    names = runtime.config.compilation_config.static_forward_context
+    if case == "front":
+        assert owner.dsa_front_name == "layers.0.self_attn.dsa_front"
+        assert names[owner.dsa_front_name] is owner
+    else:
+        assert owner.dsa_front_name is None
+        assert not any(name.endswith(".dsa_front") for name in names)
+
+
+class _Linear(nn.Module):
+    """``x @ weight.T``, each call recorded; ``out=`` where ``takes_out``."""
+
+    def __init__(self, weight, calls, name, takes_out=True):
+        super().__init__()
+        self.weight, self.calls, self.name = weight, calls, name
+        self.takes_out = takes_out
+
+    def supports_out(self):
+        return self.takes_out
+
+    def make_row_view(self, start, length):
+        return _Linear(
+            self.weight[start : start + length],
+            self.calls,
+            f"{self.name}[{start}:{start + length}]",
+            self.takes_out,
+        )
+
+    def forward(self, x, x_scale=None, out=None):
+        assert x_scale is None
+        self.calls.append((self.name, x.shape[0], out is not None))
+        y = x @ self.weight.T
+        return y if out is None else out.copy_(y)
+
+
+def _front(runtime, takes_out=True):
+    """A row-parallel layer with exact integer weights: any row's front is
+    the same whichever rows a GEMM runs over."""
+    runtime.envs.ATOM_DSA_ROW_PARALLEL_PREFILL = True
+    owner = runtime.make()
+    g = torch.Generator().manual_seed(0)
+
+    def ints(*shape):
+        return torch.randint(-3, 4, shape, generator=g).float()
+
+    calls = []
+    owner.fused_qkv_a_proj = _Linear(ints(16, 8), calls, "fused", takes_out)
+    owner.indexer.wq_b = _Linear(ints(8, 4), calls, "wq_b", takes_out)
+    owner.indexer.n_head, owner.indexer.head_dim = 2, 4
+    for norm in (owner.q_a_layernorm, owner.kv_a_layernorm):
+        norm.weight, norm.eps = ints(4), 1e-6
+    return owner, ints(8, 8), calls
+
+
+def test_the_front_op_runs_every_row_off_a_front_step(runtime):
+    owner, hidden, calls = _front(runtime)
+    for plan in (None, SimpleNamespace(front=False, first=2, end=5)):
+        runtime.ctx.attn_metadata.dsa_row_parallel = plan
+        calls.clear()
+        runtime.normed.clear()
+        projected, q, kv, index_q = owner.dsa_front(hidden)
+        full = hidden @ owner.fused_qkv_a_proj.weight.T
+        assert torch.equal(projected, full)
+        assert torch.equal(q, full[:, :4] * owner.q_a_layernorm.weight)
+        assert torch.equal(kv, full[:, 4:8] * owner.kv_a_layernorm.weight)
+        assert torch.equal(index_q, q @ owner.indexer.wq_b.weight.T)
+        assert calls == [("fused", 8, False), ("wq_b", 8, False)]
+        # `_gated_core`'s norm call for a BF16 q.
+        assert runtime.normed == [
+            {
+                "dtype_quant": torch.bfloat16,
+                "shuffle": False,
+                "scale_shuffle_padding": False,
+                "group_size": 128,
+                "quant_type": 0,
+                "output_unquantized_inp1": False,
+                "transpose_scale": True,
+            }
+        ]
+
+
+@pytest.mark.parametrize("takes_out", [True, False])
+def test_a_front_step_runs_the_front_on_its_rows(runtime, takes_out):
+    owner, hidden, calls = _front(runtime, takes_out)
+    runtime.ctx.attn_metadata.dsa_row_parallel = None
+    full = owner.dsa_front(hidden)
+    calls.clear()
+    runtime.ctx.attn_metadata.dsa_row_parallel = SimpleNamespace(
+        front=True, first=2, end=5
+    )
+    got = owner.dsa_front(hidden)
+    own = slice(2, 5)
+    for out, want in zip(got, full):
+        assert out.shape == want.shape and out.is_contiguous()
+        assert torch.equal(out[own], want[own])
+    # Every row's index keys, for the indexer's cache writer.
+    assert torch.equal(got[0][:, 10:14], full[0][:, 10:14])
+    assert calls == [
+        ("fused", 3, takes_out),
+        ("fused[10:14]", 8, False),
+        ("wq_b", 3, takes_out),
+    ]
+
+
+class _Stop(Exception):
+    pass
+
+
+def test_gated_core_takes_the_front_from_its_op(runtime):
+    owner, hidden, _calls = _front(runtime)
+    outs = (
+        torch.arange(8 * 16.0).view(8, 16),
+        torch.ones(8, 4),
+        torch.ones(8, 4) * 2,
+        torch.ones(8, 8) * 3,
+    )
+    fronts, indexed = [], []
+
+    class Torch:
+        ops = SimpleNamespace(
+            aiter=SimpleNamespace(kimi_k3_dsa_front=lambda *a: fronts.append(a) or outs)
+        )
+
+        def __getattr__(self, name):
+            return getattr(torch, name)
+
+    class Indexer(nn.Module):
+        def forward(self, *args, **kwargs):
+            indexed.append((args, kwargs))
+            raise _Stop
+
+    runtime.namespace["torch"] = Torch()
+    owner.indexer = Indexer()
+    positions = torch.arange(8)
+    with pytest.raises(_Stop):
+        owner._gated_core(positions, hidden)
+    ((h, name),) = fronts
+    assert h is hidden and name == owner.dsa_front_name
+    (((h2, q, q_scale, pos), kw),) = indexed
+    assert h2 is hidden and q is outs[1] and q_scale is None and pos is positions
+    k, weights = kw["projected_k_weights"]
+    assert torch.equal(k, outs[0][:, 10:14]) and torch.equal(weights, outs[0][:, 14:])
+    assert kw["projected_q"] is outs[3]
+
+
+@pytest.mark.parametrize("projected", [False, True])
+def test_the_indexer_takes_a_projected_q_in_place_of_wq_b(projected):
+    namespace = {
+        "torch": torch,
+        "nn": nn,
+        "pcp_is_enabled": lambda: False,
+        "_pcp_active": lambda: False,
+        "IndexerDecoratorForPluginMode": lambda cls: cls,
+    }
+    _load(
+        "atom/models/deepseek_v2.py",
+        {"Indexer"},
+        namespace,
+        {"forward", "forward_impl"},
+    )
+    indexer = object.__new__(namespace["Indexer"])
+    nn.Module.__init__(indexer)
+    projections, scored = [], []
+    for name, value in {
+        "rotary_emb": SimpleNamespace(is_neox_style=False),
+        "wq_b": lambda x, s: projections.append((x, s)) or torch.ones(5, 8),
+        "n_head": 2,
+        "head_dim": 4,
+        "external_k_weights": True,
+        "use_nope_cache_fusion": True,
+        "_indexer_opus": False,
+        "use_qk_rope_cache_fusion": True,
+        "sparse_attn_indexer_impl": lambda *a, **k: scored.append(a),
+        "k_cache": SimpleNamespace(prefix="L.k_cache", kv_cache=[torch.zeros(1)]),
+        "quant_block_size": 128,
+        "scale_fmt": None,
+        "topk_tokens": 4,
+        "max_model_len": 8,
+        "max_total_seq_len": 8,
+        "sparse_kv_indices_buffer": None,
+        "dcp_sparse_kv_indptr_buffer": None,
+        "dcp_owned_counts_buffer": None,
+        "k_norm": SimpleNamespace(weight=None, bias=None, eps=1e-6),
+        "rope_dim": 0,
+        "_empty_rope_cache": torch.zeros(0),
+        "_weights_scale": 1.0,
+        "stable_topk": False,
+    }.items():
+        object.__setattr__(indexer, name, value)
+    qr, k, weights = torch.zeros(5, 4), torch.zeros(5, 4), torch.zeros(5, 2)
+    index_q = torch.arange(40.0).view(5, 8) if projected else None
+    indexer.forward(
+        qr,
+        qr,
+        None,
+        torch.arange(5),
+        projected_k_weights=(k, weights),
+        projected_q=index_q,
+    )
+    ((args),) = scored
+    q_input = args[3]
+    assert args[4] is k and args[5] is weights and q_input.shape == (5, 2, 4)
+    if projected:
+        assert projections == [] and q_input.data_ptr() == index_q.data_ptr()
+    else:
+        assert len(projections) == 1 and projections[0][0] is qr
 
 
 @pytest.mark.parametrize(

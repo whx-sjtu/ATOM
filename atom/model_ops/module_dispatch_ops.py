@@ -22,6 +22,7 @@ Currently registered:
   - torch.ops.aiter.maybe_dual_stream_forward  — V2/V3.2/V4 MoE (summed)
   - torch.ops.aiter.maybe_dual_stream_split_forward — K3 MoE (routed/shared or sum/zeros)
   - torch.ops.aiter.kimi_k3_post_attention_forward — K3 layer after its attention
+  - torch.ops.aiter.kimi_k3_dsa_front          — K3 sparse-MLA front (row-parallel)
   - torch.ops.aiter.indexer_score_topk         — V4 sparse indexer
 """
 
@@ -201,6 +202,47 @@ direct_register_custom_op(
     op_func=kimi_k3_post_attention_forward,
     mutates_args=(),
     fake_impl=_kimi_k3_post_attention_forward_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+# K3 sparse-MLA front: fused_qkv_a, the q_a/kv_a norms and the indexer's wq_b.
+# The registered KimiFullAttention exposes `dsa_front(hidden_states)` ->
+# (projected, q, kv, index_q), each [T, ...]; a row-parallel step computes
+# only the rank's rows, which only the op can see.
+
+
+def kimi_k3_dsa_front(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    self = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    return self.dsa_front(hidden_states)
+
+
+def _kimi_k3_dsa_front_fake(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    self = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    rows = hidden_states.shape[0]
+    return (
+        hidden_states.new_empty(rows, sum(self.projection_split_sizes)),
+        hidden_states.new_empty(rows, self.q_lora_rank),
+        hidden_states.new_empty(rows, self.kv_lora_rank),
+        hidden_states.new_empty(rows, self.indexer.n_head * self.indexer.head_dim),
+    )
+
+
+direct_register_custom_op(
+    op_name="kimi_k3_dsa_front",
+    op_func=kimi_k3_dsa_front,
+    mutates_args=(),
+    fake_impl=_kimi_k3_dsa_front_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 

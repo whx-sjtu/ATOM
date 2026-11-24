@@ -3804,6 +3804,16 @@ class Config:
         # shared_experts() and how many experts it routes over (129 / top-5 vs
         # 128 / top-4), so it changes the compiled graph the same way.
         factors.append(bool(envs.ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4))
+        # The row-parallel prefill front moves Kimi-K3's fused_qkv_a, q/kv norms
+        # and the indexer's wq_b into the opaque `kimi_k3_dsa_front` op: another
+        # graph, and the pcp hazard above (a front run loading a FRONT=0
+        # artifact trips copy_misaligned_inputs). Keyed only when it may run, so
+        # every other configuration keeps its artifacts.
+        if (
+            envs.ATOM_DSA_ROW_PARALLEL_PREFILL
+            and envs.ATOM_DSA_ROW_PARALLEL_PREFILL_FRONT
+        ):
+            factors.append("dsa_row_parallel_front")
         # The sparse-attention indexer bakes max_model_len and max_num_seqs into
         # the graph as constants, so a cache built for a smaller max_model_len
         # faults on the first decode past the old width.

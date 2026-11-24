@@ -4,7 +4,8 @@
 
 The plan: every candidate a rank's rows select reads, from the gathered KV,
 the row of the position the top-k named -- simulated here over every rank's
-cache, filled where the DCP writer puts each token. The wiring: with the
+cache, filled where the DCP writer puts each token, and with the front on its
+rows (``_FRONT``) over the new tokens each rank wrote after it. The wiring: with the
 switch off, or on a step it does not take, the builder, the indexer and
 sparse MLA run exactly the calls they ran before it existed; on a step it
 takes, each runs the row-parallel calls over this rank's rows. The GPU
@@ -495,16 +496,21 @@ def _resolvable(monkeypatch, **kw):
     monkeypatch.setattr("atom.plugin.is_plugin_mode", lambda: False)
     monkeypatch.setattr("atom.distributed.pcp_utils.pcp_is_enabled", lambda: False)
     warmed, warned = [], []
-    monkeypatch.setattr(rp, "warm_gathered_kv_index", lambda *a: warmed.append(a))
+    monkeypatch.setattr(
+        rp, "warm_gathered_kv_index", lambda *a, **k: warmed.append((a, k))
+    )
     monkeypatch.setattr(aiter_mla.logger, "warning", lambda *a: warned.append(a))
     return b, config, warmed, warned
 
 
-def test_the_switch_on_warms_the_index_kernel(monkeypatch):
+@pytest.mark.parametrize("front", ["0", "1"])
+def test_the_switch_on_warms_the_index_kernel(monkeypatch, front):
     b, config, warmed, warned = _resolvable(monkeypatch)
     monkeypatch.setenv("ATOM_DSA_ROW_PARALLEL_PREFILL_MIN_TOKENS", "4096")
+    monkeypatch.setenv("ATOM_DSA_ROW_PARALLEL_PREFILL_FRONT", front)
     assert b._resolve_dsa_row_parallel(config) is True
-    assert warmed == [(8, 1, TOPK, "cpu")] and warned == []
+    assert warmed == [((8, 1, TOPK, "cpu"), {"new_rows": front == "1"})]
+    assert warned == [] and b._dsa_row_parallel_front is (front == "1")
     assert b._dsa_row_parallel_min_tokens == 4096
     assert b._dsa_row_parallel_max_kv_rows == 1 << 18
 
@@ -1047,3 +1053,304 @@ def test_the_kv_write_writes_the_q_tail_kernels_codes():
         mla_q_tail_and_cache(q_pe, kv_c, k_pe, want, q_out, slots, scale, scale)
         rp.write_kv(kv_c, k_pe, got, slots, scale)
         assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+
+
+# ─────────────────── the front on its rows (ATOM_DSA_ROW_PARALLEL_PREFILL_FRONT) ──
+
+
+def ref_index_new(indptr, batch_ids, topk, plan, world, out):
+    """The index kernel's mapping with new rows, row by row."""
+    cached, first, count = plan.new_meta.cpu().numpy().reshape(3, -1)
+    shard_base = plan.shard_base.cpu().numpy()
+    stride, block_rows = plan.new_stride, plan.block_rows
+    for t in range(len(batch_ids)):
+        req, start = int(batch_ids[t]), int(indptr[t])
+        for c in range(int(indptr[t + 1]) - start):
+            p = int(topk[t, c])
+            if p >= cached[req]:
+                j = int(first[req]) + p - int(cached[req])
+                ok = p - cached[req] < count[req]
+                row = (j // stride) * block_rows + plan.rows_pad + j % stride
+            else:
+                base, end = int(shard_base[req]), int(shard_base[req + 1])
+                local = p // world
+                ok = p >= 0 and base + local < end
+                row = (p % world) * block_rows + base + local
+            out[start + c] = row if ok else 0
+    return out
+
+
+def _front_plan(cached, new, world, block, device="cpu"):
+    tables, n_blocks = _requests([c + n for c, n in zip(cached, new)], world, block)
+    stride = -(-sum(new) // world)
+    kv = rp.gathered_kv_plan(np.array(cached), tables, world, block, device)
+    return rp.with_new_rows(kv, cached, new, stride, device), tables, n_blocks
+
+
+def _gathered_front(cached, new, tables, world, block, n_blocks, plan):
+    """Each rank's block of `gather_local_kv`, by global ids (request,
+    position): its cache's rows of the cached positions, then the new
+    tokens of its rows. Returns it and the step's new tokens in order."""
+    caches = [np.full((n_blocks * block, 2), -1, dtype=np.int64) for _ in range(world)]
+    for i, n in enumerate(cached):
+        for p in range(n):
+            owner, slot = owner_slot(tables[i], p, world, block)
+            caches[owner][slot] = (i, p)
+    tokens = [(i, cached[i] + t) for i in range(len(new)) for t in range(new[i])]
+    slots, stride = plan.slot_ids.numpy(), plan.new_stride
+    blocks = []
+    for r in range(world):
+        rows = np.full((stride, 2), -1, dtype=np.int64)
+        mine = tokens[r * stride : (r + 1) * stride]
+        if mine:
+            rows[: len(mine)] = mine
+        blocks.append(np.concatenate([caches[r][slots], rows]))
+    return np.concatenate(blocks), tokens
+
+
+def _candidates(cached, new, topk_width=16, seed=1):
+    """Three query rows a request, each a top-k of the positions it sees."""
+    rng = np.random.default_rng(seed)
+    batch_ids, rows = [], []
+    for i, (c, n) in enumerate(zip(cached, new)):
+        for _ in range(3):
+            visible = c + int(rng.integers(1, n + 1))
+            k = min(visible, topk_width)
+            row = np.full(topk_width, -1, dtype=np.int32)
+            row[:k] = rng.choice(visible, size=k, replace=False)
+            batch_ids.append(i)
+            rows.append(row)
+    topk = np.stack(rows)
+    counts = (topk >= 0).sum(1)
+    return batch_ids, topk, np.concatenate([[0], np.cumsum(counts)]), counts
+
+
+def test_the_front_sub_switch_is_on_by_default(monkeypatch):
+    from atom.utils import envs
+
+    monkeypatch.delenv("ATOM_DSA_ROW_PARALLEL_PREFILL_FRONT", raising=False)
+    assert envs.ATOM_DSA_ROW_PARALLEL_PREFILL_FRONT is True
+    assert aiter_mla.AiterMLAMetadataBuilder._dsa_row_parallel_front is False
+
+
+@pytest.mark.parametrize("world,block", [(8, 64), (4, 4), (2, 1)])
+@pytest.mark.parametrize(
+    "cached,new", [([0], [300]), ([129, 0, 70], [5, 300, 1]), ([64 * 8 * 3], [1000])]
+)
+def test_with_new_rows_every_candidate_reads_its_position(world, block, cached, new):
+    plan, tables, n_blocks = _front_plan(cached, new, world, block)
+    stride = plan.new_stride
+    assert plan.block_rows == plan.rows_pad + stride
+    assert plan.rows_pad * world == rp.gathered_kv_rows(cached, world, block)
+    gathered, tokens = _gathered_front(
+        cached, new, tables, world, block, n_blocks, plan
+    )
+    # `write_new_kv` reads token j's KV from the row its rank wrote it to.
+    for j, token in enumerate(tokens):
+        row = (j // stride) * plan.block_rows + plan.rows_pad + j % stride
+        assert tuple(gathered[row]) == token
+    batch_ids, topk, indptr, counts = _candidates(cached, new)
+    out = ref_index_new(
+        indptr, batch_ids, topk, plan, world, np.full(indptr[-1], -7, dtype=np.int64)
+    )
+    for t, i in enumerate(batch_ids):
+        for c in range(counts[t]):
+            assert tuple(gathered[out[indptr[t] + c]]) == (i, int(topk[t, c]))
+
+
+def test_new_rows_take_each_requests_cached_first_and_new_tokens():
+    plan, _, _ = _front_plan([129, 0, 70], [5, 300, 1], 8, 64)
+    assert plan.new_meta.view(3, -1).tolist() == [
+        [129, 0, 70],
+        [0, 5, 305],
+        [5, 300, 1],
+    ]
+    assert plan.new_stride == 39 and plan.rows_pad == 128
+
+
+@pytest.mark.parametrize("stride,new", [(0, [5]), (4, [5, 6])])
+def test_new_rows_refuse_a_bad_layout(stride, new):
+    kv = rp.gathered_kv_plan(np.array([0]), [[0]], 8, 64, "cpu")
+    with pytest.raises(ValueError):
+        rp.with_new_rows(kv, [0], new, stride, "cpu")
+
+
+def test_the_local_block_is_the_shard_then_room_for_its_rows():
+    cache = torch.arange(40 * 4, dtype=torch.uint8).view(40, 1, 4)
+    cache = cache.view(torch.float8_e4m3fn)
+    plan = rp.GatheredKV(
+        slot_ids=torch.tensor([7, 3, 30], dtype=torch.int32),
+        shard_base=torch.tensor([0, 3], dtype=torch.int32),
+        rows_pad=3,
+        new_stride=2,
+        new_meta=torch.zeros(3, dtype=torch.int32),
+    )
+    local = rp.local_kv(cache, plan)
+    assert local.shape == (5, 4) and local.dtype == cache.dtype
+    want = cache.view(torch.uint8)[[7, 3, 30], 0]
+    assert torch.equal(local[:3].view(torch.uint8), want)
+
+
+@pytest.mark.parametrize("rank", [0, 7])
+@pytest.mark.parametrize("ctx,tokens", [(0, 16384), (114688, 16384), (300, 8195)])
+def test_a_front_step_carries_its_new_rows_in_the_gather(
+    monkeypatch, rank, ctx, tokens
+):
+    b, _calls, _plans = _builder(monkeypatch, rank=rank)
+    b._dsa_row_parallel_front = True
+    batch = _batch([ctx + tokens], [tokens])
+    md = _metadata(tokens)
+    _finish(b, batch, _staged(batch), md)
+    plan = md.dsa_row_parallel
+    stride = -(-tokens // WORLD)
+    assert plan.front and plan.kv.new_stride == stride == plan.stride
+    assert plan.kv.rows_pad * WORLD == rp.gathered_kv_rows([ctx], WORLD, BLOCK)
+    assert plan.kv.new_meta.tolist() == [ctx, 0, tokens]
+    pad = plan.kv.rows_pad
+    assert plan.new_slots.tolist() == list(range(pad, pad + plan.rows))
+    assert plan.no_slots.tolist() == [-1] * plan.rows
+
+
+@pytest.mark.parametrize("front", [False, True])
+def test_the_cap_counts_the_rows_each_layout_gathers(monkeypatch, front):
+    # 8195 new tokens: 8 x 1025 rows a rank with the front, 8 x 17 x 64 without.
+    b, _calls, _plans = _builder(monkeypatch, cap=8 * 1025)
+    b._dsa_row_parallel_front = front
+    batch = _batch([8195], [8195])
+    md = _metadata(8195)
+    _finish(b, batch, _staged(batch), md)
+    assert (md.dsa_row_parallel is not None) is front
+
+
+def test_a_front_layer_carries_its_rows_kv_in_the_gather(monkeypatch):
+    """On a front step a layer reads only its rows of the KV: their codes go
+    after its shard of the gathered KV, at `new_slots`, with no KV write for
+    every row; each rank copies its owned slots out of the gather."""
+    from dataclasses import replace
+
+    plan = _plan(world=W)
+    n = plan.rows
+    kv_plan = replace(
+        plan.kv, new_stride=plan.stride, new_meta=torch.zeros(3, dtype=torch.int32)
+    )
+    plan = replace(
+        plan, kv=kv_plan, new_slots=torch.arange(8, 8 + n, dtype=torch.int64)
+    )
+    impl, md, kv_cache = _mla(monkeypatch, plan)
+    calls = []
+    q_nope = torch.zeros(n, H, 6, dtype=torch.bfloat16)
+    q_rope = torch.zeros(n, H, R, dtype=torch.bfloat16)
+    monkeypatch.setattr(
+        attention_mla.MLAAttention,
+        "_q_proj_and_k_up_proj",
+        lambda self, x, **k: calls.append(("q_proj", x)) or (q_nope, q_rope),
+    )
+    local = torch.zeros(kv_plan.block_rows, L + R, dtype=torch.float8_e4m3fn)
+    gathered = torch.zeros(W * kv_plan.block_rows, 1, L + R, dtype=local.dtype)
+    monkeypatch.setattr(rp, "write_kv", lambda *a: pytest.fail("every row's KV"))
+    monkeypatch.setattr(rp, "gather_kv", lambda *a: pytest.fail("the cache gather"))
+    monkeypatch.setattr(rp, "local_kv", lambda *a: calls.append(("local", a)) or local)
+    monkeypatch.setattr(
+        rp, "gather_local_kv", lambda *a: calls.append(("gather", a)) or gathered
+    )
+    monkeypatch.setattr(rp, "write_new_kv", lambda *a: calls.append(("new_kv", a)))
+    monkeypatch.setattr(
+        attention_mla, "mla_q_tail_and_cache", lambda *a: calls.append(("q_tail", a))
+    )
+    monkeypatch.setattr(
+        attention_mla, "mla_absorb_q_pack", lambda *a: calls.append(("absorb", a))
+    )
+    monkeypatch.setattr(
+        attention_mla,
+        "mla_decode_fwd",
+        lambda *a, **k: calls.append(("mla", a, k)) or (None, None),
+    )
+    monkeypatch.setattr(attention_mla, "_aiter_triton_bf16_bmm", lambda *a, **k: None)
+    out = torch.zeros(plan.num_tokens, (H // W) * V)
+    monkeypatch.setattr(rp, "rows_to_heads", lambda *a: calls.append(("a2a", a)) or out)
+    q, k_nope, k_rope = _inputs(plan.num_tokens)
+    assert impl.forward_impl(q, k_nope, k_rope) is out
+
+    names = [c[0] for c in calls]
+    assert names == [
+        "local",
+        "q_proj",
+        "q_tail",
+        "absorb",
+        "gather",
+        "new_kv",
+        "mla",
+        "a2a",
+    ]
+    by = {c[0]: c for c in calls}
+    assert by["local"][1] == (kv_cache, kv_plan)
+    _, (_qr, kvc, kpe, tail_cache, _q_out, slots, _ks, _qs) = by["q_tail"]
+    own = slice(plan.first, plan.end)
+    assert kvc.data_ptr() == k_nope[own].data_ptr() and kvc.shape[0] == n
+    assert kpe.data_ptr() == k_rope[own].data_ptr()
+    assert tail_cache.shape == (kv_plan.block_rows, 1, L + R)
+    assert tail_cache.data_ptr() == local.data_ptr() and slots is plan.new_slots
+    assert by["gather"][1] == ("group", local)
+    kv, cache, slot_mapping, plan_kv = by["new_kv"][1]
+    assert kv is gathered and cache is kv_cache and plan_kv is kv_plan
+    assert slot_mapping is md.slot_mapping
+    assert by["mla"][1][1].shape == (W * kv_plan.block_rows, 1, 1, L + R)
+
+
+@gpu
+@pytest.mark.parametrize("world,block", [(8, 64), (4, 1)])
+def test_the_index_kernel_maps_new_rows_as_the_reference(world, block):
+    cached, new = [300, 0, 4097], [129, 700, 3]
+    plan, _, _ = _front_plan(cached, new, world, block, "cuda")
+    batch_ids, topk, indptr, _counts = _candidates(cached, new, topk_width=256)
+    want = ref_index_new(
+        indptr,
+        batch_ids,
+        topk,
+        plan,
+        world,
+        np.full(int(indptr[-1]) + 5, -7, dtype=np.int64),
+    )
+    rows = len(batch_ids)
+    out = torch.full((int(indptr[-1]) + 5,), -7, dtype=torch.int32, device="cuda")
+    rp.gathered_kv_index(
+        torch.from_numpy(indptr.astype(np.int32)).cuda(),
+        torch.tensor(batch_ids, dtype=torch.int32, device="cuda"),
+        torch.from_numpy(topk).cuda(),
+        plan,
+        world,
+        out,
+        256,
+    )
+    hi = int(indptr[rows])
+    assert out[:hi].cpu().tolist() == want[:hi].tolist()
+    assert (out[hi:] == -7).all()
+
+
+@gpu
+def test_new_kv_lands_at_the_owned_slots_only():
+    from aiter import dtypes
+
+    g = torch.Generator(device="cuda").manual_seed(0)
+    world, rows_pad, stride, tokens = 4, 5, 7, 26
+    plan = rp.GatheredKV(
+        slot_ids=torch.zeros(rows_pad, dtype=torch.int32, device="cuda"),
+        shard_base=torch.tensor([0, rows_pad], dtype=torch.int32, device="cuda"),
+        rows_pad=rows_pad,
+        new_stride=stride,
+        new_meta=torch.zeros(3, dtype=torch.int32, device="cuda"),
+    )
+    codes = torch.randint(
+        0, 256, (world * plan.block_rows, 1, 576), generator=g, device="cuda"
+    )
+    gathered = codes.to(torch.uint8).view(dtypes.fp8)
+    slots = torch.randperm(64, device="cuda", generator=g)[:tokens]
+    slots[::3] = -1
+    cache = torch.zeros(64, 1, 576, dtype=dtypes.fp8, device="cuda")
+    rp.write_new_kv(gathered, cache, slots, plan)
+    want = torch.zeros(64, 576, dtype=torch.uint8)
+    src = gathered.view(torch.uint8).view(-1, 576).cpu()
+    for j, slot in enumerate(slots.tolist()):
+        if slot >= 0:
+            want[slot] = src[(j // stride) * plan.block_rows + rows_pad + j % stride]
+    assert torch.equal(cache.view(torch.uint8).view(64, 576).cpu(), want)

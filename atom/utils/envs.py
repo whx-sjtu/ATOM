@@ -610,6 +610,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSA_ROW_PARALLEL_PREFILL_MAX_KV_ROWS": lambda: int(
         os.getenv("ATOM_DSA_ROW_PARALLEL_PREFILL_MAX_KV_ROWS", str(1 << 18))
     ),
+    # A row-parallel step's front (fused_qkv_a, q/kv norms, the indexer's
+    # wq_b) on the rank's rows only; 0 runs it on every row.
+    "ATOM_DSA_ROW_PARALLEL_PREFILL_FRONT": lambda: (
+        os.getenv("ATOM_DSA_ROW_PARALLEL_PREFILL_FRONT", "1") == "1"
+    ),
     # QREP decode of a NoPE layer: one kernel absorbs W_K into the FP8 q_out,
     # stores the rope half and writes the step's K, in place of the W_K bmm and
     # fused_qk_rope_concat_and_cache_mla. The nope half rounds once instead of
