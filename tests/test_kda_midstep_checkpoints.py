@@ -213,7 +213,14 @@ def test_builder_interval_matches_the_block_manager(interval, expected, k3_modul
     )
 
 
-def test_the_builder_hands_the_forward_its_rows(k3_modules):
+@pytest.fixture
+def heads(monkeypatch):
+    """The head re-run's layout; `test_kda_ckpt_split` covers the blocks the
+    builder adds with ``ATOM_KDA_PREFILL_CKPT_SPLIT``."""
+    monkeypatch.setenv("ATOM_KDA_PREFILL_CKPT_SPLIT", "0")
+
+
+def test_the_builder_hands_the_forward_its_rows(k3_modules, heads):
     """`kda_cu` joins the int32 query starts the KDA call is cut by."""
     K3 = k3_modules.builder
     from test_kda_layout_id import builder
@@ -254,7 +261,7 @@ def test_the_builder_hands_the_forward_its_rows(k3_modules):
 
 @pytest.mark.parametrize("tokens", [8192, 32768])
 def test_checkpoint_metadata_transfers_only_small_descriptors(
-    tokens, monkeypatch, k3_modules
+    tokens, monkeypatch, k3_modules, heads
 ):
     builder = SimpleNamespace(
         device="cpu",
@@ -276,7 +283,7 @@ def test_checkpoint_metadata_transfers_only_small_descriptors(
 
 
 def test_finish_prefill_keeps_kda_targets_out_of_gdn_chunk_snapshots(
-    monkeypatch, k3_modules
+    monkeypatch, k3_modules, heads
 ):
     K3 = k3_modules.builder
     from test_kda_layout_id import builder
@@ -599,7 +606,7 @@ def test_token_graph_prefill_writes_the_checkpoints_an_eager_step_does(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashKDA needs a GPU")
-def test_a_head_ends_on_the_state_a_forward_ending_there_would(k3_modules):
+def test_a_head_ends_on_the_state_a_forward_ending_there_would(k3_modules, heads):
     """Row 1's checkpoint off FlashKDA's 32-token chunk grid, behind a row
     resuming from a state, the way a mixed step lays them out."""
     attn = k3_modules.model.KimiKDAAttention

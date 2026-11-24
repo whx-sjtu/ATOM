@@ -1192,3 +1192,10 @@ def test_zeros_beside_gather_gate(monkeypatch, on, alt, cuda, graph, capturing, 
         layer, SimpleNamespace(is_cuda=cuda)
     )
     assert got is (second if stream else None)
+
+
+def test_pad_switch_is_on_unless_0(monkeypatch):
+    monkeypatch.delenv("ATOM_ROW_SHARD_PAD_IN_PLACE", raising=False)
+    assert kimi.envs.ATOM_ROW_SHARD_PAD_IN_PLACE
+    monkeypatch.setenv("ATOM_ROW_SHARD_PAD_IN_PLACE", "0")
+    assert not kimi.envs.ATOM_ROW_SHARD_PAD_IN_PLACE

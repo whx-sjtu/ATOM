@@ -629,7 +629,7 @@ def early_compute(c, kind, i, q, ops):
     if const_expr(c.get("xflags") is not None):
         if tid < c["xflags"]:
             c["poll"]([(c["xrdy"], tid, 1)])
-        if const_expr(kind == 2 and c.get("early_yield", False)):
+        if const_expr(kind == 2 and c.get("early_yield", False)):  # noqa: SIM102
             if tid < R_TASKS + L_TASKS:
                 c["poll"]([(c["estg"], tid, 1)])
         gpu.barrier()

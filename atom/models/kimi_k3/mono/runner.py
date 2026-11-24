@@ -132,7 +132,7 @@ K2_HANDOFF_ENVS = {
     "ATOM_MONO_K2_LN_SQ": "ln_sq",
 }
 
-# K2's front switches (``k2.FRONT``), off by default: env -> K2Build field
+# K2's front switches (``k2.FRONT``): env -> K2Build field
 K2_FRONT_ENVS = {
     "ATOM_MONO_K2_EARLY_AHEAD": "early_ahead",
     "ATOM_MONO_K2_LATQ_BATCH": "latq_batch",

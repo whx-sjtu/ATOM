@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""K2's opt-in front switches (``layer.FRONT``): the router's and latent's x
-staged further ahead (``early_ahead``), two latent passes a poll
+"""K2's front switches (``layer.FRONT``, on by default): the router's and
+latent's x staged further ahead (``early_ahead``), two latent passes a poll
 (``latq_batch``), the shared gate/up's x staged after theirs (``early_yield``).
 Each keeps every sum and its order; only when loads and polls are issued
 changes."""
@@ -31,11 +31,11 @@ SYMS = {"early_ahead": "ea", "latq_batch": "lb", "early_yield": "ey"}
 
 
 @pytest.mark.parametrize("name", sorted(SWITCHES))
-def test_default_is_off(monkeypatch, name):
+def test_default_is_on(monkeypatch, name):
     monkeypatch.delenv(name, raising=False)
-    assert not getattr(envs, name)
-    monkeypatch.setenv(name, "1")
     assert getattr(envs, name)
+    monkeypatch.setenv(name, "0")
+    assert not getattr(envs, name)
 
 
 def test_the_switches_are_build_fields():
@@ -64,7 +64,9 @@ def test_keys_take_a_switch_where_it_changes_the_code(rows):
     assert key.early_ahead == (k2.EARLY_AHEAD if groups(rows) > 1 else 0)
     assert key.latq_batch == (moe.latq_passes(rows) > 1)
     assert key.early_yield == (10 <= rows <= 16)
-    assert k2.yield_pays(rows) == (groups(rows) == 1 and len(gemv.slabs(moe.HIDDEN, rows)) > 1)
+    assert k2.yield_pays(rows) == (
+        groups(rows) == 1 and len(gemv.slabs(moe.HIDDEN, rows)) > 1
+    )
     off = _runner({name: False for name in k2.FRONT})._k2_keys(rows, 5)[7]
     assert off == k2.K2Build(tokens=rows, nblocks=3, qlen=5)
     assert k2.symbol(off) == k2.symbol(k2.K2Build(tokens=rows, nblocks=3, qlen=5))
@@ -107,7 +109,9 @@ def test_batched_latent_gather_covers_every_block_once(s):
         n = min(moe.LATQ_BATCH, npass - j * moe.LATQ_BATCH)
         for p in range(n):
             i = j * moe.LATQ_BATCH + p
-            seen += [tid + THREADS * i for tid in range(THREADS) if tid + THREADS * i < nblk]
+            seen += [
+                tid + THREADS * i for tid in range(THREADS) if tid + THREADS * i < nblk
+            ]
     assert seen == list(range(nblk))
 
 
@@ -124,7 +128,11 @@ def test_compile_keeps_the_front_and_resources(rows, tmp_path, monkeypatch):
     monkeypatch.setenv("FLYDSL_RUNTIME_CACHE_DIR", str(tmp_path))
     cuda_was_initialized = torch.cuda.is_initialized()
     base = {"batch_polls": True, "route_parts": True, "ln_sq": True}
-    arms = {"off": {}, **{n: {n: True} for n in k2.FRONT}, "all": dict.fromkeys(k2.FRONT, True)}
+    arms = {
+        "off": {},
+        **{n: {n: True} for n in k2.FRONT},
+        "all": dict.fromkeys(k2.FRONT, True),
+    }
     seen = {}
     for arm, on in arms.items():
         front = {**k2.front_at(rows, on), "early_yield": bool(on.get("early_yield"))}

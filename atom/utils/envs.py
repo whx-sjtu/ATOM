@@ -752,15 +752,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     == "1",
     # Kimi K2: the latent norm's sums of squares from their owner rank.
     "ATOM_MONO_K2_LN_SQ": lambda: os.getenv("ATOM_MONO_K2_LN_SQ", "1") == "1",
-    # Kimi K2 front, the same sums, each off by default (1 turns it on): x staged
+    # Kimi K2 front, the same sums, each on by default (0 turns it off): x staged
     # ``layer.EARLY_AHEAD`` units ahead past one token group.
-    "ATOM_MONO_K2_EARLY_AHEAD": lambda: os.getenv("ATOM_MONO_K2_EARLY_AHEAD", "0")
+    "ATOM_MONO_K2_EARLY_AHEAD": lambda: os.getenv("ATOM_MONO_K2_EARLY_AHEAD", "1")
     == "1",
     # Kimi K2: two of the latent's gather passes a poll.
-    "ATOM_MONO_K2_LATQ_BATCH": lambda: os.getenv("ATOM_MONO_K2_LATQ_BATCH", "0")
-    == "1",
-    # Kimi K2: the shared gate/up stages x after the router's and latent's.
-    "ATOM_MONO_K2_EARLY_YIELD": lambda: os.getenv("ATOM_MONO_K2_EARLY_YIELD", "0")
+    "ATOM_MONO_K2_LATQ_BATCH": lambda: os.getenv("ATOM_MONO_K2_LATQ_BATCH", "1") == "1",
+    # Kimi K2: the shared gate/up stages x after the router's and latent's
+    # (widths ``layer.yield_pays`` gives).
+    "ATOM_MONO_K2_EARLY_YIELD": lambda: os.getenv("ATOM_MONO_K2_EARLY_YIELD", "1")
     == "1",
     # GLM-5.2 mono: run the "full" indexer layers (18 of 78) through the fused
     # MonoKernel (atom/models/glm52/mono/kernels/{kernel,layout,op}.py, built
@@ -1063,31 +1063,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # local shard's rows, then write every staged byte from its gathered row,
     # zero for a page's tail. Replaces the read gather + cat and the
     # index_select, zero fills and index_put after the all-gather.
-    # Bit-identical. Off by default; 1 enables.
-    "ATOM_SPG_INDEXER_STAGE": lambda: (os.getenv("ATOM_SPG_INDEXER_STAGE", "0") == "1"),
+    # Bit-identical. On by default; 0 runs the gather and fills.
+    "ATOM_SPG_INDEXER_STAGE": lambda: (os.getenv("ATOM_SPG_INDEXER_STAGE", "1") == "1"),
     # Kimi-K3 KDA prefill state glue on the gather path: the initial-state
     # gather reads has_initial_state's bytes in place (no int8 cast); with
     # interior checkpoints one kernel gathers each sequence's initial state
     # (rows', then heads') -- K-first in memory when FlashKDA would copy it
     # so -- instead of a gather, an index_select and FlashKDA's transpose;
     # the final states are written back with the builder's int64 slots.
-    # Bit-identical. Off by default; 1 enables.
-    "ATOM_SPG_KDA_STATE": lambda: (os.getenv("ATOM_SPG_KDA_STATE", "0") == "1"),
+    # Bit-identical. On by default; 0 runs the gathers and the cast.
+    "ATOM_SPG_KDA_STATE": lambda: (os.getenv("ATOM_SPG_KDA_STATE", "1") == "1"),
     # SPG: with interior checkpoints the KDA prefill gathers q, k, v, gate and
     # beta (widened to fp32) for its rows and heads in one kernel instead of
-    # five index_selects and a cast. Bit-identical. Off by default; 1 enables.
-    "ATOM_SPG_KDA_PACK": lambda: (os.getenv("ATOM_SPG_KDA_PACK", "0") == "1"),
+    # five index_selects and a cast. Bit-identical. On by default; 0 runs
+    # the index_selects.
+    "ATOM_SPG_KDA_PACK": lambda: (os.getenv("ATOM_SPG_KDA_PACK", "1") == "1"),
     # SPG: the DCP head-major prefill merge builds the [H, B] FP32 LSE it sends
     # (empty rows masked to -inf) in one kernel instead of an eq, a masked_fill
-    # (clone + fill) and a transpose copy. Bit-identical. Off by default; 1
-    # enables.
-    "ATOM_SPG_DCP_LSE": lambda: (os.getenv("ATOM_SPG_DCP_LSE", "0") == "1"),
+    # (clone + fill) and a transpose copy. Bit-identical. On by default; 0
+    # runs the three.
+    "ATOM_SPG_DCP_LSE": lambda: (os.getenv("ATOM_SPG_DCP_LSE", "1") == "1"),
     # SPG: a prefill token-graph recording hands the KDA recurrence and the
     # sparse MLA attention regions an output buffer of its own, which they
     # write and return, so a replay reads their result in place instead of
     # copying it to the next segment (and the MLA pads only its pad rows).
-    # Bit-identical. Off by default; 1 enables.
-    "ATOM_SPG_REGION_OUT": lambda: (os.getenv("ATOM_SPG_REGION_OUT", "0") == "1"),
+    # Bit-identical. On by default; 0 copies.
+    "ATOM_SPG_REGION_OUT": lambda: (os.getenv("ATOM_SPG_REGION_OUT", "1") == "1"),
     # Kimi-K3 KDA prefill reads and writes the recurrent state in the slot pool
     # directly (FlashKDA's paged state_cache) instead of gathering it, copying
     # it K-first and scattering the final state back. Steps with a state fork
@@ -1120,10 +1121,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and runs each block on the paged state (kda_ckpt_split), instead of
     # re-running every checkpoint's head as one more sequence through the
     # gathered state. Only where the blocks give the head re-run's bits (no
-    # FlashKDA call segmented, cuts on its chunk grid). Off by default; 0
+    # FlashKDA call segmented, cuts on its chunk grid). On by default; 0
     # keeps the head re-run.
     "ATOM_KDA_PREFILL_CKPT_SPLIT": lambda: (
-        os.getenv("ATOM_KDA_PREFILL_CKPT_SPLIT", "0") == "1"
+        os.getenv("ATOM_KDA_PREFILL_CKPT_SPLIT", "1") == "1"
     ),
     # With ATOM_KDA_PREFILL_CKPT_SPLIT, cut every step it can, including those
     # whose rows FlashKDA segments: the segments a cut moves change numerics
@@ -1467,9 +1468,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Row sharding pads a reduce-scatter input by zeroing only its pad rows, and
     # Kimi's row tail has its experts write into an already padded buffer.
-    # Same values. Off by default.
+    # Same values. On by default; 0 pads the whole tensor.
     "ATOM_ROW_SHARD_PAD_IN_PLACE": lambda: (
-        os.getenv("ATOM_ROW_SHARD_PAD_IN_PLACE", "0") == "1"
+        os.getenv("ATOM_ROW_SHARD_PAD_IN_PLACE", "1") == "1"
     ),
     # Fuse into a per-rank replica without EPLB. EPLB always fuses it as routed.
     "ATOM_FUSE_SHARED_EXPERT": lambda: (

@@ -14,7 +14,7 @@ BIT_EXACT = (
     "ATOM_SPG_DCP_LSE",
     "ATOM_SPG_REGION_OUT",
 )
-ON_BY_DEFAULT = ()
+ON_BY_DEFAULT = BIT_EXACT
 
 
 @pytest.mark.parametrize("name", BIT_EXACT)
