@@ -60,7 +60,11 @@ def test_absorb_into_q_out_matches_two_kernel_path(tokens, q_scale):
         q_proj=lambda x, x_scale: x,
         W_K_qrep=w_k,
         W_K_qrep_scale=None,
+        # a main-model layer: only the DSpark drafter opts into the bmm tile
+        bf16_absorb_bmm_tile=False,
+        _BF16_ABSORB_BMM_CONFIG=MLAAttention._BF16_ABSORB_BMM_CONFIG,
     )
+    layer._bf16_absorb_bmm_kwargs = MLAAttention._bf16_absorb_bmm_kwargs.__get__(layer)
     ql_nope, q_pe = MLAAttention._q_proj_and_k_up_proj(layer, q, group=True)
     q_nope, _ = MLAAttention._q_proj_and_k_up_proj(
         layer, q, group=True, k_up_proj=False
