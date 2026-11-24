@@ -245,6 +245,10 @@ def _gated_core_layer(monkeypatch, gate_in_merge):
         _fuse_rmsnorm_quant=lambda *a, **k: ((q, None), None, kv, None)
     )
     monkeypatch.setitem(sys.modules, "atom.models.deepseek_v2", norm)
+    # INT4: kimi_k3/model.py imports it at module level (PF3-RPA's front)
+    monkeypatch.setattr(
+        kimi, "_fuse_rmsnorm_quant", norm._fuse_rmsnorm_quant, raising=False
+    )
     monkeypatch.setattr(
         kimi,
         "fused_sigmoid_mul_maybe_quant",
