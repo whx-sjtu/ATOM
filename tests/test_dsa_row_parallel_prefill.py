@@ -423,6 +423,22 @@ def test_a_step_a_token_graph_bucket_holds_keeps_the_default_path(
         assert _names(calls) == _DEFAULT and plans == []
 
 
+def test_the_first_row_parallel_step_is_logged_once(monkeypatch):
+    monkeypatch.setitem(aiter_mla.TokenGraph._sizes, "prefill", ())
+    logged = []
+    monkeypatch.setattr(
+        aiter_mla.logger, "info", lambda msg, *args: logged.append(msg % args)
+    )
+    b, _calls, _plans = _builder(monkeypatch)
+    for tokens in (8191, 16384, 16384):
+        batch = _batch([tokens], [tokens])
+        md = _metadata(tokens)
+        _finish(b, batch, _staged(batch), md)
+        assert (md.dsa_row_parallel is not None) is (tokens >= 8192)
+    steps = [m for m in logged if "first row-parallel step" in m]
+    assert len(steps) == 1 and "16384 new tokens" in steps[0]
+
+
 def test_layers_not_ready_keep_the_default_path(monkeypatch):
     b, calls, _plans = _builder(monkeypatch)
     b._dsa_row_parallel_layers = False

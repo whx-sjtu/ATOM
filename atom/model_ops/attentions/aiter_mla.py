@@ -473,6 +473,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     mtp_keeps_selection = False
     _dsa_row_parallel = False
     _dsa_row_parallel_front = False
+    _dsa_row_parallel_logged = False
 
     def _global_num_draft_layers(self) -> int:
         """Return draft layers in the target MLA pool across all PP stages."""
@@ -2750,6 +2751,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         work = self._dsa_row_parallel_work_plan(
             cu_seqlens_q, kv_indptr, own, last_page_lens
         )
+        if not self._dsa_row_parallel_logged:
+            self._dsa_row_parallel_logged = True
+            logger.info(
+                "Row-parallel DSA prefill: first row-parallel step, %d new tokens, "
+                "rows [%d, %d) on this rank, %d gathered KV rows",
+                tokens,
+                split.first,
+                split.end,
+                rows,
+            )
         return dsa_row_parallel.DsaRowParallel(
             num_tokens=tokens,
             first=split.first,
