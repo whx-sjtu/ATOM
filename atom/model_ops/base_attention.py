@@ -1003,7 +1003,8 @@ def fake_(
     return output
 
 
-def _mla_token_graph_forward(impl, q, q_scale, k, v, positions):
+def _mla_token_graph_forward(impl, q, q_scale, k, v, positions, out=None):
+    """With ``out`` (`_attention_region`'s buffer) the result is ``out``."""
     layout = getattr(impl, "token_graph_query_layout", None)
     fwd_ctx = get_forward_context()
     context = fwd_ctx.context
@@ -1044,12 +1045,24 @@ def _mla_token_graph_forward(impl, q, q_scale, k, v, positions):
             )
         finally:
             metadata.slot_mapping = slots
+        if _fits(out, (q.shape[0], *result.shape[1:]), result.dtype):
+            out[:rows].copy_(result)
+            out[rows:].zero_()
+            return out
         padded = result.new_zeros((q.shape[0], *result.shape[1:]))
         padded[:rows].copy_(result)
         return padded
-    return impl.forward(
+    result = impl.forward(
         query=q, k_nope=k, k_rope=v, positions=positions, q_scale=q_scale
     )
+    if not _fits(out, result.shape, result.dtype):
+        return result
+    return out.copy_(result)
+
+
+def _fits(out, shape, dtype) -> bool:
+    """Whether `_attention_region`'s ``out`` can hold a result so shaped."""
+    return out is not None and tuple(out.shape) == tuple(shape) and out.dtype == dtype
 
 
 # Dynamo will not try to inspect any of the internal operations for prefill or decode
@@ -1078,6 +1091,19 @@ def unified_attention_with_output_base(
         impl = atom_config.compilation_config.static_forward_context[layer_name].impl
         if isinstance(impl, MLAAttention) and impl.records_prefill_split():
             return impl.forward_prefill_split(q, q_scale, k, v, positions, layer_name)
+        if (
+            envs.ATOM_SPG_REGION_OUT
+            and fwd_ctx.tr_graph == "record"
+            and getattr(impl, "token_graph_query_layout", None) is not None
+        ):
+            # The op's output (`fake_`), in the recording's pool: the region
+            # writes it, so a replay reads the result there without a copy.
+            shape = list(q.shape)
+            shape[-1] = _mla_output_width(impl, atom_config.hf_config.hidden_size)
+            out = q.new_empty(shape, dtype=atom_config.torch_dtype)
+            return _attention_region(
+                q, q_scale, k, v, positions, layer_name, use_mla, qkv, out
+            )
     return _attention_region(q, q_scale, k, v, positions, layer_name, use_mla, qkv)
 
 
@@ -1119,7 +1145,7 @@ def _attention(
 
 # Keep the plain eager call free of token-graph layout checks.
 @eager_region()
-def _attention_region(q, q_scale, k, v, positions, layer_name, use_mla, qkv):
+def _attention_region(q, q_scale, k, v, positions, layer_name, use_mla, qkv, out=None):
     if use_mla:
         impl = (
             get_current_atom_config()
@@ -1127,7 +1153,7 @@ def _attention_region(q, q_scale, k, v, positions, layer_name, use_mla, qkv):
             .impl
         )
         if getattr(impl, "token_graph_query_layout", None) is not None:
-            return _mla_token_graph_forward(impl, q, q_scale, k, v, positions)
+            return _mla_token_graph_forward(impl, q, q_scale, k, v, positions, out)
         return impl.forward(
             query=q, k_nope=k, k_rope=v, positions=positions, q_scale=q_scale
         )

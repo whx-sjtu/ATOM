@@ -1430,17 +1430,22 @@ def _kda_recurrence(
     gate: torch.Tensor,
     beta: torch.Tensor,
     layer_name: str,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """A prefill's causal conv and KDA recurrence, ``[T, heads, head_dim]``:
     the TR-graph break of a split KDA layer, whose launches follow each
     request's rows and state slots. It runs every row of the bucket. A pad row
     belongs to no request (past every request's `query_start_loc`): the
     kernels skip it and leave its output unwritten, as a decode leaves a
-    padding request's."""
+    padding request's.
+
+    With ``out`` (``ATOM_SPG_REGION_OUT``: ``[2T, heads, head_dim]``,
+    allocated by the recording) the result is ``out[:T]``, which a replay
+    then reads in place instead of copying it to the next segment."""
     self = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
-    return self._live_prefill_recurrence(mixed_qkv, gate, beta)
+    return self._live_prefill_recurrence(mixed_qkv, gate, beta, out)
 
 
 _FLASH_KDA_FLAGS = (
@@ -1454,15 +1459,12 @@ _FLASH_KDA_FLAGS = (
 _KDA_PACK_MAX_ROWS = 8192
 
 
-def _direct_flash_kda_cps(q, v, cu, safe_gate, lower_bound, A_log, flags):
-    """The segment length `KimiKDAAttention._chunk_kda` hands `flash_kda_fwd`
-    itself (``ATOM_KDA_PREFILL_SEG_BALANCE`` on a multi-sequence call), or
-    None when the call takes `chunk_kimi_delta_attn`."""
-    if not (envs.ATOM_KDA_PREFILL_SEG_BALANCE and cu is not None and cu.shape[0] > 2):
-        return None
+def _flash_kda_takes(q, v, safe_gate, lower_bound, A_log, flags):
+    """Whether the call runs on FlashKDA, the one pipeline that takes
+    ``out=``: `chunk_kimi_delta_attn` dispatches on the same test."""
     from aiter.ops.triton._triton_kernels.kimi_delta_attn import flash_kda
 
-    if not (
+    return bool(
         flash_kda.AITER_FDA_ENABLE
         and flash_kda.flash_kda_supported(
             q=q,
@@ -1473,7 +1475,16 @@ def _direct_flash_kda_cps(q, v, cu, safe_gate, lower_bound, A_log, flags):
             A_log=A_log,
             **flags,
         )
-    ):
+    )
+
+
+def _direct_flash_kda_cps(q, v, cu, safe_gate, lower_bound, A_log, flags):
+    """The segment length `KimiKDAAttention._chunk_kda` hands `flash_kda_fwd`
+    itself (``ATOM_KDA_PREFILL_SEG_BALANCE`` on a multi-sequence call), or
+    None when the call takes `chunk_kimi_delta_attn`."""
+    if not (envs.ATOM_KDA_PREFILL_SEG_BALANCE and cu is not None and cu.shape[0] > 2):
+        return None
+    if not _flash_kda_takes(q, v, safe_gate, lower_bound, A_log, flags):
         return None
     return balanced_chunks_per_seg(cu, q.shape[2], v.shape[-1])
 
@@ -1754,7 +1765,11 @@ class KimiKDAAttention(nn.Module):
         initial_state: torch.Tensor | None,
         cu_seqlens: torch.Tensor | None,
         output_final_state: bool,
+        out: torch.Tensor | None = None,
     ):
+        # `out` only where `flash_kda_fwd` takes it (`_kda_out_rows`): the
+        # wrapper's default pipeline rejects one.
+        extra = {} if out is None else {"out": out}
         return self._chunk_kda(
             q=q,
             k=k,
@@ -1781,6 +1796,7 @@ class KimiKDAAttention(nn.Module):
             # fused decode kernel writes. Without it the state comes back
             # K-first and decode reads it transposed.
             state_v_first=True,
+            **extra,
         )
 
     def _chunk_kda(self, **kwargs):
@@ -1863,9 +1879,10 @@ class KimiKDAAttention(nn.Module):
 
         return bool(flash_kda.AITER_FDA_ENABLE)
 
-    def _run_kda_paged(self, q, k, v, g, beta, kda_metadata, ssm_state):
+    def _run_kda_paged(self, q, k, v, g, beta, kda_metadata, ssm_state, out=None):
         """`_run_kda` with the state read from and written back to
-        ``ssm_state[state_indices]`` by the kernels themselves."""
+        ``ssm_state[state_indices]`` by the kernels themselves, and the output
+        into ``out``'s first rows if given (`_kda_recurrence`)."""
         out, _ = self._chunk_kda(
             q=q,
             k=k,
@@ -1882,21 +1899,27 @@ class KimiKDAAttention(nn.Module):
             lower_bound=self._kda_gate_lower_bound,
             cu_seqlens=kda_metadata.non_spec_query_start_loc,
             state_v_first=True,
-            out=torch.empty_like(v),
+            out=(
+                torch.empty_like(v)
+                if out is None or v.shape[1] > out.shape[0]
+                else out[: v.shape[1]].unsqueeze(0)
+            ),
             state_cache=ssm_state,
             state_indices=kda_metadata.non_spec_state_indices_tensor,
             has_initial_state=kda_metadata.has_initial_state,
         )
         return out
 
-    def _prefill_kda(self, q, k, v, gate, beta, initial, cu, ckpt, num_rows=None):
+    def _prefill_kda(
+        self, q, k, v, gate, beta, initial, cu, ckpt, num_rows=None, out=None
+    ):
         """The prefill recurrence, plus each interior checkpoint's head.
 
         A head rides the same call as one more sequence: the kernel keeps only
         final states, and one `cu_seqlens` a step is what its host-side cache
         holds. Returns the rows' output and final states, then the heads'.
         With ``num_rows``, ``initial`` already holds the rows' then the heads'
-        initial states (`_prefill_initial`).
+        initial states (`_prefill_initial`); ``out``: `_kda_out_rows`.
         """
         expanded = num_rows is not None
         if not expanded:
@@ -1914,12 +1937,34 @@ class KimiKDAAttention(nn.Module):
                 )
             if not expanded:
                 initial = initial.index_select(0, ckpt["kda_rows"])
-        out, state = self._run_kda(q, k, v, gate, beta, initial, cu, True)
-        if out.shape[1] < num_tokens:
+        rows = None if out is None else self._kda_out_rows(out, q, v, cu)
+        extra = {} if rows is None else {"out": rows}
+        o, state = self._run_kda(q, k, v, gate, beta, initial, cu, True, **extra)
+        if o.shape[1] < num_tokens:
             # A token-graph bucket keeps its height; its pad rows are unwritten.
-            pad = out.new_empty((1, num_tokens - out.shape[1], *out.shape[2:]))
-            out = torch.cat((out, pad), dim=1)
-        return out[:, :num_tokens], state[:num_rows], state[num_rows:]
+            if rows is not None:
+                o = out[:num_tokens].unsqueeze(0)
+            else:
+                pad = o.new_empty((1, num_tokens - o.shape[1], *o.shape[2:]))
+                o = torch.cat((o, pad), dim=1)
+        return o[:, :num_tokens], state[:num_rows], state[num_rows:]
+
+    def _kda_out_rows(self, out, q, v, cu):
+        """``out``'s first rows as the ``out=`` of a recurrence over ``q``, or
+        None: ``out`` is `_kda_recurrence`'s buffer, written in place only by
+        a call FlashKDA runs (directly or through `chunk_kimi_delta_attn`)
+        that fits in it."""
+        if out is None or not q.is_cuda or q.shape[1] > out.shape[0]:
+            return None
+        takes = _flash_kda_takes(
+            q,
+            v,
+            self._kda_gate_lower_bound is not None,
+            self._kda_gate_lower_bound,
+            self.A_log,
+            dict.fromkeys(_FLASH_KDA_FLAGS, True),
+        )
+        return out[: q.shape[1]].unsqueeze(0) if takes else None
 
     def _settle_prefill(
         self,
@@ -1934,10 +1979,11 @@ class KimiKDAAttention(nn.Module):
         conv_state,
         ssm_state,
         expanded: bool = False,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The prefill recurrence, each request's final state and the step's
         checkpoints; returns ``[1, T, heads, head_dim]``. ``expanded``: see
-        `_prefill_initial`.
+        `_prefill_initial`; ``out``: `_kda_out_rows`.
 
         Eager and token-graph prefills both come here: the scheduler publishes
         every checkpoint it reserved for the step, whichever path ran it.
@@ -1945,9 +1991,12 @@ class KimiKDAAttention(nn.Module):
         state_indices = kda_metadata.non_spec_state_indices_tensor
         query_start_loc = kda_metadata.non_spec_query_start_loc
         ckpt = getattr(kda_metadata, "ssm_checkpoints", None)
+        extra = {} if out is None else {"out": out}
         if initial is None:
             # `_paged_prefill`: the kernels wrote the final states into the pool.
-            kda_out = self._run_kda_paged(q, k, v, gate, beta, kda_metadata, ssm_state)
+            kda_out = self._run_kda_paged(
+                q, k, v, gate, beta, kda_metadata, ssm_state, **extra
+            )
             head_states = ssm_state
         elif ckpt is not None and "kda_tokens" in ckpt:
             kda_out, last_state, head_states = self._prefill_kda(
@@ -1960,10 +2009,22 @@ class KimiKDAAttention(nn.Module):
                 query_start_loc,
                 ckpt,
                 num_rows=state_indices.shape[0] if expanded else None,
+                **extra,
             )
         else:
+            rows = (
+                None if out is None else self._kda_out_rows(out, q, v, query_start_loc)
+            )
             kda_out, last_state = self._run_kda(
-                q, k, v, gate, beta, initial, query_start_loc, True
+                q,
+                k,
+                v,
+                gate,
+                beta,
+                initial,
+                query_start_loc,
+                True,
+                **({} if rows is None else {"out": rows}),
             )
             head_states = last_state
         if initial is not None:
@@ -2484,11 +2545,12 @@ class KimiKDAAttention(nn.Module):
         return mixed_qkv, out_gate, beta, gate
 
     def _prefill_recurrence(
-        self, mixed_qkv, gate, beta, kda_metadata, conv_state, ssm_state
+        self, mixed_qkv, gate, beta, kda_metadata, conv_state, ssm_state, out=None
     ) -> torch.Tensor:
         """A prefill's causal conv and chunked recurrence, reading and writing
         each request's conv/ssm state slots: ``[T, heads, head_dim]``.
-        ``gate`` is ``[1, T, heads, head_dim]``, ``beta`` ``[1, T, heads]``."""
+        ``gate`` is ``[1, T, heads, head_dim]``, ``beta`` ``[1, T, heads]``.
+        With ``out`` (`_kda_recurrence`) the result is ``out[:T]``."""
         conv_weights = self.conv_weight
         state_indices = kda_metadata.non_spec_state_indices_tensor
         state_indices_in = kda_metadata.non_spec_state_indices_in_tensor
@@ -2530,6 +2592,7 @@ class KimiKDAAttention(nn.Module):
             conv_state,
             ssm_state,
             expanded=expanded,
+            out=out,
         )
         # `_kda_recurrence` returns this tensor itself, and `_project_out`'s
         # o_norm reads it (on a replay, the copy the region's step makes).
@@ -2538,7 +2601,13 @@ class KimiKDAAttention(nn.Module):
             f"{kda_out.dtype} vs {mixed_qkv.dtype}"
         )
         assert kda_out.is_contiguous(), "KDA output must be contiguous for o_norm"
-        return kda_out.squeeze(0)
+        kda_out = kda_out.squeeze(0)
+        if out is None:
+            return kda_out
+        rows = out[: kda_out.shape[0]]
+        if kda_out.data_ptr() != rows.data_ptr():
+            rows.copy_(kda_out)
+        return rows
 
     def _project_out(self, out: torch.Tensor, out_gate: torch.Tensor) -> torch.Tensor:
         """A prefill's gated output norm and ``o_proj`` (its all-reduce
@@ -2565,7 +2634,15 @@ class KimiKDAAttention(nn.Module):
         mixed_qkv, out_gate, beta, gate = self._project_in(
             hidden_states, hidden_states_scale
         )
-        out = _kda_recurrence(mixed_qkv, gate, beta, self.layer_name)
+        recording = getattr(get_forward_context(), "tr_graph", None) == "record"
+        if envs.ATOM_SPG_REGION_OUT and recording:
+            # Room for the rows and, typically, their checkpoint heads.
+            buf = mixed_qkv.new_empty(
+                (2 * mixed_qkv.shape[0], self.num_local_heads, self.head_dim)
+            )
+            out = _kda_recurrence(mixed_qkv, gate, beta, self.layer_name, buf)
+        else:
+            out = _kda_recurrence(mixed_qkv, gate, beta, self.layer_name)
         return self._project_out(out, out_gate)
 
     def _live_prefill_recurrence(
@@ -2573,6 +2650,7 @@ class KimiKDAAttention(nn.Module):
         mixed_qkv: torch.Tensor,
         gate: torch.Tensor,
         beta: torch.Tensor,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """`_prefill_recurrence` for `_kda_recurrence`, on the live step's
         metadata and state: ``[T, heads, head_dim]``. The recording's dummy
@@ -2581,6 +2659,8 @@ class KimiKDAAttention(nn.Module):
         is a bug, not a step to skip."""
         fwd_ctx = get_forward_context()
         if fwd_ctx.context.is_dummy_run:
+            if out is not None:
+                return out[: mixed_qkv.shape[0]].zero_()
             return mixed_qkv.new_zeros(
                 (mixed_qkv.shape[0], self.num_local_heads, self.head_dim)
             )
@@ -2591,7 +2671,7 @@ class KimiKDAAttention(nn.Module):
         conv_state, ssm_state = self._state(fwd_ctx)
         gate, beta = self._recurrence_gate_beta(gate, beta)
         return self._prefill_recurrence(
-            mixed_qkv, gate, beta, kda_metadata, conv_state, ssm_state
+            mixed_qkv, gate, beta, kda_metadata, conv_state, ssm_state, out
         )
 
 

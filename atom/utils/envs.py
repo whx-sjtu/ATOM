@@ -1040,6 +1040,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (clone + fill) and a transpose copy. Bit-identical. Off by default; 1
     # enables.
     "ATOM_SPG_DCP_LSE": lambda: (os.getenv("ATOM_SPG_DCP_LSE", "0") == "1"),
+    # SPG: a prefill token-graph recording hands the KDA recurrence and the
+    # sparse MLA attention regions an output buffer of its own, which they
+    # write and return, so a replay reads their result in place instead of
+    # copying it to the next segment (and the MLA pads only its pad rows).
+    # Bit-identical. Off by default; 1 enables.
+    "ATOM_SPG_REGION_OUT": lambda: (os.getenv("ATOM_SPG_REGION_OUT", "0") == "1"),
     # Kimi-K3 KDA prefill reads and writes the recurrent state in the slot pool
     # directly (FlashKDA's paged state_cache) instead of gathering it, copying
     # it K-first and scattering the final state back. Steps with a state fork
