@@ -133,10 +133,13 @@ def mla_builder_cls():
             get_mla_decode_fwd_max_splits=noop,
             get_mla_decode_shape_support=noop,
         ),
+        # dsa_row_parallel.py uses @triton.jit(...) and tl.int64 annotations
         "triton": _module(
-            "triton", next_power_of_2=lambda value: value, jit=lambda fn: fn
+            "triton",
+            next_power_of_2=lambda value: value,
+            jit=lambda fn=None, **kwargs: fn if fn is not None else (lambda f: f),
         ),
-        "triton.language": _module("triton.language", constexpr=object),
+        "triton.language": _module("triton.language", constexpr=object, int64=object),
         "atom.distributed.dcp_utils": _module(
             "atom.distributed.dcp_utils",
             NONPS_MAX_Q_ROWS=32768,
