@@ -951,6 +951,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSPARK_FUSED_MARKOV_SAMPLE": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_MARKOV_SAMPLE", "1") == "1"
     ),
+    # Kimi-K3's greedy draft block under TP keeps the LM head sharded: each
+    # rank reduces its vocab slice to (max, id) per block position and the
+    # ranks gather those, instead of all-gathering the [B * T, V] logits for a
+    # whole-vocab argmax. The same ids (`dspark_markov_argmax_tp`). Needs the
+    # fused Markov op above. Read at draft construction.
+    "ATOM_DSPARK_SHARDED_MARKOV": lambda: _flag_env("ATOM_DSPARK_SHARDED_MARKOV"),
     # DSA MTP verify: skip the step's dense persistent MLA plan when no layer
     # decodes off it (no dense MLA layer in the target or a non-block drafter).
     # On by default; 0 always builds it.

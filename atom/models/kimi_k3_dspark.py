@@ -61,10 +61,12 @@ from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from aiter import QuantType, dtypes
+from aiter.dist.parallel_state import get_tp_group
 from aiter.rotary_embedding import get_rope
 from aiter.tuned_gemm import tgemm
 from torch import nn
 
+from atom.distributed.ulysses_sp import sp_is_enabled
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.attention_mla import (
     MLAModules,
@@ -72,6 +74,10 @@ from atom.model_ops.attention_mla import (
     qrep_tp_override,
 )
 from atom.model_ops.base_attention import Attention
+from atom.model_ops.dspark_markov_argmax import (
+    dspark_markov_argmax_tp,
+    markov_weights_unsupported,
+)
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -548,6 +554,10 @@ class KimiK3DSpark(DSparkDraftModel):
     # so `DSparkProposer` may arm lossless speculative sampling here.
     supports_lossless_draft = True
 
+    # Set from its switch at construction; a draft built without `__init__`
+    # keeps the whole-logits gather.
+    sharded_markov = False
+
     packed_modules_mapping: ClassVar[dict[str, tuple[str, int]]] = {
         "q_a_proj": ("fused_qkv_a_proj", 0),
         "kv_a_proj_with_mqa": ("fused_qkv_a_proj", 1),
@@ -630,6 +640,7 @@ class KimiK3DSpark(DSparkDraftModel):
         # vLLM 0.28 probes this attribute before enabling adaptive verification.
         # This checkpoint deliberately skips the training-only head.
         self.confidence_head = None
+        self.sharded_markov = envs.ATOM_DSPARK_SHARDED_MARKOV
 
     @property
     def first_attention_layer_num(self) -> int:
@@ -677,3 +688,55 @@ class KimiK3DSpark(DSparkDraftModel):
         # Runs before the layers' hooks (parent first), so only mark the stack
         # stale; the next context write refills it from the final weights.
         self._ctx_kv_src = None
+
+    def head_and_sample(self, out, anchor_ids, num_draft, *, greedy=False):
+        """The base head and greedy block, with the LM head kept sharded where
+        ``_sharded_markov_greedy`` allows: each rank reduces its ``[B, V/tp]``
+        slice of every position to ``(max, id)`` and only those ``[B, 2]``
+        cross ranks -- T small gathers in place of the ``[B * T, V]`` one, and
+        a ``W2`` read of ``V/tp`` rows per position instead of ``V``. The same
+        ids: the logits are the same GEMM's, and both picks take the lowest id
+        among equal maxima (``dspark_markov_argmax_tp``)."""
+        if (greedy or self.draft_sampling is None) and self._sharded_markov_greedy():
+            return self._sample_block_sharded(out, anchor_ids, num_draft), None
+        return super().head_and_sample(out, anchor_ids, num_draft, greedy=greedy)
+
+    def _sharded_markov_greedy(self) -> bool:
+        """Whether the greedy block may run off this rank's vocab shard: the
+        LM head would otherwise take its plain TP path (GEMM + all-gather)."""
+        head, markov = self.lm_head, self.markov_head
+        return (
+            self.sharded_markov
+            and head is not None
+            and head.tp_size > 1
+            and head.bias is None
+            and not sp_is_enabled()
+            and markov.fused_sample
+            and markov_weights_unsupported(
+                markov.markov_w1.weight, markov.markov_w2.weight
+            )
+            is None
+        )
+
+    def _sample_block_sharded(self, out, anchor_ids, num_draft):
+        """``DSparkMarkovHead.sample_block``'s greedy loop and column
+        convention over the sharded logits; returns the drafts ``[B, T]``."""
+        head, markov = self.lm_head, self.markov_head
+        bs = anchor_ids.shape[0]
+        base_logits = tgemm.mm(out, head.weight).view(bs, num_draft, -1)
+        tp_group = get_tp_group()
+        use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
+        out_ids = anchor_ids.new_empty(bs, num_draft + 1)
+        out_ids[:, 0] = anchor_ids
+        for k in range(num_draft):
+            dspark_markov_argmax_tp(
+                base_logits[:, k],
+                out_ids[:, k],
+                markov.markov_w1.weight,
+                markov.markov_w2.weight,
+                out_ids[:, k + 1],
+                head.vocab_start_idx,
+                tp_group,
+                use_custom=use_custom,
+            )
+        return out_ids[:, 1:]
