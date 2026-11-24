@@ -780,6 +780,9 @@ class MLAAttention(nn.Module):
         # Set by a model whose prefill token graph records up to the attention
         # core (`records_prefill_split`).
         self.split_prefill_recording = False
+        # Set by a model that runs this layer's long sparse prefills row-
+        # parallel (`dsa_row_parallel`, ATOM_DSA_ROW_PARALLEL_PREFILL).
+        self.dsa_row_parallel = False
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.scale = float(scale)
@@ -1783,6 +1786,132 @@ class MLAAttention(nn.Module):
             merge_in_fp32=not self.dcp_prefill_merge_bf16_ok,
             owned_counts=attn_metadata.dcp_owned_counts[: q_out.shape[0]],
         )
+
+    def dsa_row_parallel_blocker(self) -> str | None:
+        """Why this layer cannot run a row-parallel DSA prefill step, or None.
+        It runs the QREP sparse prefill's kernels -- the FP8 absorb into
+        q_out, the identity-rotary q-tail write, the BF16 head-major V
+        projection -- over this rank's rows, so it needs each of them. Read
+        after the weights load."""
+        checks = (
+            (self.dsa_row_parallel, "it did not opt in"),
+            (self.dcp_world_size > 1, "DCP is off"),
+            (self.qrep_enabled, "no query replication"),
+            (getattr(self, "_absorb_q_pack_enabled", False), "no FP8 q_out absorb"),
+            (self._q_tail_cache, "no q-tail cache write"),
+            (
+                self.pbm_enabled and getattr(self, "W_V_dcp_scale", 0) is None,
+                "no BF16 group V projection",
+            ),
+            (
+                self.dcp_sparse_prefill_persistent
+                and not self.dcp_sparse_prefill_nonps,
+                "no persistent sparse prefill",
+            ),
+            (
+                not (self.use_seg_mla or self.kv_shuffled or self._fused_q_head_pad),
+                "a padded or shuffled q_out or KV layout",
+            ),
+            (self.kv_cache_dtype.startswith("fp8"), "a non-fp8 KV cache"),
+        )
+        for ok, why in checks:
+            if not ok:
+                return f"layer {self.layer_num}: {why}"
+        return None
+
+    def _hold_dsa_row_parallel_scratch(self, device) -> None:
+        """Dummy prefill: allocate, and free, the gathered KV of a row-parallel
+        step at its cap, so the memory profile that sizes the KV cache counts
+        it; the dummy run skips the attention itself."""
+        from atom.model_ops.dsa_row_parallel import max_kv_rows_env, scratch_bytes
+
+        nbytes = scratch_bytes(
+            max_kv_rows_env(),
+            self.dcp_world_size,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+        )
+        torch.empty(nbytes, dtype=torch.uint8, device=device)
+
+    @mark_trace(prefix="dsa_row_parallel_prefill", torch_compile=False)
+    def _dsa_row_parallel_prefill(
+        self, q, k_nope, k_rope, q_scale, kv_cache, attn_metadata, plan
+    ):
+        """A row-parallel DSA prefill step (atom/model_ops/dsa_row_parallel.py):
+        this rank's rows, all the group's heads, over each row's whole top-k
+        of the gathered KV; then each rank's heads of every row, by one
+        all-to-all. Returns what the QREP sparse prefill does."""
+        from atom.model_ops.dsa_row_parallel import gather_kv, rows_to_heads, write_kv
+
+        if (
+            q_scale is not None
+            or kv_cache.numel() == 0
+            or attn_metadata.dtype_q != kv_cache.dtype
+        ):
+            raise RuntimeError(
+                f"layer {self.layer_num}: a row-parallel prefill takes a BF16 q "
+                f"and an fp8 cache of q_out's dtype, got q_scale "
+                f"{None if q_scale is None else tuple(q_scale.shape)}, cache "
+                f"{kv_cache.dtype} x {kv_cache.numel()}, q_out {attn_metadata.dtype_q}"
+            )
+        width = self.kv_lora_rank + self.qk_rope_head_dim
+        own = slice(plan.first, plan.end)
+        cache = kv_cache.view(kv_cache.shape[0], -1, width)
+        # Every new token's KV at the slots this rank owns, as QREP writes it.
+        write_kv(k_nope, k_rope, cache, attn_metadata.slot_mapping, self._k_scale)
+        q_nope, q_rope = self._q_proj_and_k_up_proj(q[own], group=True, k_up_proj=False)
+        q_out = torch.empty(
+            (plan.rows, self.qrep_num_heads, width),
+            dtype=attn_metadata.dtype_q,
+            device=q.device,
+        )
+        mla_q_tail_and_cache(
+            q_rope,
+            k_nope[own],
+            k_rope[own],
+            cache,
+            q_out,
+            plan.no_slots,
+            self._k_scale,
+            self._q_scale,
+        )
+        mla_absorb_q_pack(q_nope.transpose(0, 1), self.W_K_qrep, q_out, self._q_scale)
+        kv = gather_kv(self.dcp_group, kv_cache, plan.kv)
+        kernel_q = self._pad_sparse_prefill_query_heads(q_out)
+        o = torch.empty(
+            (plan.rows, kernel_q.shape[1], self.kv_lora_rank),
+            dtype=self.dtype,
+            device=q.device,
+        )
+        mla_decode_fwd(
+            kernel_q,
+            kv.view(-1, 1, 1, width),
+            o,
+            plan.cu_seqlens_q,
+            plan.kv_indptr,
+            attn_metadata.sparse_kv_indices[plan.kv_base :],
+            plan.last_page_lens,
+            1,
+            page_size=1,
+            num_kv_splits=mla_dcp_sparse_prefill_kv_splits(False, self.dcp_world_size),
+            sm_scale=self.scale,
+            q_scale=self._q_scale,
+            kv_scale=self._k_scale,
+            return_lse=False,
+            **plan.work,
+        )
+        o = self._restore_sparse_prefill_query_heads(o, self.qrep_num_heads)
+        # Head-major with a tail past this rank's rows: every rank sends
+        # `stride` rows of each destination's heads.
+        projected = torch.empty(
+            (self.qrep_num_heads, plan.stride, self.W_V_dcp.shape[1]),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        _aiter_triton_bf16_bmm(
+            o.transpose(0, 1), self.W_V_dcp, YQ=projected[:, : plan.rows]
+        )
+        out = rows_to_heads(projected, q.shape[0], self.dcp_group)
+        return self.o_proj(out)
 
     @mark_trace(prefix="dcp_decode", torch_compile=False)
     def _dcp_decode(self, q_out, kv_cache, attn_metadata, use_qrep):
@@ -3777,6 +3906,8 @@ class MLAAttention(nn.Module):
         context = forward_context.context
         use_prefill_mla = self.is_sparse_mla and attn_metadata.run_sparse
         if forward_context.context.is_dummy_run:
+            if self.dsa_row_parallel and self.is_sparse_mla and context.is_prefill:
+                self._hold_dsa_row_parallel_scratch(q.device)
             output_shape = list(q.shape)
             atom_config = get_current_atom_config()
             output_shape[-1] = _mla_output_width(
@@ -3787,6 +3918,17 @@ class MLAAttention(nn.Module):
             return output
         kv_cache_data = forward_context.kv_cache_data
         kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
+
+        row_parallel = getattr(attn_metadata, "dsa_row_parallel", None)
+        if row_parallel is not None and context.is_prefill and use_prefill_mla:
+            if not self.dsa_row_parallel:
+                raise RuntimeError(
+                    f"layer {self.layer_num}: a row-parallel prefill step "
+                    "reached a sparse MLA layer that did not opt in"
+                )
+            return self._dsa_row_parallel_prefill(
+                q, k_nope, k_rope, q_scale, kv_cache, attn_metadata, row_parallel
+            )
 
         if context.is_prefill and not use_prefill_mla:
             prefill_q = self._prefill_q(q, q_scale, k_rope, positions)

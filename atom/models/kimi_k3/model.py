@@ -1238,6 +1238,16 @@ class KimiFullAttention(nn.Module):
         )
         if self.indexer is not None:
             self.indexer.quantized_q = self.fuse_qknorm_quant
+        if (
+            envs.ATOM_DSA_ROW_PARALLEL_PREFILL
+            and self.indexer is not None
+            and not self.fuse_qknorm_quant
+            and isinstance(self.attn.impl, MLAAttention)
+        ):
+            # A long sparse prefill may run row-parallel (dsa_row_parallel):
+            # q reaches the attention unscaled, so a rank projects its own rows.
+            self.attn.impl.dsa_row_parallel = True
+            self.indexer.row_parallel = True
         if not is_plugin_mode() and isinstance(self.attn.impl, MLAAttention):
             # Only this owner knows whether q carries column/shuffled scales.
             self.attn.impl.prefill_query_layout = (

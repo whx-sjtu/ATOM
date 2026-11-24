@@ -21,6 +21,7 @@ from atom.utils.tbo.ubatching import sync_dp_metadata
 
 if TYPE_CHECKING:
     from atom.distributed.pcp_utils import PcpBalGroup
+    from atom.model_ops.dsa_row_parallel import DsaRowParallel
     from atom.model_ops.indexer import IndexRows
 
 
@@ -708,6 +709,10 @@ class AttentionMetaData:
     # Recorded when a DCP prefill's indexer writes the three above on a side
     # stream; the layer's sparse MLA waits on it and clears it.
     index_exchange_done: torch.cuda.Event | None = None
+    # A row-parallel DSA prefill step's plan (`DsaRowParallel`,
+    # atom/model_ops/dsa_row_parallel.py), set by the attention builder; the
+    # indexer and sparse MLA take the row-parallel path when it is set.
+    dsa_row_parallel: "DsaRowParallel | None" = None
     # Whether this prefill runs sparse (DSA) MLA, decided once a step by the
     # attention builder: the indexer, MLA and PCP all follow it.
     run_sparse: bool = False

@@ -592,6 +592,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the whole gathered q back to token-major; this removes both. Costs a
     # group-wide q GEMM + W_K bmm per prefill token. Off by default.
     "ATOM_DCP_PREFILL_QREP": lambda: os.getenv("ATOM_DCP_PREFILL_QREP", "0") == "1",
+    # Row-parallel DSA prefill under DCP (atom/model_ops/dsa_row_parallel.py):
+    # a sparse prefill step of at least _MIN_TOKENS new tokens splits its rows
+    # across the DCP group instead of replicating the query side: each rank
+    # projects its rows' queries, all-gathers the step's KV rows (at most
+    # _MAX_KV_ROWS, each request padded to whole local blocks; a larger step
+    # keeps the default path) and attends them over each row's whole top-k,
+    # with no LSE merge. Off by default. Changes numerics: one softmax a row
+    # instead of LSE-merged per-rank partials. The memory profile reserves
+    # the gather at _MAX_KV_ROWS.
+    "ATOM_DSA_ROW_PARALLEL_PREFILL": lambda: (
+        os.getenv("ATOM_DSA_ROW_PARALLEL_PREFILL", "0") == "1"
+    ),
+    "ATOM_DSA_ROW_PARALLEL_PREFILL_MIN_TOKENS": lambda: int(
+        os.getenv("ATOM_DSA_ROW_PARALLEL_PREFILL_MIN_TOKENS", "8192")
+    ),
+    "ATOM_DSA_ROW_PARALLEL_PREFILL_MAX_KV_ROWS": lambda: int(
+        os.getenv("ATOM_DSA_ROW_PARALLEL_PREFILL_MAX_KV_ROWS", str(1 << 18))
+    ),
     # QREP decode of a NoPE layer: one kernel absorbs W_K into the FP8 q_out,
     # stores the rope half and writes the step's K, in place of the W_K bmm and
     # fused_qk_rope_concat_and_cache_mla. The nope half rounds once instead of
