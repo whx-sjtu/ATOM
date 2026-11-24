@@ -26,6 +26,10 @@ WORK = (
 )
 BUILD = {
     "_persistent_work_buffer_sizes",
+    "_sparse_mtp_work_buffer_sizes",
+    "_head_split_work_buffer_sizes",
+    "_widest_work_buffers",
+    "_work_buffers_hold",
     "_active_work_indptr",
     "_sparse_dcp_decode_plan",
     "_sparse_dcp_decode_template",
@@ -56,6 +60,7 @@ def methods(path, names, namespace):
 @pytest.fixture
 def runtime():
     ns = {
+        "math": math,
         "torch": torch,
         "PERSISTENT_WORK_BUFFERS": WORK,
         "_MLA_SPLIT_BUDGET_AUTO": -1,
@@ -456,6 +461,144 @@ def test_head_split_keeps_whole_rows_it_cannot_split(runtime, rows, heads):
     assert runtime["calls"][0][0] == heads
 
 
+def aiter_gfx950_fp8(ns):
+    """aiter's sizing and metadata stores on gfx950 for FP8 q and KV at 16 and
+    96 heads, as runs/DMLA/hsfix/hs_probe.py measured them on MI355X: 256
+    workers, one reduce tile a q_len=1 row (sparse sizing folds the query
+    length into the rows), one work item and one reduce_indptr entry a planned
+    row. The stores fail where the kernel's would land past a buffer."""
+    workers = 256
+    stores = []
+
+    def sizes(rows, max_q, heads, dtype_q, dtype_kv, *, is_sparse, fast_mode):
+        assert heads in (16, 96) and is_sparse and fast_mode is True
+        tiles = rows * max_q
+        return [
+            (2, torch.int64),
+            (workers + 1, torch.int32),
+            ((tiles + workers - 1, 8), torch.int32),
+            (tiles + 1, torch.int32),
+            ((tiles, 2), torch.int32),
+            (min(tiles + workers - 1, 2 * (workers - 1)), torch.int32),
+        ]
+
+    def planner(qptr, kvptr, last, heads, _, causal, wmd, info, wi, ri, rfm, rpm, **kw):
+        rows = qptr.numel() - 1
+        stores.append((heads, rows))
+        for name, tensor, count in (
+            ("work_indptr", wi, workers + 1),
+            ("work_info_set", info, rows * 8),
+            ("reduce_indptr", ri, rows + 1),
+        ):
+            assert tensor.numel() >= count, (
+                f"{heads}-head plan of {rows} rows stores {count} {name} "
+                f"entries into {tensor.numel()}"
+            )
+
+    ns.update(
+        get_mla_metadata_info_v1=sizes,
+        get_mla_metadata_v1=planner,
+        decode_update_mla_metadata_v1=planner,
+        get_mla_decode_fwd_max_splits=lambda *a: workers,
+    )
+    return stores
+
+
+def head_split_builder(ns, mns, k, mtp_sizes=None):
+    """A Kimi-K3.1 DCP8 builder (96 gathered heads, FP8) at ``max_num_seqs``
+    ``mns`` and K=``k``, its work buffers as the builder sizes them."""
+    builder = ns["Builder"].__new__(ns["Builder"])
+    builder.__dict__.update(
+        is_sparse=True,
+        sparse_dcp_metadata_rebuild=True,
+        block_size=1,
+        persistent_num_heads=96,
+        max_bs=mns,
+        padded_num_attention_heads=12,
+        dtype_q=torch.float8_e4m3fn,
+        dtype_kv=torch.float8_e4m3fn,
+        index_topk_out=2048,
+        kv_shuffled=False,
+    )
+    if mtp_sizes is None:
+        mtp_sizes = builder._sparse_mtp_work_buffer_sizes(k + 1)
+    var = {
+        prefix + name: torch.empty(shape, dtype=dt)
+        for prefix, sizes in (
+            ("", builder._persistent_work_buffer_sizes(k + 1)),
+            ("sparse_mtp_", mtp_sizes),
+        )
+        for name, (shape, dt) in zip(WORK, sizes)
+    }
+    tokens = 16384  # --max-num-batched-tokens
+    ptr = torch.arange(mns + 1, dtype=torch.int32)
+    for name, value in {
+        "cu_seqlens_q": ptr,
+        "sparse_cu_seqlens_q": torch.arange(tokens + 1, dtype=torch.int32),
+        "kv_indptr": ptr * 64,
+        "sparse_kv_indptr": torch.arange(tokens + 1, dtype=torch.int32) * 8,
+        "kv_last_page_lens": torch.ones(mns, dtype=torch.int32),
+        "sparse_kv_last_page_lens": torch.ones(tokens, dtype=torch.int32),
+    }.items():
+        var[name] = SimpleNamespace(gpu=value)
+    builder.model_runner = SimpleNamespace(forward_vars=var)
+    return builder
+
+
+@pytest.mark.parametrize("k", [0, 3, 4])
+@pytest.mark.parametrize("mns", [8, 10, 12, 16])
+def test_head_split_templates_stay_inside_their_work_buffers(runtime, mns, k):
+    # 25 Nov C16 daily, mns 10 / K4: the bs-8 capture split 40 rows into 240
+    # and stored 241 reduce_indptr entries into 51, then faulted.
+    runtime["envs"].ATOM_DMLA_MLA_HEAD_SPLIT = True
+    stores = aiter_gfx950_fp8(runtime)
+    builder = head_split_builder(runtime, mns, k)
+    for bs in range(1, mns + 1):
+        if k:
+            rows = bs * (k + 1)
+            plan = builder._set_mla_persistent_worker_buffers_sparse_mtp(rows)
+            assert plan["sparse_mtp_dcp_decode_plan"][4] == (6 if rows <= 42 else 1)
+        plan = builder.set_mla_persistent_worker_buffers(bs, 1)
+        assert plan["sparse_dcp_decode_plan"][4] == (6 if bs <= 42 else 1)
+    assert (16, 6 * mns) in stores
+    if k:
+        assert (16, 6 * (k + 1) * min(mns, 42 // (k + 1))) in stores
+        held = builder.model_runner.forward_vars["sparse_mtp_reduce_indptr"].numel()
+        assert held == min(6 * mns * (k + 1), 256) + 1
+
+
+@pytest.mark.parametrize("mns,k", [(10, 4), (8, 4), (16, 4), (8, 3)])
+def test_head_split_keeps_whole_rows_its_work_buffers_cannot_hold(
+    runtime, caplog, mns, k
+):
+    # INT3b's sparse_mtp_* sizing: whole 96-head rows only.
+    runtime["envs"].ATOM_DMLA_MLA_HEAD_SPLIT = True
+    aiter_gfx950_fp8(runtime)
+    whole = runtime["get_mla_metadata_info_v1"](
+        mns * (k + 1), 1, 96, None, None, is_sparse=True, fast_mode=True
+    )
+    builder = head_split_builder(runtime, mns, k, mtp_sizes=whole)
+    with caplog.at_level(logging.WARNING):
+        for bs in range(1, mns + 1):
+            rows = bs * (k + 1)
+            plan = builder._set_mla_persistent_worker_buffers_sparse_mtp(rows)
+            split = rows <= 42 and 6 * bs <= mns
+            assert plan["sparse_mtp_dcp_decode_plan"][4] == (6 if split else 1)
+    assert "stay whole" in caplog.text
+
+
+def test_head_split_off_keeps_the_whole_row_allocation(runtime):
+    aiter_gfx950_fp8(runtime)
+    builder = head_split_builder(runtime, 10, 4)
+    sizes = runtime["get_mla_metadata_info_v1"]
+    assert list(builder._sparse_mtp_work_buffer_sizes(5)) == [
+        tuple(s) for s in sizes(50, 1, 96, None, None, is_sparse=True, fast_mode=True)
+    ]
+    assert list(builder._persistent_work_buffer_sizes(5)) == [
+        tuple(s) for s in sizes(10, 5, 96, None, None, is_sparse=True, fast_mode=True)
+    ]
+
+
 def test_head_split_plan_falls_back_without_the_layers_row_tensors(runtime):
     runtime["envs"].ATOM_DMLA_MLA_HEAD_SPLIT = True
     _, md, layer = setup(runtime, 16)
@@ -798,13 +941,12 @@ def test_decode_ubatch_publishes_the_plan(runtime):
 def test_native_decode_and_graph_against_direct_attention(
     max_q, rows, dtype, head_split, monkeypatch
 ):
-    from aiter import get_mla_decode_shape_support, get_mla_metadata_info_v1
+    from aiter import get_mla_decode_shape_support
 
     from atom.model_ops import attention_mla
     from atom.model_ops.attentions import aiter_mla
 
     monkeypatch.setenv("ATOM_DMLA_MLA_HEAD_SPLIT", "1" if head_split else "0")
-    sizes = get_mla_metadata_info_v1(rows, 1, 64, dtype, dtype, is_sparse=True)
     ns = {
         "Builder": aiter_mla.AiterMLAMetadataBuilder,
         "Attention": attention_mla.MLAAttention,
@@ -817,7 +959,7 @@ def test_native_decode_and_graph_against_direct_attention(
         return original(*a, **kw)
 
     monkeypatch.setattr(aiter_mla, "get_mla_metadata_v1", build)
-    _, md, layer = setup(ns, rows, max_q, dtype, "cuda", sizes)
+    _, md, layer = setup(ns, rows, max_q, dtype, "cuda")
     plan = getattr(
         md, "sparse_mtp_dcp_decode_plan" if max_q > 1 else "sparse_dcp_decode_plan"
     )
@@ -885,22 +1027,21 @@ def test_native_decode_and_graph_against_direct_attention(
 def test_native_decode_without_reduce_is_bit_identical(
     max_q, rows, heads, head_split, monkeypatch
 ):
-    from aiter import get_mla_metadata_info_v1
-
     from atom.model_ops import attention_mla
     from atom.model_ops.attentions import aiter_mla
 
     dtype = torch.float8_e4m3fn
     monkeypatch.setenv("ATOM_DMLA_MLA_HEAD_SPLIT", "1" if head_split else "0")
-    sizes = get_mla_metadata_info_v1(rows, 1, heads, dtype, dtype, is_sparse=True)
     ns = {
         "Builder": aiter_mla.AiterMLAMetadataBuilder,
         "Attention": attention_mla.MLAAttention,
     }
-    _, md, layer = setup(ns, rows, max_q, dtype, "cuda", sizes, heads=heads)
+    _, md, layer = setup(ns, rows, max_q, dtype, "cuda", heads=heads)
     plan_name = "sparse_mtp_dcp_decode_plan" if max_q > 1 else "sparse_dcp_decode_plan"
     if getattr(md, plan_name) is None:
         pytest.skip("runtime does not qualify this native plan geometry")
+    groups = heads // 16 if head_split and rows * heads // 16 <= 256 else 1
+    assert getattr(md, plan_name)[4] == groups
     reduces = []
     reduce = attention_mla._aiter_mla._mla_decode_reduce_v1_dispatch
 

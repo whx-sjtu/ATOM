@@ -4,6 +4,7 @@
 import functools
 import inspect
 import logging
+import math
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -936,14 +937,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         if self.is_sparse and max_seqlen_qo > 1:
             # Allocate a second set of persistent work buffers for sparse MTP
             # per-token layout: max_bs*max_seqlen_qo virtual seqs, each q_len=1.
-            smt_max_bs = self.max_bs * max_seqlen_qo
-            # Same widening as sparse prefill: the DCP rebuild regenerates these
-            # for the gathered query width, not for a single rank's heads.
-            sparse_mtp_num_heads = (
-                self.persistent_num_heads
-                if self.sparse_dcp_metadata_rebuild
-                else self.padded_num_attention_heads
-            )
             (
                 (smt_wmd_size, smt_wmd_type),
                 (smt_wi_size, smt_wi_type),
@@ -951,16 +944,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 (smt_ri_size, smt_ri_type),
                 (smt_rfm_size, smt_rfm_type),
                 (smt_rpm_size, smt_rpm_type),
-            ) = get_mla_metadata_info_v1(
-                smt_max_bs,
-                1,  # max_seqlen_qo=1 for per-token
-                sparse_mtp_num_heads,
-                self.dtype_q,
-                self.dtype_kv,
-                is_sparse=True,
-                fast_mode=True,
-                **_mla_seg_meta_kwargs(),
-            )
+            ) = self._sparse_mtp_work_buffer_sizes(max_seqlen_qo)
             mla_metadata["sparse_mtp_work_meta_data"] = torch.empty(
                 smt_wmd_size, dtype=smt_wmd_type, device=self.device
             )
@@ -1162,26 +1146,93 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 **_mla_seg_meta_kwargs(),
             )
 
-        allocated = sizes(max_q_len)
-        if not self.sparse_dcp_metadata_rebuild or max_q_len == 1:
-            return allocated
-        # An intermediate capture width can have higher occupancy than either
-        # endpoint. Reserve every buffer for the configured query-width range.
-        for query_length in range(1, max_q_len):
-            allocated = tuple(
-                (
-                    (
-                        tuple(max(a, b) for a, b in zip(shape, other, strict=True))
-                        if isinstance(shape, tuple)
-                        else max(shape, other)
-                    ),
-                    dtype,
-                )
-                for (shape, dtype), (other, _) in zip(
-                    allocated, sizes(query_length), strict=True
+        plans = [sizes(max_q_len)]
+        if self.sparse_dcp_metadata_rebuild:
+            # An intermediate capture width can have higher occupancy than either
+            # endpoint. Reserve every buffer for the configured query-width range.
+            plans += [sizes(query_length) for query_length in range(1, max_q_len)]
+        if self.is_sparse:
+            # A q_len=1 sparse decode's template may plan its rows by 16 heads.
+            plans.append(
+                self._head_split_work_buffer_sizes(
+                    self.max_bs, self.persistent_num_heads
                 )
             )
-        return allocated
+        return self._widest_work_buffers(*plans)
+
+    def _sparse_mtp_work_buffer_sizes(self, max_seqlen_qo: int):
+        """The sparse_mtp_* work buffers: MTP verify plans every token of up to
+        max_bs requests as a virtual q_len=1 sequence, its template possibly
+        by 16 heads."""
+        rows = self.max_bs * max_seqlen_qo
+        # Same widening as sparse prefill: the DCP rebuild regenerates these
+        # for the gathered query width, not for a single rank's heads.
+        heads = (
+            self.persistent_num_heads
+            if self.sparse_dcp_metadata_rebuild
+            else self.padded_num_attention_heads
+        )
+        return self._widest_work_buffers(
+            get_mla_metadata_info_v1(
+                rows,
+                1,  # max_seqlen_qo=1 for per-token
+                heads,
+                self.dtype_q,
+                self.dtype_kv,
+                is_sparse=True,
+                fast_mode=True,
+                **_mla_seg_meta_kwargs(),
+            ),
+            self._head_split_work_buffer_sizes(rows, heads),
+        )
+
+    def _head_split_work_buffer_sizes(self, rows: int, heads: int):
+        """The work buffers `_sparse_dcp_decode_template` fills when it plans
+        ``rows`` rows of ``heads`` heads as 16-head rows (up to its 256 rows);
+        None where it never splits them.
+
+        aiter reserves a 16-head row as many reduce tiles as a whole one, so
+        the split needs about heads // 16 times the whole rows' reduce maps.
+        """
+        groups = heads // 16
+        if not (
+            envs.ATOM_DMLA_MLA_HEAD_SPLIT
+            and groups > 1
+            and heads % 16 == 0
+            and self.sparse_dcp_metadata_rebuild
+            and self.block_size == 1
+        ):
+            return None
+        return get_mla_metadata_info_v1(
+            min(rows * groups, 256),
+            1,
+            16,
+            self.dtype_q,
+            self.dtype_kv,
+            is_sparse=True,
+            fast_mode=True,
+        )
+
+    def _widest_work_buffers(self, *plans):
+        """Each work buffer at its largest shape over the
+        `get_mla_metadata_info_v1` ``plans`` (Nones skipped)."""
+        widest = []
+        for column in zip(*(plan for plan in plans if plan is not None), strict=True):
+            shapes = [shape for shape, _ in column]
+            if isinstance(shapes[0], tuple):
+                shape = tuple(max(dims) for dims in zip(*shapes, strict=True))
+            else:
+                shape = max(shapes)
+            widest.append((shape, column[0][1]))
+        return tuple(widest)
+
+    def _work_buffers_hold(self, work, sizes) -> bool:
+        """Whether every buffer of ``work`` holds its `get_mla_metadata_info_v1`
+        size in ``sizes``."""
+        return all(
+            buffer.numel() >= math.prod(shape if isinstance(shape, tuple) else (shape,))
+            for buffer, (shape, _) in zip(work, sizes, strict=True)
+        )
 
     def _active_work_indptr(self, work_indptr, heads, max_q_len):
         # AITER launches one worker per entry minus one, even without plan reuse.
@@ -1216,14 +1267,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             return None
         return (rows, heads, self.dtype_q, self.dtype_kv, 1)
 
-    def _sparse_dcp_decode_template(self, rows: int, heads: int, work_indptr):
-        """`_sparse_dcp_decode_plan`, over 16-head rows (heads // 16 a query
-        row) when `ATOM_DMLA_MLA_HEAD_SPLIT` is set and they still fit.
+    def _sparse_dcp_decode_template(self, rows: int, heads: int, work):
+        """`_sparse_dcp_decode_plan` into ``work`` (the persistent work buffers,
+        in `PERSISTENT_WORK_BUFFERS` order), over 16-head rows (heads // 16 a
+        query row) when `ATOM_DMLA_MLA_HEAD_SPLIT` is set and they still fit.
 
         A decode row's latency is one workgroup's, whatever the batch, so a
         small batch spreads over heads // 16 times as many CUs. aiter's 16-head
         persistent kernel returns a valid LSE; its 32-head one does not.
         """
+        work_indptr = work[1]
         groups = heads // 16
         if (
             envs.ATOM_DMLA_MLA_HEAD_SPLIT
@@ -1233,6 +1286,19 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             < self.model_runner.forward_vars["sparse_cu_seqlens_q"].gpu.numel()
         ):
             plan = self._sparse_dcp_decode_plan(rows * groups, 16, work_indptr)
+            # The metadata kernel writes the split rows' reduce maps unchecked.
+            if plan is not None and not self._work_buffers_hold(
+                work, self._head_split_work_buffer_sizes(rows, heads)
+            ):
+                if not getattr(type(self), "_head_split_unfit_logged", False):
+                    type(self)._head_split_unfit_logged = True
+                    logger.warning(
+                        "ATOM_DMLA_MLA_HEAD_SPLIT: %d decode rows stay whole: "
+                        "the work buffers hold no %d rows of 16 heads.",
+                        rows,
+                        rows * groups,
+                    )
+                plan = None
             if plan is not None:
                 if not getattr(type(self), "_head_split_logged", False):
                     type(self)._head_split_logged = True
@@ -1265,7 +1331,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             else self.padded_num_attention_heads
         )
         plan = self._sparse_dcp_decode_template(
-            num_tokens, heads, var["sparse_mtp_work_indptr"]
+            num_tokens,
+            heads,
+            tuple(var[f"sparse_mtp_{name}"] for name in PERSISTENT_WORK_BUFFERS),
         )
         rows, heads = (num_tokens, heads) if plan is None else plan[:2]
         split_params = {
@@ -1373,7 +1441,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         use_sparse_meta = self.is_sparse and (max_q_len == 1 or sparse_decode)
         plan = (
             self._sparse_dcp_decode_template(
-                bs, self.persistent_num_heads, var[f"{prefix}work_indptr"]
+                bs,
+                self.persistent_num_heads,
+                tuple(var[f"{prefix}{name}"] for name in PERSISTENT_WORK_BUFFERS),
             )
             if use_sparse_meta and max_q_len == 1 and not only_update
             else None
