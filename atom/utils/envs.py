@@ -1017,6 +1017,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_CONV1D_TILED_PREFILL": lambda: (
         os.getenv("ATOM_CONV1D_TILED_PREFILL", "1") == "1"
     ),
+    # DCP prefill FP4 index staging (MFMA layout) in two kernels: pack the
+    # local shard's rows, then write every staged byte from its gathered row,
+    # zero for a page's tail. Replaces the read gather + cat and the
+    # index_select, zero fills and index_put after the all-gather.
+    # Bit-identical. Off by default; 1 enables.
+    "ATOM_SPG_INDEXER_STAGE": lambda: (os.getenv("ATOM_SPG_INDEXER_STAGE", "0") == "1"),
     # Kimi-K3 KDA prefill reads and writes the recurrent state in the slot pool
     # directly (FlashKDA's paged state_cache) instead of gathering it, copying
     # it K-first and scattering the final state back. Steps with a state fork
