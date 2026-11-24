@@ -831,21 +831,41 @@ class KimiSparseMoeBlock(nn.Module):
         router_logits, routed_input = self._row_sharded_front(
             hidden_states, rows, hidden_rows
         )
-        routed_output = self.experts(routed_input, router_logits)
+        routed_output = rows.padded_rows(routed_input)
+        if routed_output is None:
+            routed_output = self.experts(routed_input, router_logits)
+        else:
+            self.experts(routed_input, router_logits, out=routed_output)
         if rows.group_rs:
             _log_row_tail_group_rs()
             routed_rows, shared_rows = rows.scatter_pair(
-                routed_output, self.shared_experts(hidden_states)
+                routed_output, self._row_sharded_shared(hidden_states, rows)
             )
             output = self._apply_routed_norm_and_up_proj(routed_rows) + shared_rows
         else:
             routed_output = self._apply_routed_norm_and_up_proj(
                 rows.scatter(routed_output)
             )
-            output = routed_output + rows.scatter(self.shared_experts(hidden_states))
+            output = routed_output + rows.scatter(
+                self._row_sharded_shared(hidden_states, rows)
+            )
         if prefix_rows is not None:
             output += prefix_rows
         return rows.gather(output)
+
+    def _row_sharded_shared(self, hidden_states: torch.Tensor, rows) -> torch.Tensor:
+        """The shared experts' partial over every row; into `rows.padded_rows`
+        when that applies and their down projection takes `out=`."""
+        shared = self.shared_experts
+        out = (
+            rows.padded_rows(hidden_states)
+            if envs.ATOM_ROW_SHARD_PAD_IN_PLACE and shared.down_proj.supports_out()
+            else None
+        )
+        if out is None:
+            return shared(hidden_states)
+        shared.act_and_down_proj(shared.gate_up_proj(hidden_states), out=out)
+        return out
 
     def _row_sharded_front(
         self, hidden_states: torch.Tensor, rows, hidden_rows: torch.Tensor | None

@@ -1374,6 +1374,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_K3_ATTN_RES_SKIP_ZERO_ADDENDS": lambda: (
         os.getenv("ATOM_KIMI_K3_ATTN_RES_SKIP_ZERO_ADDENDS", "1") == "1"
     ),
+    # Row sharding pads a reduce-scatter input by zeroing only its pad rows, and
+    # Kimi's row tail has its experts write into an already padded buffer.
+    # Same values. Off by default.
+    "ATOM_ROW_SHARD_PAD_IN_PLACE": lambda: (
+        os.getenv("ATOM_ROW_SHARD_PAD_IN_PLACE", "0") == "1"
+    ),
     # Fuse into a per-rank replica without EPLB. EPLB always fuses it as routed.
     "ATOM_FUSE_SHARED_EXPERT": lambda: (
         os.getenv("ATOM_FUSE_SHARED_EXPERT", "1").lower() == "1"

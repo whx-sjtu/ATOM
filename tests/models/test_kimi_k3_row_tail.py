@@ -113,8 +113,9 @@ class _Stub(nn.Module):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__()
 
-    def forward(self, *args):
-        return self.fn(*args)
+    def forward(self, *args, out=None):
+        result = self.fn(*args)
+        return result if out is None else out.copy_(result)
 
 
 @pytest.fixture(autouse=True)
@@ -184,6 +185,11 @@ def _block(w, rank, up_rows):
         x * logits.sum(-1, keepdim=True)
     )
     block.shared_experts.fn = lambda x: share * torch.tanh(x @ w["shared"])
+    # KimiMLP's out= path: the same partial, written into `out`.
+    shared = block.shared_experts
+    shared.down_proj = SimpleNamespace(supports_out=lambda: True)
+    shared.gate_up_proj = lambda x: x
+    shared.act_and_down_proj = lambda gate_up, out: out.copy_(shared.fn(gate_up))
     # Normalize in FP32 so CPU BF16 rounding is independent of row count.
     block.routed_expert_norm.fn = lambda x: (
         x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + 1e-6)
@@ -1024,3 +1030,81 @@ def test_mono_fallback_uses_post_attention_reduction():
     )
     assert torch.equal(partial, normed + 1) and residual is prefix
     assert torch.equal(blocks, bank)
+
+
+@pytest.mark.parametrize("shape", [(13, 6), (13, 3, 4)], ids=["2d", "3d"])
+@pytest.mark.parametrize("missing", [0, 3])
+def test_pad_in_place_pads_like_the_full_pad(monkeypatch, shape, missing):
+    x = torch.randn(shape).bfloat16()
+    x[0] = -0.0
+    monkeypatch.setenv("ATOM_ROW_SHARD_PAD_IN_PLACE", "0")
+    want = sequence_parallel._pad_rows(x, missing)
+    monkeypatch.setenv("ATOM_ROW_SHARD_PAD_IN_PLACE", "1")
+    got = sequence_parallel._pad_rows(x, missing)
+    assert got.shape == want.shape and got.stride() == want.stride()
+    assert torch.equal(got.view(torch.int16), want.view(torch.int16))
+
+
+@pytest.mark.parametrize("on", ["0", "1"], ids=["off", "on"])
+@pytest.mark.parametrize("tokens", [13, 16])
+def test_padded_rows_reach_the_reduce_scatter_uncopied(monkeypatch, on, tokens):
+    seen = []
+
+    def reduce_scatter_tensor(x, use_custom=False, dim=0):
+        seen.append(x)
+        return x.chunk(WORLD)[0].clone()
+
+    group = SimpleNamespace(reduce_scatter_tensor=reduce_scatter_tensor)
+    monkeypatch.setattr(sequence_parallel, "get_tp_group", lambda: group)
+    monkeypatch.setenv("ATOM_ROW_SHARD_PAD_IN_PLACE", on)
+    rows = sequence_parallel.SequenceParallel(tokens, WORLD, 0)
+    out = rows.padded_rows(torch.ones(tokens, 5, dtype=torch.bfloat16))
+    if on == "0" or tokens % WORLD == 0:
+        assert out is None
+        return
+    assert out.shape == (tokens, 5) and out.is_contiguous()
+    out.copy_(torch.randn(tokens, 5))
+    rows.scatter(out)
+    (x,) = seen
+    assert x.shape == (16, 5) and x.data_ptr() == out.data_ptr()
+    assert torch.equal(x[:tokens], out) and not x[tokens:].any()
+
+
+def _bits(tensors):
+    return [t.view(torch.int16) for t in tensors]
+
+
+@pytest.mark.parametrize("layer_num", [4, 5], ids=["block-closes", "mid-block"])
+@pytest.mark.parametrize("tokens", [8, 13, 1027])
+def test_pad_in_place_keeps_the_row_tail_bit_for_bit(
+    logged, monkeypatch, tokens, layer_num
+):
+    """With pad rows, the routed and shared partials are written into padded
+    buffers that their reduce-scatters take as they are; the o_proj partial
+    is copied into one. Outputs and kernels stay the same."""
+    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "4")
+    layers = _layers(layer_num)
+    inputs = _inputs(tokens)
+    monkeypatch.setenv("ATOM_ROW_SHARD_PAD_IN_PLACE", "0")
+    base = logged(lambda rank: layers[rank](None, *(x.clone() for x in inputs)))
+
+    pad_rows, local = sequence_parallel._pad_rows, threading.local()
+
+    def recorded(x, missing):
+        out = pad_rows(x, missing)
+        if x.shape[0] == tokens:  # a reduce-scatter's input, not a shard
+            local.pads.append((x.shape[-1], out is getattr(x, "_padded_rows_of", 0)))
+        return out
+
+    monkeypatch.setattr(sequence_parallel, "_pad_rows", recorded)
+    monkeypatch.setenv("ATOM_ROW_SHARD_PAD_IN_PLACE", "1")
+
+    def forward(rank):
+        local.pads = []
+        return layers[rank](None, *(x.clone() for x in inputs)), local.pads
+
+    padded = tokens % WORLD != 0
+    for (want, want_log), ((got, pads), log) in zip(base, logged(forward)):
+        assert log == want_log
+        assert all(map(torch.equal, _bits(got), _bits(want)))
+        assert pads == [(HIDDEN, False), (LATENT, padded), (HIDDEN, padded)]
