@@ -743,6 +743,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     == "1",
     # Kimi K2: the latent norm's sums of squares from their owner rank.
     "ATOM_MONO_K2_LN_SQ": lambda: os.getenv("ATOM_MONO_K2_LN_SQ", "1") == "1",
+    # Kimi K2 front, the same sums, each off by default (1 turns it on): x staged
+    # ``layer.EARLY_AHEAD`` units ahead past one token group.
+    "ATOM_MONO_K2_EARLY_AHEAD": lambda: os.getenv("ATOM_MONO_K2_EARLY_AHEAD", "0")
+    == "1",
+    # Kimi K2: two of the latent's gather passes a poll.
+    "ATOM_MONO_K2_LATQ_BATCH": lambda: os.getenv("ATOM_MONO_K2_LATQ_BATCH", "0")
+    == "1",
+    # Kimi K2: the shared gate/up stages x after the router's and latent's.
+    "ATOM_MONO_K2_EARLY_YIELD": lambda: os.getenv("ATOM_MONO_K2_EARLY_YIELD", "0")
+    == "1",
     # GLM-5.2 mono: run the "full" indexer layers (18 of 78) through the fused
     # MonoKernel (atom/models/glm52/mono/kernels/{kernel,layout,op}.py, built
     # with with_indexer=True), which does index Q/K/W projection, paged FP8

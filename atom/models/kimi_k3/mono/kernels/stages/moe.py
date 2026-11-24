@@ -128,6 +128,7 @@ REGIONS = (
     "fing",
     "rlogp",
     "lsq",
+    "estg",
 )
 # the regions every rank pushes into (every peer's copy)
 PEER_REGIONS = ("rlog", "latq", "latsc", "latr", "latg", "fin", "fing")
@@ -339,6 +340,9 @@ def scratch_layout(key: MoeBuild) -> dict:
         "lmsq": LN_TASKS * s,
         "lnrdy": LN_TASKS * LN_HALVES_MAX,
         "shrdy": UP_TASKS,
+        # past every other region (their offsets stay): a router / latent
+        # task's flag, its x slice multiplied (``K2Build.early_yield``)
+        "estg": R_TASKS + L_TASKS,
     }
     return pair_layout(pairs.items())
 
@@ -625,12 +629,20 @@ def early_compute(c, kind, i, q, ops):
     if const_expr(c.get("xflags") is not None):
         if tid < c["xflags"]:
             c["poll"]([(c["xrdy"], tid, 1)])
+        if const_expr(kind == 2 and c.get("early_yield", False)):
+            if tid < R_TASKS + L_TASKS:
+                c["poll"]([(c["estg"], tid, 1)])
         gpu.barrier()
     if const_expr(groups(s) > 1):
-        acc = early_units(c, q, klen, [op for sl_ops in ops for op in sl_ops])
+        # ``early_ahead``: the router's and latent's (their weights 28 VGPRs;
+        # the sgu's 112 leave no room for more rows: it spilled)
+        ahead = 1 if kind == 2 else max(1, c.get("early_ahead", 0))
+        acc = early_units(c, q, klen, [op for sl_ops in ops for op in sl_ops], ahead)
         for g in range_constexpr(groups(s)):
             fx.ptr_store(acc[g], red + (wave * 64 + lane) * 4)
             gpu.barrier()
+            if const_expr(g == 0):
+                early_staged(c, kind, i, q)
             early_out(c, kind, i, q, red, TG * g)
         return
     # one token group: its rows staged a slab at a time against the slab's
@@ -652,13 +664,25 @@ def early_compute(c, kind, i, q, ops):
         acc = gemv.mfmas(lane, wave, c["xl"], xrow, n, sg, ops[sl], acc)
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
     gpu.barrier()
+    early_staged(c, kind, i, q)
     early_out(c, kind, i, q, red, 0)
 
 
-def early_units(c, q, klen, ops):
+@traced
+def early_staged(c, kind, i, q):
+    """``early_yield``: router / latent task (i, q) is past its MFMAs (every
+    wave: behind a barrier), so it reads no more x -> its ESTG flag, which the
+    shared gate/up's tasks wait for before staging theirs."""
+    if const_expr(kind != 2 and c.get("early_yield", False)):
+        first, parts = {0: (0, R_PARTS), 1: (R_TASKS, L_PARTS)}[kind]
+        if c["tid"] == 0:
+            c["put"](c["estg"], first + i * parts + q, 1)
+
+
+def early_units(c, q, klen, ops, ahead=1):
     """``early_compute`` past one token group: ``gemv.staged_units`` over the
-    units -- a column group (``gemv.KGROUP``) of a token group -- with x one
-    unit ahead (``ops``: ``gemv.loads``' entries, one a column group, all in
+    units -- a column group (``gemv.KGROUP``) of a token group -- with x
+    ``ahead`` units ahead (``ops``: ``gemv.loads``' entries, one a column group, all in
     flight already). Column groups in order per token group: ``gemv.mfmas``'
     accumulation order. -> an accumulator a group."""
     tid, lane, wave, G = c["tid"], c["lane"], c["wave"], groups(c["S"])
@@ -698,7 +722,7 @@ def early_units(c, q, klen, ops):
         )
 
     gemv.staged_units(
-        len(units), 1, bufs, lambda u: unit_loads(*units[u]), store, multiply
+        len(units), ahead, bufs, lambda u: unit_loads(*units[u]), store, multiply
     )
     return acc
 
@@ -1001,6 +1025,9 @@ def load_latq(c):
         if tid < LAT // 32:
             c["poll"]([(c["peer"]["latsc_own"], (s - 1) * (LAT // 32) + tid, 1)])
         gpu.barrier()
+    if const_expr(c.get("latq_batch", False)):
+        load_latq_batched(c)
+        return
     for i in range_constexpr((nblk + THREADS - 1) // THREADS):
         b = fx.min(tid + THREADS * i, nblk - 1)
         t = b // (LAT // 32)
@@ -1020,6 +1047,46 @@ def load_latq(c):
                 fx.ptr_store(got[q][0], c["latq"] + (w0 + q))
             if kb % 4 == 0:
                 fx.ptr_store(packed, c["latsc"] + (t * (LAT // 128) + kb // 4))
+    gpu.barrier()
+
+
+# ``latq_batch``: passes a poll (five pairs each, ``POLL_MAX`` bounds the batch)
+LATQ_BATCH = 2
+
+
+def latq_passes(s):
+    """``load_latq``'s 512-block passes at ``s`` rows."""
+    return -(-s * (LAT // 32) // THREADS)
+
+
+@traced
+def load_latq_batched(c):
+    """``load_latq`` with ``LATQ_BATCH`` passes' pairs in one poll: a round
+    trip a batch, not a pass; the same words to the same LDS."""
+    s, tid = c["S"], c["tid"]
+    nblk = s * (LAT // 32)
+    npass = latq_passes(s)
+    for j in range_constexpr(-(-npass // LATQ_BATCH)):
+        n = min(LATQ_BATCH, npass - j * LATQ_BATCH)
+        bs = [fx.min(tid + THREADS * (j * LATQ_BATCH + p), nblk - 1) for p in range(n)]
+        ts = [b // (LAT // 32) for b in bs]
+        kbs = [b % (LAT // 32) for b in bs]
+        w0s = [ts[p] * (LAT // 8) + kbs[p] * 4 for p in range(n)]
+        specs = []
+        for p in range_constexpr(n):
+            specs += [(c["peer"]["latq_own"], w0s[p] + q, 1) for q in range(4)]
+            specs += [(c["peer"]["latsc_own"], ts[p] * (LAT // 32) + kbs[p], 1)]
+        got = c["poll"](specs)
+        if const_expr(j == 0):
+            stamp(c["tl_on"], c["tls"], tid, 17)
+        for p in range_constexpr(n):
+            t, kb, w0 = ts[p], kbs[p], w0s[p]
+            packed = butterfly(got[5 * p + 4][0] << ((kb % 4) * 8), (1, 2))
+            if tid + THREADS * (j * LATQ_BATCH + p) < nblk:
+                for q in range_constexpr(4):
+                    fx.ptr_store(got[5 * p + q][0], c["latq"] + (w0 + q))
+                if kb % 4 == 0:
+                    fx.ptr_store(packed, c["latsc"] + (t * (LAT // 128) + kb // 4))
     gpu.barrier()
 
 
