@@ -15,7 +15,9 @@ softmax, selected by ``DCPConfig.comm_backend``:
 
 With ``ATOM_DCP_PREFILL_PULL`` the head-major prefill merge of ``a2a`` reads
 each rank's heads from its peers' IPC-mapped buffers instead of exchanging them
-in all-to-alls (``prepare_dcp_prefill_pull``).
+in all-to-alls (``prepare_dcp_prefill_pull``); with
+``ATOM_DCP_PREFILL_PULL_EPILOGUE`` that merge also writes the output gate or
+a token-graph region's output buffer (``dcp_prefill_pull_project_merge``).
 
 The backends implement the same LSE-weighted sum with floating-point
 differences from accumulation order.
@@ -1421,11 +1423,19 @@ def _dcp_pull_combine_kernel(
     out_stride_b,
     out_stride_h,
     N_RANKS,
+    gate_ptr,  # GATED: [rows, heads * HEAD_DIM] BF16, a dense last dimension
+    gate_stride_b,
     HEAD_DIM: tl.constexpr,
     N_ROUNDED: tl.constexpr,
+    GATED: tl.constexpr,
+    PAD: tl.constexpr,
 ):
     """``_dcp_a2a_combine_kernel`` (LSE_PACK=1, no LSE out) for one (row, head),
     reading each rank's record from its buffers.
+
+    GATED rounds the merge to BF16 and then multiplies it by the gate's sigmoid
+    as ``_fused_sigmoid_mul_kernel`` does. PAD makes the programs from row
+    ``rows`` on write zeros.
 
     The value pointers must carry their 16-byte alignment: without it Triton
     lays the [N, D] tile out otherwise, and the N-term sums run in another
@@ -1434,6 +1444,13 @@ def _dcp_pull_combine_kernel(
     into 32-bit buffer offsets, and peers lie far apart."""
     b = tl.program_id(0).to(tl.int64)
     h = tl.program_id(1).to(tl.int64)
+    if PAD:  # noqa: SIM102 -- a constexpr test, then a runtime one
+        if b >= rows:
+            tl.store(
+                out_ptr + b * out_stride_b + h * out_stride_h + tl.arange(0, HEAD_DIM),
+                tl.zeros([HEAD_DIM], dtype=out_ptr.dtype.element_ty),
+            )
+            return
     n = tl.arange(0, N_ROUNDED)
     valid = n < N_RANKS
     n_safe = tl.where(valid, n, 0).to(tl.int64)
@@ -1457,6 +1474,10 @@ def _dcp_pull_combine_kernel(
     ).to(tl.float32)
     vals = tl.where(factor[:, None] == 0.0, 0.0, vals)
     acc = tl.sum(vals * factor[:, None], axis=0)
+    if GATED:
+        gate = tl.load(gate_ptr + b * gate_stride_b + h * HEAD_DIM + d).to(tl.float32)
+        sig = 1.0 / (1.0 + tl.exp2(-(gate * 1.44269504089)))
+        acc = acc.to(out_ptr.dtype.element_ty).to(tl.float32) * sig
     tl.store(
         out_ptr + b * out_stride_b + h * out_stride_h + d,
         acc.to(out_ptr.dtype.element_ty),
@@ -1468,7 +1489,9 @@ def _pull_barrier(ws, key) -> None:
     _dcp_pull_barrier_kernel[(1,)](ws.signal_tab, ws.rank, N_RANKS=ws.ranks)
 
 
-def dcp_prefill_pull_project_merge(x, w_v, cp_attn_lse, cp_group, owned_counts, bmm):
+def dcp_prefill_pull_project_merge(
+    x, w_v, cp_attn_lse, cp_group, owned_counts, bmm, out=None, gate=None
+):
     """``cp_lse_a2a_head_major(bmm(x, w_v), cp_attn_lse, cp_group,
     owned_counts=owned_counts)`` through the pull workspace, bit for bit, or
     None when this call cannot take it.
@@ -1476,6 +1499,11 @@ def dcp_prefill_pull_project_merge(x, w_v, cp_attn_lse, cp_group, owned_counts, 
     ``x`` is the group's ``[H, rows, kv_lora_rank]`` BF16 attention output,
     ``w_v`` the group's ``[H, D, kv_lora_rank]`` V projection and
     ``bmm(x, w_v, YQ=y)`` the batched GEMM that writes ``[H, rows, D]`` into ``y``.
+
+    ``out``, a contiguous ``[R >= rows, heads * D]`` BF16 buffer, takes the
+    merge in its first rows and zeros in the rest; the result is then its
+    first ``rows``. ``gate``, ``[rows, heads * D]`` BF16 with a dense last
+    dimension, makes the result ``sigmoid_mul(merge, gate)``, bit for bit.
     """
     heads, rows, _ = x.shape
     dim = w_v.shape[1]
@@ -1489,10 +1517,31 @@ def dcp_prefill_pull_project_merge(x, w_v, cp_attn_lse, cp_group, owned_counts, 
     ):
         return None
     h_local = heads // ws.ranks
-    out = torch.empty((rows, h_local, dim), dtype=torch.bfloat16, device=x.device)
+    width = h_local * dim
+    if out is None:
+        total = rows
+        out = torch.empty((rows, h_local, dim), dtype=torch.bfloat16, device=x.device)
+    elif (
+        out.dtype != torch.bfloat16
+        or out.dim() != 2
+        or not out.is_contiguous()
+        or out.shape[1] != width
+        or out.shape[0] < rows
+    ):
+        raise ValueError(f"pull merge out {tuple(out.shape)} for {rows} x {width}")
+    else:
+        total = out.shape[0]
+        out = out.view(total, h_local, dim)
+    if gate is not None and (
+        gate.dtype != torch.bfloat16
+        or tuple(gate.shape) != (rows, width)
+        or gate.stride(1) != 1
+    ):
+        raise ValueError(f"pull merge gate {tuple(gate.shape)} for {rows} x {width}")
     step = triton.cdiv(rows, triton.cdiv(rows, ws.rows))
     for r0 in range(0, rows, step):
         n = min(step, rows - r0)
+        pad = total - rows if r0 + n == rows else 0
         bmm(x[:, r0 : r0 + n], w_v, YQ=ws.values[: heads * n * dim].view(heads, n, dim))
         dcp_head_major_lse(
             cp_attn_lse[r0 : r0 + n],
@@ -1500,7 +1549,7 @@ def dcp_prefill_pull_project_merge(x, w_v, cp_attn_lse, cp_group, owned_counts, 
             out=ws.lse[: heads * n].view(heads, n),
         )
         _pull_barrier(ws, key)
-        _dcp_pull_combine_kernel[(n, h_local)](
+        _dcp_pull_combine_kernel[(n + pad, h_local)](
             ws.values_tab,
             ws.lse_tab,
             out[r0:],
@@ -1509,11 +1558,15 @@ def dcp_prefill_pull_project_merge(x, w_v, cp_attn_lse, cp_group, owned_counts, 
             out.stride(0),
             out.stride(1),
             ws.ranks,
+            None if gate is None else gate[r0:],
+            None if gate is None else gate.stride(0),
             HEAD_DIM=dim,
             N_ROUNDED=triton.next_power_of_2(ws.ranks),
+            GATED=gate is not None,
+            PAD=pad > 0,
         )
         _pull_barrier(ws, key)
-    return out
+    return out[:rows]
 
 
 def check_dcp_prefill_pull_launches() -> None:

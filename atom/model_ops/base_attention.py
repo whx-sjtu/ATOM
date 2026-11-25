@@ -1035,6 +1035,10 @@ def _mla_token_graph_forward(impl, q, q_scale, k, v, positions, out=None):
         slots = metadata.slot_mapping
         # The cache writer sees only live slots; later draft readers keep the bucket.
         metadata.slot_mapping = slots[:rows]
+        # A pull merge may write all of ``out`` itself (`_pull_merge_epilogue`).
+        merge_out = None
+        if out is not None and impl._dcp_prefill_pull_epilogue:
+            merge_out = impl._merge_out = [out, False]
         try:
             result = impl.forward(
                 query=q[:rows],
@@ -1045,6 +1049,15 @@ def _mla_token_graph_forward(impl, q, q_scale, k, v, positions, out=None):
             )
         finally:
             metadata.slot_mapping = slots
+            if merge_out is not None:
+                impl._merge_out = None
+        if (
+            merge_out is not None
+            and merge_out[1]
+            and result.data_ptr() == out.data_ptr()
+            and tuple(result.shape) == (rows, *out.shape[1:])
+        ):
+            return out
         if _fits(out, (q.shape[0], *result.shape[1:]), result.dtype):
             out[:rows].copy_(result)
             out[rows:].zero_()

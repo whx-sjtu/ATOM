@@ -768,8 +768,14 @@ class MLAAttention(nn.Module):
     # The gate of the call in flight, until a DCP decode merge takes it.
     _merge_gate = None
     # The head-major prefill merge may take the peer pull
-    # (`_prepare_dcp_prefill_pull`).
+    # (`_prepare_dcp_prefill_pull`), and with it the work after the merge
+    # (`_pull_merge_epilogue`).
     _dcp_prefill_pull = False
+    _dcp_prefill_pull_epilogue = False
+    _pull_epilogue_logged = False
+    # A prefill token-graph region's output buffer, and whether a pull merge
+    # wrote all of it (`_mla_token_graph_forward`).
+    _merge_out = None
 
     def __init__(
         self,
@@ -1623,6 +1629,10 @@ class MLAAttention(nn.Module):
         if self._dcp_prefill_pull and not merge_in_fp32:
             from atom.model_ops.dcp_ops import dcp_prefill_pull_project_merge
 
+            width = self.num_heads * self.v_head_dim
+            out = gate = None
+            if self._dcp_prefill_pull_epilogue:
+                out, gate = self._pull_merge_epilogue(x.shape[1], width)
             merged = dcp_prefill_pull_project_merge(
                 x,
                 self.W_V_dcp,
@@ -1630,9 +1640,15 @@ class MLAAttention(nn.Module):
                 self.dcp_group,
                 owned_counts,
                 _aiter_triton_bf16_bmm,
+                out=out,
+                gate=gate,
             )
             if merged is not None:
-                return self.o_proj(merged.reshape(-1, self.num_heads * self.v_head_dim))
+                if out is not None:
+                    self._merge_out[1] = True
+                if gate is not None:
+                    self._take_merge_gate()
+                return self.o_proj(merged.reshape(-1, width))
         projected = torch.empty(
             (x.shape[0], x.shape[1], self.W_V_dcp.shape[1]),
             dtype=torch.bfloat16,
@@ -1694,6 +1710,51 @@ class MLAAttention(nn.Module):
         self._dcp_prefill_pull = prepare_dcp_prefill_pull(
             self.dcp_group, self.qrep_num_heads, self.v_head_dim, self.kv_lora_rank
         )
+        # The gate and the region buffer apply to the attention's own output.
+        self._dcp_prefill_pull_epilogue = (
+            self._dcp_prefill_pull
+            and envs.ATOM_DCP_PREFILL_PULL_EPILOGUE
+            and isinstance(self.o_proj, nn.Identity)
+        )
+        if self._dcp_prefill_pull_epilogue and not MLAAttention._pull_epilogue_logged:
+            MLAAttention._pull_epilogue_logged = True
+            logger.info(
+                "DCP prefill pull merge also writes the output gate on eager steps "
+                "and the region's output buffer on token-graph steps"
+            )
+
+    def _pull_merge_epilogue(self, rows: int, width: int):
+        """``(out, gate)`` for a pull merge of ``rows`` x ``width``: the prefill
+        token-graph region's output buffer, which it fills whole, and on an
+        eager step the output gate of the call in flight (`forward_gated`).
+        Never the gate in a recording or a replay: there the gate kernel after
+        the region is recorded, and a replay runs the region alone."""
+        out = gate = None
+        if self._merge_out is not None and not self._merge_out[1]:
+            buf = self._merge_out[0]
+            if (
+                buf.dtype == torch.bfloat16
+                and buf.dim() == 2
+                and buf.is_contiguous()
+                and buf.shape[1] == width
+                and buf.shape[0] >= rows
+            ):
+                out = buf
+        fwd_ctx = get_forward_context()
+        if (
+            self._merge_gate is not None
+            and not self._merge_gate[1]
+            and fwd_ctx.tr_graph is None
+            and not fwd_ctx.in_hipgraph
+        ):
+            g = self._merge_gate[0]
+            if (
+                g.dtype == torch.bfloat16
+                and tuple(g.shape) == (rows, width)
+                and g.stride(1) == 1
+            ):
+                gate = g
+        return out, gate
 
     def _dcp_merge(
         self,

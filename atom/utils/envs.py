@@ -599,6 +599,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all_to_all_single. Bit-identical to them. Maps about 102 MB of peer memory
     # a rank at model build (dcp_ops.prepare_dcp_prefill_pull). Off by default.
     "ATOM_DCP_PREFILL_PULL": lambda: os.getenv("ATOM_DCP_PREFILL_PULL", "0") == "1",
+    # With ATOM_DCP_PREFILL_PULL, a pull merge also does the work after it:
+    # on an eager step the output gate (MLAAttention.forward_gated), and in a
+    # prefill token-graph region the copy into the region's output buffer and
+    # the zero fill of the bucket's pad rows. Bit-identical. Off by default.
+    "ATOM_DCP_PREFILL_PULL_EPILOGUE": lambda: (
+        os.getenv("ATOM_DCP_PREFILL_PULL_EPILOGUE", "0") == "1"
+    ),
     # Row-parallel DSA prefill under DCP (atom/model_ops/dsa_row_parallel.py):
     # a sparse prefill step of at least _MIN_TOKENS new tokens splits its rows
     # across the DCP group instead of replicating the query side: each rank
