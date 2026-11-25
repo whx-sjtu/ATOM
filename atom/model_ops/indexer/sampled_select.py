@@ -9,7 +9,9 @@ filtering pass, an exact select of the candidates -- where the one-block
 kernel reads a long row twice. With `tie_low` it keeps the stable emit's set:
 the k largest, ties to the smaller column, NaN by sign. It writes them in no
 promised order; the ids are then put in ascending order, -1 last, the order
-the stable emit writes.
+the stable emit writes. One exception: the stable emit takes a row's negative
+NaNs (as if above +inf), the sampled selector ranks them last. Index logits
+are finite.
 """
 
 from functools import lru_cache
