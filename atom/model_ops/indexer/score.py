@@ -34,6 +34,7 @@ from atom.distributed.dcp_utils import get_dcp_group
 from atom.utils import forward_context
 from atom.utils.region_graph import eager_region
 
+from . import sampled_select
 from .layout import MFMA, NATURAL
 from .rows import IndexCache, IndexRows
 
@@ -59,6 +60,7 @@ def score_topk(
     on_band=None,
     out: torch.Tensor | None = None,
     request_local: bool = True,
+    sampled_topk: bool = False,
 ) -> torch.Tensor:
     """`[rows.out_rows, topk]` int32 of `rows`' query rows against `cache`,
     each band scored into the plane the rows were cut to (`rows.workspace`).
@@ -81,7 +83,11 @@ def score_topk(
     slot r holds rows r, r + world, ..., so row i sits at
     `(i % world) * stride + i // world` (`csa_translate_pack` reads it
     there). `out`, `on_band` and `request_local=False`, which assume rows in
-    order, do not apply."""
+    order, do not apply.
+
+    `sampled_topk`: a stable top-k of a wide band of paged one-row items
+    (prefill) through the sampled selector (`sampled_select.py`), bit for bit
+    the one-block kernel's ids; other bands keep that kernel."""
     split = rows.split
     if split.stripe:
         if not (out is None and on_band is None and request_local):
@@ -103,7 +109,16 @@ def score_topk(
         _score_concat(query, weights, cache, rows, topk, stable, mine, request_local)
     else:
         _score_paged(
-            query, weights, cache, rows, topk, weight_scale, stable, on_band, mine
+            query,
+            weights,
+            cache,
+            rows,
+            topk,
+            weight_scale,
+            stable,
+            on_band,
+            mine,
+            sampled=sampled_topk and stable and rows.next_n == 1,
         )
     _gather_split(out, split)
     return out
@@ -149,7 +164,18 @@ def _all_gather_slot(buffer, stride, rank, world, group):
     )
 
 
-def _score_paged(query, weights, cache, rows, topk, weight_scale, stable, on_band, out):
+def _score_paged(
+    query,
+    weights,
+    cache,
+    rows,
+    topk,
+    weight_scale,
+    stable,
+    on_band,
+    out,
+    sampled=False,
+):
     """Paged rows, band by band into the plane, each band top-k'd at once."""
     workspace = rows.workspace
     # Without a workspace (rows cut to the logits budget alone), one band's
@@ -210,7 +236,11 @@ def _score_paged(query, weights, cache, rows, topk, weight_scale, stable, on_ban
             )
         if on_band is not None:
             on_band(scores, span)
-        if offsets is None:
+        if offsets is None and sampled and sampled_select.takes(scores, topk):
+            sampled_select.stable_sampled_topk(
+                scores, rows.row_ends[items], out[span], topk
+            )
+        elif offsets is None:
             top_k_per_row_decode(
                 scores,
                 group,

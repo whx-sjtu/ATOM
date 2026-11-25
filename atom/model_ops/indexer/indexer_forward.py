@@ -28,6 +28,7 @@ from atom.model_ops.dcp_ops import (
 )
 from atom.model_ops.dsa_row_parallel import gathered_kv_index
 from atom.model_ops.sparse_indexer_fp4 import FP4_QUANT_BLOCK_SIZE, fp4_q_scale_shape
+from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.forward_context import get_forward_context
 from atom.utils.region_graph import eager_region
@@ -437,6 +438,7 @@ def sparse_attn_indexer(
         stable=stable_topk,
         out=topk_indices[: rows.out_rows],
         request_local=not single_rank_prefill,
+        sampled_topk=context.is_prefill and envs.ATOM_DSA_PREFILL_TOPK_SAMPLED,
     )
     if not context.is_prefill:
         if attn_metadata.max_seqlen_q > 1:
@@ -528,6 +530,7 @@ def _dcp_prefill_exchange(
         weight_scale=weight_scale,
         stable=stable,
         out=topk_indices[: rows.out_rows],
+        sampled_topk=envs.ATOM_DSA_PREFILL_TOPK_SAMPLED,
     )
     exchange.wait_stream(torch.cuda.current_stream())
     topk_indices.record_stream(exchange)
@@ -587,6 +590,7 @@ def _row_parallel_select(
         weight_scale=weight_scale,
         stable=stable,
         out=topk_indices[: rows.out_rows],
+        sampled_topk=envs.ATOM_DSA_PREFILL_TOPK_SAMPLED,
     )
     own = slice(plan.first, plan.end)
     gathered_kv_index(
