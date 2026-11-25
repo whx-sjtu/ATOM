@@ -784,6 +784,16 @@ def _causal_conv1d_fwd_tiled_kernel(
             tl.store(st_ptrs, new_state, st_mask)
 
 
+def _tiled_conv1d_tile():
+    """``(BLOCK_M, BLOCK_N, NUM_WARPS, CHANNEL_FAST)``: ATOM_PFX_KDA_CONV_TILE
+    or the defaults."""
+    tile = envs.ATOM_PFX_KDA_CONV_TILE
+    if not tile:
+        return _TILED_BLOCK_M, _TILED_BLOCK_N, _TILED_NUM_WARPS, _TILED_CHANNEL_FAST
+    bm, bn, nw, cf = (int(x) for x in tile.split(","))
+    return bm, bn, nw, bool(cf)
+
+
 def _tiled_conv1d_map(metadata, query_start_loc, num_tokens, block_m):
     """The tiled kernel's program map, cached in the step's `nums_dict`."""
     nums_dict = None if metadata is None else metadata.nums_dict
@@ -820,11 +830,12 @@ def _causal_conv1d_fwd_tiled(
     num_warps=None,
     channel_fast=None,
 ):
-    block_m = block_m or _TILED_BLOCK_M
-    block_n = block_n or _TILED_BLOCK_N
-    num_warps = num_warps or _TILED_NUM_WARPS
+    tile = _tiled_conv1d_tile()
+    block_m = block_m or tile[0]
+    block_n = block_n or tile[1]
+    num_warps = num_warps or tile[2]
     if channel_fast is None:
-        channel_fast = _TILED_CHANNEL_FAST
+        channel_fast = tile[3]
     dim, cu_seqlen = x.shape
     width = weight.shape[1]
     entry = _tiled_conv1d_map(metadata, query_start_loc, cu_seqlen, block_m)
@@ -877,7 +888,7 @@ def _causal_conv1d_fwd_tiled(
 def _tiled_conv1d_applies(
     x, weight, conv_states, k_dim_size, v_dim_size, cache_indices, has_initial_state
 ):
-    block_n = _TILED_BLOCK_N
+    block_n = _tiled_conv1d_tile()[1]
     return (
         conv_states is not None
         and cache_indices is not None

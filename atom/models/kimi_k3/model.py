@@ -2342,6 +2342,7 @@ class KimiKDAAttention(nn.Module):
                 conv_state,
                 ssm_state,
                 split,
+                out=out if envs.ATOM_PFX_KDA_SPLIT_OUT else None,
             )
         state_indices = kda_metadata.non_spec_state_indices_tensor
         query_start_loc = kda_metadata.non_spec_query_start_loc

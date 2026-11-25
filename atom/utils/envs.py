@@ -1170,6 +1170,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KDA_PREFILL_CKPT_SPLIT_ALL": lambda: (
         os.getenv("ATOM_KDA_PREFILL_CKPT_SPLIT_ALL", "1") == "1"
     ),
+    # A split step (ATOM_KDA_PREFILL_CKPT_SPLIT) writes its KDA output into the
+    # token-graph region's buffer (ATOM_SPG_REGION_OUT) rather than a fresh
+    # tensor the region then copies there. Bit-identical. Off by default.
+    "ATOM_PFX_KDA_SPLIT_OUT": lambda: (
+        os.getenv("ATOM_PFX_KDA_SPLIT_OUT", "0") == "1"
+    ),
+    # The tiled prefill conv (ATOM_CONV1D_TILED_PREFILL) on this tile,
+    # "BLOCK_M,BLOCK_N,NUM_WARPS,CHANNEL_FAST" (e.g. "64,256,4,1"); BLOCK_N
+    # must divide the q/k/v widths. Same per-element arithmetic, bit-identical.
+    # Empty (default) keeps 16,512,4,1.
+    "ATOM_PFX_KDA_CONV_TILE": lambda: os.getenv("ATOM_PFX_KDA_CONV_TILE", ""),
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT": lambda: (
         os.getenv("ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT", "1") == "1"
     ),

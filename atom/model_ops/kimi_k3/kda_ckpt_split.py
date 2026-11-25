@@ -267,8 +267,10 @@ def run_checkpoint_split(
     conv_state,
     ssm_state,
     split: CheckpointSplit,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """`_settle_prefill` for a split step; returns ``[1, T, heads, head_dim]``.
+    """`_settle_prefill` for a split step; returns ``[1, T, heads, head_dim]``,
+    ``out``'s first rows when it has room (`_kda_recurrence`'s buffer).
 
     A block's checkpoints are written before the next block runs: that block
     moves the same runtime slots past them.
@@ -276,7 +278,10 @@ def run_checkpoint_split(
     from atom.model_ops.fla_ops.state_checkpoint import write_state_checkpoints
 
     install_host_bounds()
-    out = torch.empty_like(v)
+    if out is not None and out.shape[0] >= v.shape[1] and out.is_contiguous():
+        out = out[: v.shape[1]].unsqueeze(0)
+    else:
+        out = torch.empty_like(v)
     beta = beta.float()
     query_start_loc = kda_metadata.non_spec_query_start_loc
     for block in split.blocks:
