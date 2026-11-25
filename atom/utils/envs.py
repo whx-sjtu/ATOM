@@ -966,10 +966,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # DSA MTP verify: keep the target's sparse per-token MLA template in its
     # buffers while the step's template geometry repeats, instead of planning
-    # it again. Layers rewrite only its items' KV ranges. Off by default; 1
-    # reuses it.
+    # it again. Layers rewrite only its items' KV ranges. On by default; 0
+    # plans it every step.
     "ATOM_MLA_SPARSE_MTP_PLAN_REUSE": lambda: _flag_env(
-        "ATOM_MLA_SPARSE_MTP_PLAN_REUSE", "0"
+        "ATOM_MLA_SPARSE_MTP_PLAN_REUSE", "1"
     ),
     # Build the Kimi-K3 DSpark block's DCP-sharded MLA metadata (positions,
     # slots, ctx_lens, kv_indptr, pad-tail kv_indices) in one Triton program
