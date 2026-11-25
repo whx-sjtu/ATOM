@@ -19,10 +19,13 @@ import triton
 import triton.language as tl
 from aiter.ops.topk import top_k_per_row_prefill_sampled, topk_sampled_supports
 
-# The narrowest band it takes: below it the one-block kernel was as fast
-# (MI355X, k=2048, causal rows), and the sampled plan follows the pitch, not
-# where rows end. Also clear of the small-width path, which tie_low lacks.
-MIN_WIDTH = 65536
+# The smallest band it takes: below either bound the one-block kernel was as
+# fast or faster (MI355X, k=2048, causal rows, the ascending pass included:
+# 1018 rows over 72K columns, 256 over 152K), and the sampled plan follows
+# the pitch, not where rows end. Also clear of the small-width path, which
+# tie_low lacks.
+MIN_ROWS = 384
+MIN_WIDTH = 81920
 
 # Above every column id, so a row's -1 padding sorts last.
 _PAD = 2**31 - 1
@@ -45,11 +48,12 @@ def _supports(rows: int, pitch: int, k: int, device: int) -> bool:
 
 
 def takes(scores: torch.Tensor, k: int) -> bool:
-    """Whether `stable_sampled_topk` serves this band: wide, eager (its
-    workspace is shared scratch), a shape the sampled kernels take."""
+    """Whether `stable_sampled_topk` serves this band: tall and wide, eager
+    (its workspace is shared scratch), a shape the sampled kernels take."""
     rows, width = scores.shape
     return (
-        width >= MIN_WIDTH
+        rows >= MIN_ROWS
+        and width >= MIN_WIDTH
         and not torch.cuda.is_current_stream_capturing()
         and _supports(rows, scores.stride(0), k, scores.get_device())
     )
