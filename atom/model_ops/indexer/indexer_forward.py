@@ -438,7 +438,7 @@ def sparse_attn_indexer(
         stable=stable_topk,
         out=topk_indices[: rows.out_rows],
         request_local=not single_rank_prefill,
-        sampled_topk=context.is_prefill and envs.ATOM_DSA_PREFILL_TOPK_SAMPLED,
+        **_sampled_topk(context.is_prefill and envs.ATOM_DSA_PREFILL_TOPK_SAMPLED),
     )
     if not context.is_prefill:
         if attn_metadata.max_seqlen_q > 1:
@@ -530,7 +530,7 @@ def _dcp_prefill_exchange(
         weight_scale=weight_scale,
         stable=stable,
         out=topk_indices[: rows.out_rows],
-        sampled_topk=envs.ATOM_DSA_PREFILL_TOPK_SAMPLED,
+        **_sampled_topk(envs.ATOM_DSA_PREFILL_TOPK_SAMPLED),
     )
     exchange.wait_stream(torch.cuda.current_stream())
     topk_indices.record_stream(exchange)
@@ -590,7 +590,7 @@ def _row_parallel_select(
         weight_scale=weight_scale,
         stable=stable,
         out=topk_indices[: rows.out_rows],
-        sampled_topk=envs.ATOM_DSA_PREFILL_TOPK_SAMPLED,
+        **_sampled_topk(envs.ATOM_DSA_PREFILL_TOPK_SAMPLED),
     )
     own = slice(plan.first, plan.end)
     gathered_kv_index(
@@ -603,6 +603,12 @@ def _row_parallel_select(
         num_topk_tokens=topk,
         interleave=interleave_size,
     )
+
+
+def _sampled_topk(on: bool) -> dict:
+    """`score_topk`'s `sampled_topk` (ATOM_DSA_PREFILL_TOPK_SAMPLED), passed
+    only when on: off, the call is the one without the switch."""
+    return {"sampled_topk": True} if on else {}
 
 
 def _exchange_stream(stream):

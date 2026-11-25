@@ -118,7 +118,11 @@ def score_topk(
             stable,
             on_band,
             mine,
-            sampled=sampled_topk and stable and rows.next_n == 1,
+            **(
+                {"sampled": True}
+                if sampled_topk and stable and rows.next_n == 1
+                else {}
+            ),
         )
     _gather_split(out, split)
     return out
