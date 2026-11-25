@@ -612,6 +612,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DCP_PREFILL_INDEX_PULL": lambda: (
         os.getenv("ATOM_DCP_PREFILL_INDEX_PULL", "0") == "1"
     ),
+    # A row-parallel DSA prefill step (ATOM_DSA_ROW_PARALLEL_PREFILL) projects
+    # V into the peer-pull workspace of ATOM_DCP_PREFILL_PULL (mapped for this
+    # switch too, about 102 MB a rank, shared) and copies each rank's heads of
+    # every row from its peers after one barrier, in place of rows_to_heads'
+    # all_to_all_single and permute copy. Bit-identical. Off by default.
+    "ATOM_DCP_PREFILL_ROWS_PULL": lambda: (
+        os.getenv("ATOM_DCP_PREFILL_ROWS_PULL", "0") == "1"
+    ),
     # Row-parallel DSA prefill under DCP (atom/model_ops/dsa_row_parallel.py):
     # a sparse prefill step of at least _MIN_TOKENS new tokens splits its rows
     # across the DCP group instead of replicating the query side: each rank

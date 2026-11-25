@@ -772,6 +772,9 @@ class MLAAttention(nn.Module):
     # (`_pull_merge_epilogue`).
     _dcp_prefill_pull = False
     _dcp_prefill_pull_epilogue = False
+    # A row-parallel DSA prefill step's rows_to_heads may take the same
+    # workspace (`_prepare_dcp_rows_pull`).
+    _dcp_rows_pull = False
     _pull_epilogue_logged = False
     # A prefill token-graph region's output buffer, and whether a pull merge
     # wrote all of it (`_mla_token_graph_forward`).
@@ -1086,6 +1089,12 @@ class MLAAttention(nn.Module):
             and self.dcp_comm_backend in ("a2a", "mailbox")
         ):
             self._prepare_dcp_prefill_pull()
+        if (
+            envs.ATOM_DCP_PREFILL_ROWS_PULL
+            and self.dcp_world_size > 1
+            and self.pbm_enabled
+        ):
+            self._prepare_dcp_rows_pull()
 
         # Row view of q_proj used by prefill; see _local_q_proj. Initialized here
         # rather than in process_weights_after_loading so it exists no matter
@@ -1723,6 +1732,21 @@ class MLAAttention(nn.Module):
                 "and the region's output buffer on token-graph steps"
             )
 
+    def _prepare_dcp_rows_pull(self):
+        """Map (or reuse) the pull workspace for a row-parallel step's
+        rows_to_heads while every rank builds the same layer: collective,
+        and before the KV cache is sized, as `_prepare_dcp_prefill_pull`.
+        The layer opts into row-parallel only after it is built, so every
+        layer that could takes it; it is one workspace a group."""
+        from atom.model_ops.dcp_ops import prepare_dcp_prefill_pull
+        from atom.plugin import is_plugin_mode
+
+        if is_plugin_mode() or get_current_atom_config().enable_tbo:
+            return
+        self._dcp_rows_pull = prepare_dcp_prefill_pull(
+            self.dcp_group, self.qrep_num_heads, self.v_head_dim, self.kv_lora_rank
+        )
+
     def _pull_merge_epilogue(self, rows: int, width: int):
         """``(out, gate)`` for a pull merge of ``rows`` x ``width``: the prefill
         token-graph region's output buffer, which it fills whole, and on an
@@ -1970,6 +1994,8 @@ class MLAAttention(nn.Module):
             gather_local_kv,
             local_kv,
             rows_to_heads,
+            rows_to_heads_pull,
+            rows_to_heads_pull_buffer,
             write_kv,
             write_new_kv,
         )
@@ -2044,15 +2070,30 @@ class MLAAttention(nn.Module):
         o = self._restore_sparse_prefill_query_heads(o, self.qrep_num_heads)
         # Head-major with a tail past this rank's rows: every rank sends
         # `stride` rows of each destination's heads.
-        projected = torch.empty(
-            (self.qrep_num_heads, plan.stride, self.W_V_dcp.shape[1]),
-            dtype=torch.bfloat16,
-            device=q.device,
-        )
+        projected = None
+        if self._dcp_rows_pull:
+            projected = rows_to_heads_pull_buffer(
+                self.dcp_group,
+                self.qrep_num_heads,
+                plan.stride,
+                self.W_V_dcp.shape[1],
+            )
+        pull = projected is not None
+        if not pull:
+            projected = torch.empty(
+                (self.qrep_num_heads, plan.stride, self.W_V_dcp.shape[1]),
+                dtype=torch.bfloat16,
+                device=q.device,
+            )
         _aiter_triton_bf16_bmm(
             o.transpose(0, 1), self.W_V_dcp, YQ=projected[:, : plan.rows]
         )
-        out = rows_to_heads(projected, q.shape[0], self.dcp_group)
+        if pull:
+            out = rows_to_heads_pull(
+                projected, q.shape[0], plan.num_tokens, self.dcp_group
+            )
+        else:
+            out = rows_to_heads(projected, q.shape[0], self.dcp_group)
         return self.o_proj(out)
 
     @mark_trace(prefix="dcp_decode", torch_compile=False)

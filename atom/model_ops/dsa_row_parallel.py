@@ -559,6 +559,110 @@ def rows_to_heads(projected: torch.Tensor, num_rows: int, cp_group) -> torch.Ten
     return torch.nn.functional.pad(out, (0, 0, 0, num_rows - out.shape[0]))
 
 
+@triton.jit(do_not_specialize=["stride", "num_rows", "num_tokens", "head0"])
+def _rows_to_heads_pull_kernel(
+    values_tab,  # [world] int64: each rank's [world * h, stride, V] BF16 projection
+    out,  # [num_rows, h * V] BF16, rows of out_stride
+    stride,
+    num_rows,
+    num_tokens,
+    head0,
+    out_stride: tl.int64,
+    V: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+):
+    """``out[peer * stride + s, h * V:(h + 1) * V] = peer's projection[head0 +
+    h, s]`` for the rows below ``num_tokens``, and zeros for the others below
+    ``num_rows``. A copy. The source pointers are raw 64-bit peer addresses,
+    16-byte aligned (`dcp_ops.PeerBuffers`)."""
+    peer = tl.program_id(0).to(tl.int64)
+    s = tl.program_id(1).to(tl.int64) * BLOCK_S + tl.arange(0, BLOCK_S).to(tl.int64)
+    h = tl.program_id(2).to(tl.int64)
+    row = peer * stride + s
+    store = (s < stride) & (row < num_rows)
+    load = store & (row < num_tokens)
+    src = tl.multiple_of(
+        tl.load(values_tab + peer).to(tl.pointer_type(tl.bfloat16)), 16
+    )
+    d = tl.arange(0, V)
+    vals = tl.load(
+        src + ((head0 + h) * stride + s)[:, None] * V + d[None, :],
+        mask=load[:, None],
+        other=0.0,
+    )
+    tl.store(
+        out + row[:, None] * out_stride + h * V + d[None, :], vals, mask=store[:, None]
+    )
+
+
+_ROWS_PULL_BLOCK_S = 16
+_rows_pull_logged = False
+
+
+def rows_to_heads_pull_buffer(cp_group, heads: int, stride: int, v: int):
+    """This rank's peer-pull workspace (`dcp_ops.prepare_dcp_prefill_pull` of
+    ``(cp_group, heads, v)``) as the ``[heads, stride, v]`` BF16 projection
+    `rows_to_heads_pull` reads, or None when the step keeps `rows_to_heads`:
+    no workspace, or rows a rank past its chunk. Reads only shapes, the same
+    on every DCP rank, so every rank takes the same path."""
+    from atom.model_ops.dcp_ops import _PULL_WORKSPACES, _pull_key
+
+    ws = _PULL_WORKSPACES.get(_pull_key(cp_group, heads, v))
+    if ws is None or not 0 < stride <= ws.rows or heads % ws.ranks:
+        return None
+    return ws.values[: heads * stride * v].view(heads, stride, v)
+
+
+def rows_to_heads_pull(
+    projected: torch.Tensor, num_rows: int, num_tokens: int, cp_group
+) -> torch.Tensor:
+    """`rows_to_heads` through the peer-pull workspace: ``projected`` is
+    `rows_to_heads_pull_buffer`'s view, written on every rank. After a barrier
+    each rank copies its heads of every rank's rows from that rank's
+    workspace, then a second barrier keeps the next writer of the workspace
+    from overwriting rows a peer still reads. Returns ``[num_rows, h * v]``:
+    bit for bit `rows_to_heads`' rows below ``num_tokens`` (a copy), zeros in
+    the rows past them, which `rows_to_heads` leaves undefined."""
+    from atom.model_ops.dcp_ops import _PULL_WORKSPACES, _pull_barrier, _pull_key
+
+    global _rows_pull_logged
+    heads, stride, v = projected.shape
+    key = _pull_key(cp_group, heads, v)
+    ws = _PULL_WORKSPACES[key]
+    assert projected.data_ptr() == ws.values.data_ptr() and projected.is_contiguous()
+    assert projected.dtype == torch.bfloat16
+    h_local = heads // ws.ranks
+    out = torch.empty(
+        (num_rows, h_local * v), dtype=torch.bfloat16, device=projected.device
+    )
+    _pull_barrier(ws, key)
+    _rows_to_heads_pull_kernel[
+        (ws.ranks, triton.cdiv(stride, _ROWS_PULL_BLOCK_S), h_local)
+    ](
+        ws.values_tab,
+        out,
+        stride,
+        num_rows,
+        num_tokens,
+        ws.rank * h_local,
+        out.stride(0),
+        V=v,
+        BLOCK_S=_ROWS_PULL_BLOCK_S,
+    )
+    _pull_barrier(ws, key)
+    if num_rows > ws.ranks * stride:
+        out[ws.ranks * stride :].zero_()
+    if not _rows_pull_logged:
+        _rows_pull_logged = True
+        logger.info(
+            "Row-parallel DSA prefill pulls rows_to_heads from peer memory: first "
+            "step %d tokens, %d rows a rank",
+            num_tokens,
+            stride,
+        )
+    return out
+
+
 def scratch_bytes(max_kv_rows: int, world: int, entry_bytes: int) -> int:
     """The gathered KV at the cap and this rank's share of it, for the memory
     profile, whose dummy run attends nothing. Every other row-parallel buffer
