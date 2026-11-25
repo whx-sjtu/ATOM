@@ -767,6 +767,9 @@ class MLAAttention(nn.Module):
     gate_in_merge = False
     # The gate of the call in flight, until a DCP decode merge takes it.
     _merge_gate = None
+    # The head-major prefill merge may take the peer pull
+    # (`_prepare_dcp_prefill_pull`).
+    _dcp_prefill_pull = False
 
     def __init__(
         self,
@@ -1070,6 +1073,13 @@ class MLAAttention(nn.Module):
         # builds the same MLA layers in the same order, as for the weights.
         if self.dcp_world_size > 1 and self.dcp_comm_backend == "mailbox":
             self._prepare_dcp_mailbox()
+        if (
+            envs.ATOM_DCP_PREFILL_PULL
+            and self.dcp_world_size > 1
+            and self.pbm_enabled
+            and self.dcp_comm_backend in ("a2a", "mailbox")
+        ):
+            self._prepare_dcp_prefill_pull()
 
         # Row view of q_proj used by prefill; see _local_q_proj. Initialized here
         # rather than in process_weights_after_loading so it exists no matter
@@ -1610,6 +1620,19 @@ class MLAAttention(nn.Module):
         from atom.model_ops.dcp_ops import cp_lse_a2a_head_major
 
         x = o.reshape(-1, o.shape[1], self.kv_lora_rank).transpose(0, 1)
+        if self._dcp_prefill_pull and not merge_in_fp32:
+            from atom.model_ops.dcp_ops import dcp_prefill_pull_project_merge
+
+            merged = dcp_prefill_pull_project_merge(
+                x,
+                self.W_V_dcp,
+                lse,
+                self.dcp_group,
+                owned_counts,
+                _aiter_triton_bf16_bmm,
+            )
+            if merged is not None:
+                return self.o_proj(merged.reshape(-1, self.num_heads * self.v_head_dim))
         projected = torch.empty(
             (x.shape[0], x.shape[1], self.W_V_dcp.shape[1]),
             dtype=torch.bfloat16,
@@ -1657,6 +1680,20 @@ class MLAAttention(nn.Module):
             dcp_mailbox_max_tokens(get_current_atom_config()),
         ):  # prepare_dcp_mailbox logged why, once
             self.dcp_comm_backend = "a2a"
+
+    def _prepare_dcp_prefill_pull(self):
+        """Map the head-major prefill merge's peer buffers while every rank
+        builds the same layer (collective, and before the KV cache is sized).
+        Plugin mode sizes the KV cache elsewhere, and a TBO step may run two
+        merges at once on one workspace: both keep the all-to-all."""
+        from atom.model_ops.dcp_ops import prepare_dcp_prefill_pull
+        from atom.plugin import is_plugin_mode
+
+        if is_plugin_mode() or get_current_atom_config().enable_tbo:
+            return
+        self._dcp_prefill_pull = prepare_dcp_prefill_pull(
+            self.dcp_group, self.qrep_num_heads, self.v_head_dim, self.kv_lora_rank
+        )
 
     def _dcp_merge(
         self,

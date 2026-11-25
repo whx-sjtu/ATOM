@@ -13,6 +13,10 @@ softmax, selected by ``DCPConfig.comm_backend``:
     stores straight into the owners' IPC-mapped memory (no collective call);
     everything else as ``a2a``
 
+With ``ATOM_DCP_PREFILL_PULL`` the head-major prefill merge of ``a2a`` reads
+each rank's heads from its peers' IPC-mapped buffers instead of exchanging them
+in all-to-alls (``prepare_dcp_prefill_pull``).
+
 The backends implement the same LSE-weighted sum with floating-point
 differences from accumulation order.
 
@@ -998,13 +1002,17 @@ def _dcp_head_major_lse_kernel(
 
 
 def dcp_head_major_lse(
-    cp_attn_lse: torch.Tensor, owned_counts: torch.Tensor | None
+    cp_attn_lse: torch.Tensor,
+    owned_counts: torch.Tensor | None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``mask_empty_dcp_lse(cp_attn_lse.float(), owned_counts).t().contiguous()``
-    in one kernel: the ``[H, B]`` FP32 LSE `cp_lse_a2a_head_major` sends.
+    in one kernel: the ``[H, B]`` FP32 LSE `cp_lse_a2a_head_major` sends, into
+    ``out`` (a contiguous ``[H, B]`` FP32 tensor) when given.
     A select and copies: bit-identical."""
     b, h = cp_attn_lse.shape
-    out = torch.empty((h, b), dtype=torch.float32, device=cp_attn_lse.device)
+    if out is None:
+        out = torch.empty((h, b), dtype=torch.float32, device=cp_attn_lse.device)
     if b == 0 or h == 0:
         return out
     block_b, block_h = 64, min(triton.next_power_of_2(h), 32)
@@ -1192,6 +1200,342 @@ def check_dcp_mailbox_launches() -> None:
                 f"DCP mailbox: ranks captured between {lo} and {hi} mailbox "
                 f"merges (this rank {n}); replay would pair them wrongly. Set "
                 '--dcp-config \'{"comm_backend": "a2a"}\' and report this.'
+            )
+
+
+# ─────────────────────────────── peer-pull head-major prefill merge ──
+#
+# ``ATOM_DCP_PREFILL_PULL``: the BF16 head-major prefill merge of more than 32
+# and at most ``_PULL_MAX_ROWS`` rows, in equal chunks of at most
+# ``_PULL_CHUNK_ROWS``. Each rank projects its partial output straight into
+# its IPC-mapped values buffer ([H, rows, D]) and writes its [H, rows] LSE
+# beside it; after a barrier each rank reads its own heads from every peer's
+# buffers and combines them as ``cp_lse_a2a_head_major`` does, and a second
+# barrier keeps the next chunk or layer from overwriting buffers a peer still
+# reads. Bit-identical to the two all_to_all_single it replaces. The barrier's
+# epoch lives on each rank, so every rank must take the same number of pull
+# merges in the same order -- which a DCP group's prefill does, since every
+# condition below reads only shapes, dtype and the switch;
+# ``check_dcp_prefill_pull_launches`` checks the count after graph capture.
+
+_PULL_WORKSPACES: dict = {}
+# Barriers launched, per workspace: eager and captured alike.
+_PULL_LAUNCHES: dict = {}
+_PULL_MAX_ROWS = 8192
+_PULL_CHUNK_ROWS = 4096
+_PULL_SIGNAL_BYTES = 4096
+
+
+def _pull_key(cp_group, heads, dim):
+    return (id(cp_group), heads, dim)
+
+
+class _DeviceBytes:
+    """``__cuda_array_interface__`` of ``nbytes`` bytes at a raw device address,
+    for a non-owning torch view."""
+
+    def __init__(self, ptr: int, nbytes: int):
+        self.__cuda_array_interface__ = {
+            "shape": (nbytes,),
+            "typestr": "|u1",
+            "data": (ptr, False),
+            "version": 3,
+        }
+
+
+def _all_ranks_ok(ok: bool, group) -> bool:
+    flag = torch.tensor([int(ok)], dtype=torch.int32)
+    torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN, group=group)
+    return bool(flag.item())
+
+
+class _PullWorkspace:
+    """This rank's values, LSE and signal buffers of one (group, heads, dim),
+    and every rank's address of each. Values and LSE are coarse-grained, as
+    hipMalloc's; the signal words are uncached. Kept until the process exits."""
+
+    def __init__(self, cp_group, heads, dim, rows):
+        from aiter.ops.flydsl.ipc_heap import IpcHeap
+
+        self.group = cp_group.cpu_group
+        self.rank, self.ranks = cp_group.rank_in_group, cp_group.world_size
+        self.rows = rows
+        sizes = (heads * rows * dim * 2, heads * rows * 4, _PULL_SIGNAL_BYTES)
+        flags = (
+            IpcHeap._HIP_DEVICE_MALLOC_DEFAULT,
+            IpcHeap._HIP_DEVICE_MALLOC_DEFAULT,
+            IpcHeap._HIP_DEVICE_MALLOC_UNCACHED,
+        )
+        self.nbytes = sum(sizes)
+        self._local, self._opened, handles, failure = [], [], None, None
+        try:
+            for size, flag in zip(sizes, flags):
+                self._local.append(IpcHeap.alloc(size, flag))
+            handles = [IpcHeap.get_mem_handle_bytes(p) for p in self._local]
+        except RuntimeError as error:  # every rank must still reach the agreement
+            failure = error
+        if not _all_ranks_ok(failure is None, self.group):
+            self.close()
+            where = "this" if failure else "another"
+            raise RuntimeError(f"allocation failed on {where} rank") from failure
+        everyone = IpcHeap.gather_object_list_via_broadcast(self.group, handles)
+        addresses = [list(self._local) for _ in range(self.ranks)]  # [rank][buffer]
+        try:
+            for peer, theirs in enumerate(everyone):
+                if peer != self.rank:
+                    for i, handle in enumerate(theirs):
+                        addresses[peer][i] = IpcHeap.open_mem_handle(handle)
+                        self._opened.append(addresses[peer][i])
+        except RuntimeError as error:
+            failure = error
+        # The combine declares the value pointers 16-byte aligned.
+        aligned = all(a[0] % 16 == 0 for a in addresses)
+        if not _all_ranks_ok(failure is None and aligned, self.group):
+            self.close()
+            raise RuntimeError(
+                f"mapping failed on {'this' if failure or not aligned else 'another'} rank"
+            ) from failure
+        device = torch.device("cuda", torch.cuda.current_device())
+        self.values_tab, self.lse_tab, self.signal_tab = (
+            torch.tensor([a[i] for a in addresses], dtype=torch.int64, device=device)
+            for i in range(3)
+        )
+        self.values = torch.as_tensor(
+            _DeviceBytes(self._local[0], sizes[0]), device=device
+        ).view(torch.bfloat16)
+        self.lse = torch.as_tensor(
+            _DeviceBytes(self._local[1], sizes[1]), device=device
+        ).view(torch.float32)
+        torch.cuda.synchronize(device)
+        torch.distributed.barrier(group=self.group)
+
+    def close(self) -> None:
+        from aiter.ops.flydsl.ipc_heap import IpcHeap
+
+        opened, self._opened = self._opened, []
+        for base in opened:
+            IpcHeap.close_mem_handle(base)
+        local, self._local = self._local, []
+        for ptr in local:
+            IpcHeap.free_device_mem(ptr)
+
+
+def _bmm_chunks_keep_bits(heads, dim, lora_rank) -> bool:
+    """Whether aiter's BF16 bmm runs every chunk of a split merge under the
+    config of the whole merge, with one K split: each output tile then sums in
+    the same order, so chunking changes no bit. A merge over _PULL_CHUNK_ROWS
+    rows splits into two chunks of more than half of it."""
+    try:
+        from aiter.ops.triton.gemm.batched import batched_gemm_bf16 as bmm
+
+        if bmm._is_gluon_available():
+            return False
+        configs = {
+            repr(sorted(bmm._get_config(m, dim, lora_rank, B=heads)[0].items()))
+            for m in range(_PULL_CHUNK_ROWS // 2 + 1, _PULL_MAX_ROWS + 1)
+        }
+        one = bmm._get_config(_PULL_MAX_ROWS, dim, lora_rank, B=heads)[0]
+    except Exception as error:  # noqa: BLE001 -- any failure only narrows the pull
+        logger.warning("DCP prefill pull: bmm config probe failed: %s", error)
+        return False
+    return len(configs) == 1 and one.get("NUM_KSPLIT", 1) == 1
+
+
+def prepare_dcp_prefill_pull(cp_group, heads, dim, lora_rank) -> bool:
+    """Create the shared pull workspace of (group, the group's heads, head dim).
+
+    Collective (it maps every rank's buffers): call it on every rank of
+    ``cp_group`` in the same order, before any CUDA graph is captured. Its
+    memory sits outside torch's allocator, so it must exist before the KV cache
+    is sized. Returns False on every rank, and the merge stays on all-to-all,
+    when the memory cannot be allocated or mapped. When the bmm would run a
+    chunk under another config than the whole merge, only merges of at most
+    one chunk take the pull.
+    """
+    key = _pull_key(cp_group, heads, dim)
+    if key in _PULL_WORKSPACES:  # None: tried, and it fell back
+        return _PULL_WORKSPACES[key] is not None
+    _PULL_WORKSPACES[key] = None
+    ranks = cp_group.world_size
+    if ranks < 2 or ranks & (ranks - 1) or heads % ranks:
+        logger.warning(
+            "DCP prefill pull: needs a power-of-two group over 1 dividing the "
+            "heads; got %d ranks for %d heads, merging with all-to-all",
+            ranks,
+            heads,
+        )
+        return False
+    chunks_keep_bits = _bmm_chunks_keep_bits(heads, dim, lora_rank)
+    try:
+        ws = _PullWorkspace(cp_group, heads, dim, _PULL_CHUNK_ROWS)
+    except RuntimeError as error:
+        logger.warning(
+            "DCP prefill pull peer memory: %s; merging with all-to-all", error
+        )
+        return False
+    ws.max_rows = _PULL_MAX_ROWS if chunks_keep_bits else _PULL_CHUNK_ROWS
+    _PULL_WORKSPACES[key] = ws
+    logger.info(
+        "DCP prefill pull merge ready: %d heads x %d, up to %d rows in chunks of "
+        "%d, %.1f MB of peer memory a rank",
+        heads,
+        dim,
+        ws.max_rows,
+        ws.rows,
+        ws.nbytes / 1e6,
+    )
+    return True
+
+
+@triton.jit
+def _dcp_pull_barrier_kernel(signal_tab, rank, N_RANKS: tl.constexpr):
+    """Return once every rank has launched this barrier as often as this one.
+    Each rank bumps its epoch (word 0 of its signal buffer), stores it into its
+    slot of every rank's buffer (release, system scope), then polls its own
+    slots until every rank's epoch caught up."""
+    n = tl.arange(0, N_RANKS)
+    me = tl.load(signal_tab + rank).to(tl.pointer_type(tl.int32))
+    epoch = tl.load(me, volatile=True) + 1
+    tl.store(me, epoch)
+    peers = tl.load(signal_tab + n).to(tl.pointer_type(tl.int32))
+    tl.atomic_xchg(
+        peers + 64 + rank * 16,
+        tl.zeros([N_RANKS], dtype=tl.int32) + epoch,
+        sem="release",
+        scope="sys",
+    )
+    mine = me + 64 + n * 16
+    zero = tl.zeros([N_RANKS], dtype=tl.int32)
+    seen = tl.atomic_add(mine, zero, sem="acquire", scope="sys")
+    while tl.min(seen - epoch, axis=0) < 0:
+        seen = tl.atomic_add(mine, zero, sem="acquire", scope="sys")
+
+
+@triton.jit
+def _dcp_pull_combine_kernel(
+    values_tab,  # [N] int64: each rank's [H, rows, HEAD_DIM] BF16 values
+    lse_tab,  # [N] int64: each rank's [H, rows] FP32 LSE
+    out_ptr,
+    rows,
+    head0,
+    out_stride_b,
+    out_stride_h,
+    N_RANKS,
+    HEAD_DIM: tl.constexpr,
+    N_ROUNDED: tl.constexpr,
+):
+    """``_dcp_a2a_combine_kernel`` (LSE_PACK=1, no LSE out) for one (row, head),
+    reading each rank's record from its buffers.
+
+    The value pointers must carry their 16-byte alignment: without it Triton
+    lays the [N, D] tile out otherwise, and the N-term sums run in another
+    order than ``_dcp_a2a_combine_kernel``'s. They must stay raw 64-bit
+    pointers: as offsets from a pointer argument the AMD backend turns them
+    into 32-bit buffer offsets, and peers lie far apart."""
+    b = tl.program_id(0).to(tl.int64)
+    h = tl.program_id(1).to(tl.int64)
+    n = tl.arange(0, N_ROUNDED)
+    valid = n < N_RANKS
+    n_safe = tl.where(valid, n, 0).to(tl.int64)
+    row = (head0 + h) * rows + b
+    vbase = tl.multiple_of(
+        tl.load(values_tab + n_safe).to(tl.pointer_type(tl.bfloat16)), 16
+    )
+    lbase = tl.load(lse_tab + n_safe).to(tl.pointer_type(tl.float32))
+    lse = tl.load(lbase + row, mask=valid, other=float("-inf"))
+    lse = lse.to(tl.float32)
+    lse_is_nan = lse != lse  # noqa: PLR0124
+    lse = tl.where(lse_is_nan | (lse == float("inf")), float("-inf"), lse)
+    lse_max = tl.max(lse, axis=0)
+    lse_max = tl.where(lse_max == float("-inf"), 0.0, lse_max)
+    global_lse = tl.log(tl.sum(tl.exp(lse - lse_max), axis=0)) + lse_max
+    factor = tl.exp(lse - global_lse)
+    factor = tl.where((factor != factor) | (~valid), 0.0, factor)  # noqa: PLR0124
+    d = tl.arange(0, HEAD_DIM)
+    vals = tl.load(
+        vbase[:, None] + row * HEAD_DIM + d[None, :], mask=valid[:, None], other=0.0
+    ).to(tl.float32)
+    vals = tl.where(factor[:, None] == 0.0, 0.0, vals)
+    acc = tl.sum(vals * factor[:, None], axis=0)
+    tl.store(
+        out_ptr + b * out_stride_b + h * out_stride_h + d,
+        acc.to(out_ptr.dtype.element_ty),
+    )
+
+
+def _pull_barrier(ws, key) -> None:
+    _PULL_LAUNCHES[key] = _PULL_LAUNCHES.get(key, 0) + 1
+    _dcp_pull_barrier_kernel[(1,)](ws.signal_tab, ws.rank, N_RANKS=ws.ranks)
+
+
+def dcp_prefill_pull_project_merge(x, w_v, cp_attn_lse, cp_group, owned_counts, bmm):
+    """``cp_lse_a2a_head_major(bmm(x, w_v), cp_attn_lse, cp_group,
+    owned_counts=owned_counts)`` through the pull workspace, bit for bit, or
+    None when this call cannot take it.
+
+    ``x`` is the group's ``[H, rows, kv_lora_rank]`` BF16 attention output,
+    ``w_v`` the group's ``[H, D, kv_lora_rank]`` V projection and
+    ``bmm(x, w_v, YQ=y)`` the batched GEMM that writes ``[H, rows, D]`` into ``y``.
+    """
+    heads, rows, _ = x.shape
+    dim = w_v.shape[1]
+    key = _pull_key(cp_group, heads, dim)
+    ws = _PULL_WORKSPACES.get(key)
+    if (
+        ws is None
+        or not 32 < rows <= ws.max_rows
+        or x.dtype != torch.bfloat16
+        or w_v.dtype != torch.bfloat16
+    ):
+        return None
+    h_local = heads // ws.ranks
+    out = torch.empty((rows, h_local, dim), dtype=torch.bfloat16, device=x.device)
+    step = triton.cdiv(rows, triton.cdiv(rows, ws.rows))
+    for r0 in range(0, rows, step):
+        n = min(step, rows - r0)
+        bmm(x[:, r0 : r0 + n], w_v, YQ=ws.values[: heads * n * dim].view(heads, n, dim))
+        dcp_head_major_lse(
+            cp_attn_lse[r0 : r0 + n],
+            None if owned_counts is None else owned_counts[r0 : r0 + n],
+            out=ws.lse[: heads * n].view(heads, n),
+        )
+        _pull_barrier(ws, key)
+        _dcp_pull_combine_kernel[(n, h_local)](
+            ws.values_tab,
+            ws.lse_tab,
+            out[r0:],
+            n,
+            ws.rank * h_local,
+            out.stride(0),
+            out.stride(1),
+            ws.ranks,
+            HEAD_DIM=dim,
+            N_ROUNDED=triton.next_power_of_2(ws.ranks),
+        )
+        _pull_barrier(ws, key)
+    return out
+
+
+def check_dcp_prefill_pull_launches() -> None:
+    """Raise unless every rank of each pull workspace's group launched the same
+    number of barriers. A barrier pairs with the same barrier on every peer, so
+    a rank one ahead would read buffers its peers are still writing, and the
+    last barrier would hang. Collective: call on every rank after graph
+    capture."""
+    for key, ws in _PULL_WORKSPACES.items():
+        if ws is None:
+            continue
+        n = _PULL_LAUNCHES.get(key, 0)
+        t = torch.tensor([n, -n], dtype=torch.int64, device="cpu")
+        torch.distributed.all_reduce(
+            t, op=torch.distributed.ReduceOp.MIN, group=ws.group
+        )
+        lo, hi = t[0].item(), -t[1].item()
+        if lo != hi:
+            raise RuntimeError(
+                f"DCP prefill pull: ranks launched between {lo} and {hi} merge "
+                f"barriers (this rank {n}); later merges would pair them wrongly. "
+                "Unset ATOM_DCP_PREFILL_PULL and report this."
             )
 
 

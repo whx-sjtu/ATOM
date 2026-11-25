@@ -592,6 +592,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the whole gathered q back to token-major; this removes both. Costs a
     # group-wide q GEMM + W_K bmm per prefill token. Off by default.
     "ATOM_DCP_PREFILL_QREP": lambda: os.getenv("ATOM_DCP_PREFILL_QREP", "0") == "1",
+    # DCP BF16 head-major prefill merge of more than 32 and at most 8192 rows:
+    # each rank projects its partial output and writes its LSE into its own
+    # IPC-mapped buffers, and pulls its heads from every peer's buffers between
+    # two device-side barriers, in place of cp_lse_a2a_head_major's two
+    # all_to_all_single. Bit-identical to them. Maps about 102 MB of peer memory
+    # a rank at model build (dcp_ops.prepare_dcp_prefill_pull). Off by default.
+    "ATOM_DCP_PREFILL_PULL": lambda: os.getenv("ATOM_DCP_PREFILL_PULL", "0") == "1",
     # Row-parallel DSA prefill under DCP (atom/model_ops/dsa_row_parallel.py):
     # a sparse prefill step of at least _MIN_TOKENS new tokens splits its rows
     # across the DCP group instead of replicating the query side: each rank

@@ -4588,6 +4588,11 @@ class ModelRunner:
 
             check_dcp_mailbox_launches()
 
+        if envs.ATOM_DCP_PREFILL_PULL:
+            from atom.model_ops.dcp_ops import check_dcp_prefill_pull_launches
+
+            check_dcp_prefill_pull_launches()
+
         # How much GPU memory the CUDA graph capture consumed (pool = reserved
         # delta; the allocated delta is what the graphs pin live).
         _pool_bytes = max(torch.cuda.memory_reserved() - _rsv_before_capture, 0)
