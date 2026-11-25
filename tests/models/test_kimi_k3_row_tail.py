@@ -2009,3 +2009,175 @@ def test_mla_o_proj_runs_through_the_op(
         assert held == [y] and y._padded_rows_of.shape == (16, HIDDEN)
         assert torch.equal(_bits([y])[0], _bits([plain])[0])
         assert layer.self_attn.o_proj.calls == [True, False]
+
+
+# ---- ATOM_KIMI_K3_ROW_TAIL_OWNED_MIX (PKDA S2c): a rank whose rows run past
+# T mixes its real rows in place instead of padding its prefix and bank rows.
+
+
+def _attn_res_into(
+    prefix, bank, score_weight, eps, add, norm, out_eps, blocks, out, pref
+):
+    """`apply_attn_res_into` as the torch reference (row by row, so a slice of
+    rows gives the rows of the full mix)."""
+    _events.log.append(("attn_res_into", prefix.shape[0]))
+    assert bank.stride(-1) == 1 and out.is_contiguous()
+    y, summed = _torch_attn_res(
+        prefix, bank, score_weight, eps, add, norm, out_eps, None, None, blocks
+    )
+    out.copy_(y)
+    if add is None:
+        assert pref is None
+    else:
+        pref.copy_(summed)
+
+
+@pytest.fixture
+def owned_mix(logged, monkeypatch):
+    monkeypatch.setattr(kimi_k3_ops, "apply_attn_res_into", _attn_res_into)
+    pad_rows, local = sequence_parallel._pad_rows, threading.local()
+
+    def recorded(x, missing):
+        if missing and hasattr(local, "shard_pads"):
+            local.shard_pads.append((x.dim(), x.shape[0] + missing))
+        return pad_rows(x, missing)
+
+    monkeypatch.setattr(sequence_parallel, "_pad_rows", recorded)
+    return local
+
+
+def _owned_layers(monkeypatch, layer_num, attention=None):
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_TAIL_OWNED_MIX", "1")
+    layers = _layers(layer_num, attention)
+    monkeypatch.delenv("ATOM_KIMI_K3_ROW_TAIL_OWNED_MIX")
+    return layers
+
+
+def _real_rows(tokens, rank):
+    chunk = -(-tokens // WORLD)
+    return chunk, max(0, min(chunk, tokens - rank * chunk))
+
+
+def test_owned_mix_is_off_unless_1(monkeypatch):
+    monkeypatch.delenv("ATOM_KIMI_K3_ROW_TAIL_OWNED_MIX", raising=False)
+    from atom.utils import envs
+
+    assert envs.ATOM_KIMI_K3_ROW_TAIL_OWNED_MIX is False
+    assert not any(layer.owned_mix for layer in _layers(4))
+    assert all(layer.owned_mix for layer in _owned_layers(monkeypatch, 4))
+
+
+@pytest.mark.parametrize("layer_num", [4, 5], ids=["block-closes", "mid-block"])
+@pytest.mark.parametrize("tokens", [8, 13, 1027])
+def test_owned_mix_keeps_the_row_tail_bit_for_bit(
+    logged, owned_mix, monkeypatch, tokens, layer_num
+):
+    """The short ranks mix only their real rows, read in place: no prefix or
+    window shard is padded, every output bit stays, and every other rank (and
+    every step without pad rows) runs exactly as before."""
+    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "4")
+    layers = _owned_layers(monkeypatch, layer_num)
+    inputs = _inputs(tokens)
+
+    def forward(rank):
+        owned_mix.shard_pads = []
+        out = layers[rank](None, *(x.clone() for x in inputs))
+        return out, owned_mix.shard_pads
+
+    for layer in layers:
+        layer.owned_mix = False
+    base = logged(forward)
+    for layer in layers:
+        layer.owned_mix = True
+    got = logged(forward)
+
+    closes = layer_num % BLOCK == 0
+    for rank, (((want, want_pads), want_log), ((out, pads), log)) in enumerate(
+        zip(base, got)
+    ):
+        chunk, real = _real_rows(tokens, rank)
+        # Shards pad to a rank's row count, reduce-scatter inputs to all rows.
+        want_pads = [d for d, n in want_pads if n == chunk]
+        pads = [d for d, n in pads if n == chunk]
+        assert all(map(torch.equal, _bits(out), _bits(want)))
+        assert not out[0].isnan().any()
+        if real == chunk:
+            assert log == want_log and pads == want_pads
+            continue
+        # Off: the short rank padded its window (and prefix, mid-block) shards.
+        assert want_pads == ([3] if closes else [2, 3])
+        assert pads == []
+        mix = ("attn_res", chunk)
+        swapped = [("attn_res_into", real)] if real else []
+        i = want_log.index(mix, 1)  # the first mix is the input site's
+        assert log == want_log[:i] + swapped + want_log[i + 1 :]
+
+
+@pytest.mark.parametrize("first", [BLOCK - 1, BLOCK], ids=["mix-closes", "mid-block"])
+@pytest.mark.parametrize("tokens", [13, 1027])
+def test_owned_mix_keeps_the_resident_stack_bit_for_bit(
+    resident, owned_mix, o_proj_slot, monkeypatch, tokens, first
+):
+    """With S2's resident rows and S2b's padded o_proj as well: all three on
+    against S2 alone, bit for bit."""
+    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "4")
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_TAIL_OWNED_MIX", "1")
+    monkeypatch.setenv("ATOM_KIMI_K3_O_PROJ_PADDED_OUT", "1")
+    model = resident.build(first, _PaddedAttention)
+    monkeypatch.delenv("ATOM_KIMI_K3_ROW_TAIL_OWNED_MIX")
+    monkeypatch.delenv("ATOM_KIMI_K3_O_PROJ_PADDED_OUT")
+    resident.link(model)
+    layers = [layer for a, b, _ in model for layer in (a, b)]
+
+    def switch(on):
+        _set_padded_out(layers, on)
+        for layer in layers:
+            layer.owned_mix = on
+
+    switch(False)
+    base = resident.forward(model, _inputs(tokens))
+    switch(True)
+    got = resident.forward(model, _inputs(tokens))
+    for rank, ((want, _), (have, log)) in enumerate(zip(base, got)):
+        hidden, aggregate, aux, (residual, _, _, bank) = have
+        assert torch.equal(hidden, want[0]) and not hidden.isnan().any()
+        assert torch.equal(aggregate, want[1]) and torch.equal(aux, want[2])
+        for kept_rows, want_rows in ((residual, want[3][0]), (bank, want[3][3])):
+            assert torch.equal(
+                _owned(tokens, rank, kept_rows), _owned(tokens, rank, want_rows)
+            )
+        chunk, real = _real_rows(tokens, rank)
+        assert log.count(("attn_res_into", real)) == (2 if 0 < real < chunk else 0)
+
+
+@pytest.mark.parametrize(
+    "case", ["disabled", "no-window", "fp8-out", "fp32-rows", "resident"]
+)
+def test_owned_mix_keeps_other_mixes_as_they_are(logged, owned_mix, monkeypatch, case):
+    """A mix that is not the plain BF16 kernel with one addend (residuals off,
+    no candidates, a fused quant, other dtypes, a resident link) runs as
+    before, padded shards included."""
+    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "4")
+    layers = _owned_layers(monkeypatch, 5)
+    rank = WORLD - 1
+    layer = layers[rank]
+    site = layer.mlp_attn_res
+    x, bank, *_ = _inputs(13)
+    window = site.window(bank)
+    prefix = x
+    if case == "disabled":
+        monkeypatch.setattr(site, "enabled", False)
+    elif case == "no-window":
+        window = None
+    elif case == "fp8-out":
+        monkeypatch.setattr(
+            type(site), "out_quant_dtype", property(lambda self: torch.float8_e4m3fn)
+        )
+    elif case == "fp32-rows":
+        prefix = x.float()
+    elif case == "resident":
+        site.resident_from = "somewhere"
+    assert not layer._owned_mix_fits(prefix, window, x)
+    assert layer._owned_mix_fits(x, site.window(bank), x) == (
+        case not in ("disabled", "fp8-out", "resident")
+    )

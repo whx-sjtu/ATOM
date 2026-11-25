@@ -1558,6 +1558,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_K3_O_PROJ_PADDED_OUT": lambda: (
         os.getenv("ATOM_KIMI_K3_O_PROJ_PADDED_OUT", "0") == "1"
     ),
+    # On a row-sharded step with pad rows, the rank whose rows run past the
+    # step's end (the last) mixes the MoE input of its real rows only, reading
+    # its prefix and bank rows in place, into buffers of its row count whose
+    # pad rows are zero, instead of first copying those rows into padded ones.
+    # Bit-identical output. Read at construction. Off by default.
+    "ATOM_KIMI_K3_ROW_TAIL_OWNED_MIX": lambda: (
+        os.getenv("ATOM_KIMI_K3_ROW_TAIL_OWNED_MIX", "0") == "1"
+    ),
     # The next residual mix reads a row-sharded step's zero addends as one zero row.
     # Bit-identical output. On by default; 0 reads the zero tensors themselves.
     "ATOM_KIMI_K3_ATTN_RES_SKIP_ZERO_ADDENDS": lambda: (

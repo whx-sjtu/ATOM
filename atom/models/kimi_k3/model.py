@@ -187,6 +187,14 @@ def _log_o_proj_rows(taken: bool):
 
 
 @lru_cache(maxsize=1)
+def _log_row_tail_owned_mix():
+    logging.getLogger("atom").info(
+        "Kimi-K3 row tail: the last rank mixes its real rows in place, "
+        "without padding its prefix and bank rows first"
+    )
+
+
+@lru_cache(maxsize=1)
 def _log_row_tail_resident():
     logging.getLogger("atom").info(
         "Kimi-K3 row tail: the residual stays on its rows; the next residual "
@@ -3338,6 +3346,7 @@ class KimiDecoderLayer(nn.Module):
         # `kimi_k3_post_attention_forward`, which reduces it: an all-reduce, or
         # on a row-sharded step a reduce-scatter.
         self.layer_name = prefix
+        self.owned_mix = envs.ATOM_KIMI_K3_ROW_TAIL_OWNED_MIX
         self.post_attention_op = (
             hasattr(self, "block_sparse_moe") and self.block_sparse_moe.row_shardable
         )
@@ -3517,10 +3526,8 @@ class KimiDecoderLayer(nn.Module):
             return self._mlp(attn_out, prefix_sum, block_residual)
         rows = moe.row_shards(attn_partial.shape[0])
         window = self.mlp_attn_res.window(block_residual)
-        hidden_rows, prefix_rows = self.mlp_attn_res(
-            None if prefix_sum is None else rows.shard(prefix_sum),
-            None if window is None else rows.shard(window),
-            rows.scatter(_take_o_proj_rows(attn_partial)),
+        hidden_rows, prefix_rows = self._row_tail_mlp_mix(
+            rows, prefix_sum, window, attn_partial
         )
         if moe.resident_rows:
             residual = moe.row_sharded_moe(
@@ -3552,6 +3559,94 @@ class KimiDecoderLayer(nn.Module):
         )
         torch.cuda.current_stream().wait_stream(alt)
         return residual, *register_zero_addends(tuple(pair))
+
+    def _row_tail_mlp_mix(
+        self,
+        rows,
+        prefix_sum: torch.Tensor | None,
+        window: torch.Tensor | None,
+        attn_partial: torch.Tensor,
+    ):
+        """Reduce-scatter o_proj's partial and run `mlp_attn_res` on this
+        rank's rows of a row-sharded step: ``(hidden_rows, prefix_rows)``,
+        each of `rows.chunk` rows.
+
+        Under ATOM_KIMI_K3_ROW_TAIL_OWNED_MIX a rank whose rows run past T (the
+        last, on a step with pad rows) mixes only its real rows, reading its
+        prefix and bank rows in place, into buffers whose pad rows are zero,
+        instead of padding copies of those rows first. Each real row runs the
+        same kernel on the same values; pad rows reach no real row (the gather
+        drops them, and a resident tail reads real rows only)."""
+        site = self.mlp_attn_res
+        real = max(0, min(rows.chunk, rows.num_tokens - rows.start))
+        if not (
+            self.owned_mix
+            and real < rows.chunk
+            and self._owned_mix_fits(prefix_sum, window, attn_partial)
+        ):
+            return site(
+                None if prefix_sum is None else rows.shard(prefix_sum),
+                None if window is None else rows.shard(window),
+                rows.scatter(_take_o_proj_rows(attn_partial)),
+            )
+        from atom.model_ops.kimi_k3 import apply_attn_res_into
+
+        _log_row_tail_owned_mix()
+        attn_rows = rows.scatter(_take_o_proj_rows(attn_partial))
+        if site.score_weight is None:  # loader hook did not run (plugin hosts)
+            site.process_weights_after_loading()
+        hidden_rows = attn_rows.new_empty(attn_rows.shape)
+        hidden_rows[real:].zero_()
+        if prefix_sum is None:
+            # A closed block starts its sum from the attention rows themselves.
+            prefix, add, prefix_rows, prefix_out = (
+                attn_rows[:real],
+                None,
+                attn_rows,
+                None,
+            )
+        else:
+            prefix_rows = attn_rows.new_empty(attn_rows.shape)
+            prefix_rows[real:].zero_()
+            prefix, add = rows.owned(prefix_sum), attn_rows[:real]
+            prefix_out = prefix_rows[:real]
+        if real:
+            apply_attn_res_into(
+                prefix,
+                rows.owned(window),
+                site.score_weight,
+                site.eps,
+                add,
+                None if site.out_norm is None else site.out_norm.weight,
+                site.out_eps,
+                site.num_blocks,
+                hidden_rows[:real],
+                prefix_out,
+            )
+        return hidden_rows, prefix_rows
+
+    def _owned_mix_fits(
+        self,
+        prefix_sum: torch.Tensor | None,
+        window: torch.Tensor | None,
+        attn_partial: torch.Tensor,
+    ) -> bool:
+        """Whether `mlp_attn_res` would run its BF16 kernel with one addend
+        at most: candidates to mix, a BF16 output (no fused quant), BF16
+        rows, a unit-stride bank and no resident link."""
+        site = self.mlp_attn_res
+        return (
+            site.enabled
+            and not site.resident_from
+            and window is not None
+            and window.shape[1] > 0
+            and window.stride(-1) == 1
+            and site.out_quant_dtype is None
+            and isinstance(attn_partial, torch.Tensor)
+            and attn_partial.dtype == torch.bfloat16
+            and (prefix_sum is None or prefix_sum.dtype == torch.bfloat16)
+            and (prefix_sum is None or prefix_sum.is_contiguous())
+        )
 
     def _zero_addends_stream(self, like: torch.Tensor) -> torch.cuda.Stream | None:
         """The stream that writes a row-sharded step's zero addends while the

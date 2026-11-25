@@ -1108,6 +1108,41 @@ def apply_attn_res(
     )
 
 
+def apply_attn_res_into(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+    add_hidden: torch.Tensor | None,
+    out_norm_weight: torch.Tensor | None,
+    out_eps: float,
+    num_blocks: int | None,
+    out: torch.Tensor,
+    prefix_out: torch.Tensor | None,
+) -> None:
+    """The BF16 mix `apply_attn_res` runs with at most one addend, written
+    into ``out`` (and, with ``add_hidden``, its sum into ``prefix_out``):
+    a row tail's mix of only the real rows of a rank whose rows run past T.
+
+    The BF16 layout is keyed on the step kind rather than on T and the
+    kernel runs each row on its own, so each row comes out as the full mix
+    makes it. For use inside an opaque op."""
+    if prefix_sum.dtype != torch.bfloat16:
+        raise ValueError("row mixes are BF16")
+    _apply_attn_res_impl(
+        prefix_sum,
+        block_residual,
+        score_weight,
+        eps,
+        add_hidden,
+        out_norm_weight=out_norm_weight,
+        out_eps=out_eps,
+        num_blocks=num_blocks,
+        out=out,
+        prefix_out=prefix_out,
+    )
+
+
 def apply_attn_res_rows(
     prefix_sum: torch.Tensor,
     block_residual: torch.Tensor,
