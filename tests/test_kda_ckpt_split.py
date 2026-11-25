@@ -21,6 +21,13 @@ from aiter_stub import atom_without_aiter
 SWITCH = "ATOM_KDA_PREFILL_CKPT_SPLIT"
 
 
+@pytest.fixture(autouse=True)
+def _no_tail_recurrence(monkeypatch):
+    # INT5 turns ATOM_PFX_KDA_TAIL_RECURRENT on (6); the stub FlashKDA here cannot
+    # run the token recurrence, and these tests are about the split, so it is off.
+    monkeypatch.setenv("ATOM_PFX_KDA_TAIL_RECURRENT", "0")
+
+
 @pytest.fixture(scope="module")
 def k3():
     with atom_without_aiter() as load:

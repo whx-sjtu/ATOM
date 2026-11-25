@@ -105,7 +105,9 @@ def test_hash_keys_the_qkvg_front_only_where_the_front_is(monkeypatch):
         return _hash(parallel_config=parallel, decode_context_parallel_size=dcp)
 
     assert hashed("1") != hashed("0")
-    assert hashed(None) == hashed("0") == hashed("0", skip="1")
+    # INT5: QKVG on by default, so the unset switch keys like "1"
+    assert hashed(None) == hashed("1")
+    assert hashed("0") == hashed("0", skip="1")
     assert hashed("1", front="0") == hashed("0", front="0")
     assert hashed("1", dcp=1) == hashed("0", dcp=1)
 
