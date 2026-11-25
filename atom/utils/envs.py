@@ -674,6 +674,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DMLA_GATE_IN_MERGE": lambda: (
         os.getenv("ATOM_DMLA_GATE_IN_MERGE", "1") == "1"
     ),
+    # Kimi-K3's sparse layers under DCP run their front (fused_qkv_a, the q_a /
+    # kv_a norms, the indexer's wq_b) in the opaque `kimi_k3_dsa_front` op on
+    # every step (ATOM_DSA_ROW_PARALLEL_PREFILL_FRONT). With this, a step of at
+    # most 48 rows runs fused_qkv_a and g_proj -- two BF16 GEMMs of the same
+    # hidden rows -- as one GEMM over [fused_qkv_a | g_proj], a weight both
+    # projections' become views of (no extra memory). Needs aiter's Kimi BF16
+    # table rows for N = 3808, K = 7168; without them aiter's untuned default
+    # runs, slower than the two. Numerics change on those steps (another GEMM
+    # kernel); longer steps run the two GEMMs as before. Off by default.
+    "ATOM_FUSB_QKVG": lambda: os.getenv("ATOM_FUSB_QKVG", "0") == "1",
+    # That front also projects the indexer's q (wq_b) on a step the mono
+    # indexer launch serves, which projects q_a itself and never reads it. With
+    # this, such a step skips the GEMM. Bit-exact. Off by default.
+    "ATOM_FUSB_SKIP_WQB": lambda: os.getenv("ATOM_FUSB_SKIP_WQB", "0") == "1",
     # DCP sparse decode: kernel that merges the exchanged top-k candidates into
     # this rank's owned KV slots. "aiter" (default) is flydsl_dcp_topk_merge;
     # "atom" is atom/model_ops/dcp_topk_merge.py. Same output bit for bit.

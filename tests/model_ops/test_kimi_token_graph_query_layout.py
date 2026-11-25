@@ -3,6 +3,7 @@
 
 import ast
 import functools
+import logging
 import sys
 import threading
 from contextlib import contextmanager
@@ -160,7 +161,10 @@ def runtime(monkeypatch):
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
     envs = SimpleNamespace(
-        ATOM_DSA_ROW_PARALLEL_PREFILL=False, ATOM_DSA_ROW_PARALLEL_PREFILL_FRONT=True
+        ATOM_DSA_ROW_PARALLEL_PREFILL=False,
+        ATOM_DSA_ROW_PARALLEL_PREFILL_FRONT=True,
+        ATOM_FUSB_QKVG=False,
+        ATOM_FUSB_SKIP_WQB=False,
     )
     normed = []
 
@@ -186,7 +190,9 @@ def runtime(monkeypatch):
         "_is_e8m0_blockscale": lambda *args: False,
         "qrep_tp_override": lambda *args: {},
         "QuantType": quant,
-        "dtypes": SimpleNamespace(fp8=fp8, fp4x2=fp4),
+        "dtypes": SimpleNamespace(fp8=fp8, fp4x2=fp4, bf16=torch.bfloat16),
+        "logging": logging,
+        "lru_cache": functools.lru_cache,
         "_RMS_FUSABLE_QUANT_TYPES": (),
         "is_plugin_mode": lambda: mode.plugin,
         "effective_layer_quant": lambda config, prefix: (
@@ -213,6 +219,12 @@ def runtime(monkeypatch):
         {"_text_config", "KimiFullAttention", "_linear_into"},
         namespace,
         {"__init__", "dsa_front", "_gated_core"},
+    )
+    # ATOM_FUSB_QKVG's merge, whole (its class attributes too).
+    _load(
+        "atom/models/kimi_k3/model.py",
+        {"_QkvgMerge", "_qkvg_refusal", "_mono_serves", "_log_qkvg_merged"},
+        namespace,
     )
     receiver = {
         "torch": torch,
@@ -541,6 +553,223 @@ def test_gated_core_takes_the_front_from_its_op(runtime):
     k, weights = kw["projected_k_weights"]
     assert torch.equal(k, outs[0][:, 10:14]) and torch.equal(weights, outs[0][:, 14:])
     assert kw["projected_q"] is outs[3]
+
+
+def _qkvg(runtime):
+    """`_front` under ATOM_FUSB_QKVG: BF16 integer weights (exact whatever
+    the summation order), a g_proj, and aiter's GEMM recorded. The merge's
+    post-load hook is the test's to run."""
+    runtime.envs.ATOM_FUSB_QKVG = True
+    owner, _, calls = _front(runtime)
+    g = torch.Generator().manual_seed(1)
+
+    def ints(*shape):
+        return torch.randint(-3, 4, shape, generator=g).to(torch.bfloat16)
+
+    owner.fused_qkv_a_proj = _Linear(ints(16, 8), calls, "fused")
+    owner.g_proj = _Linear(ints(6, 8), calls, "g")
+    owner.indexer.wq_b = _Linear(ints(8, 4), calls, "wq_b")
+    for norm in (owner.q_a_layernorm, owner.kv_a_layernorm):
+        norm.weight = ints(4)
+    for lin in (owner.fused_qkv_a_proj, owner.g_proj):
+        lin.runs_bf16, lin.bias, lin.prefix = True, None, lin.name
+        lin.quant_type = runtime.namespace["QuantType"].No
+
+    def mm(x, w, bias, otype):
+        assert bias is None and otype is torch.bfloat16
+        calls.append(("tgemm", x.shape[0], w.shape[0]))
+        return x @ w.T
+
+    runtime.namespace["tgemm"] = SimpleNamespace(mm=mm)
+    runtime.ctx.attn_metadata.dsa_row_parallel = None
+    return owner, ints(8, 8), calls
+
+
+def test_the_qkvg_merge_makes_both_weights_views_of_one(runtime):
+    owner, _, _ = _qkvg(runtime)
+    a, g = owner.fused_qkv_a_proj.weight.clone(), owner.g_proj.weight.clone()
+    merge = owner._qkvg_merge
+    # The loader's parent-first walk reaches it after every projection.
+    assert list(dict(owner.named_children()))[-1] == "_qkvg_merge"
+    assert not list(merge.children()) and not merge.ready
+    merge.process_weights_after_loading()
+    assert merge.ready and (merge.split, merge.width) == (16, 22)
+    assert torch.equal(merge.weight, torch.cat([a, g]))
+    assert owner.fused_qkv_a_proj.weight.data_ptr() == merge.weight.data_ptr()
+    assert owner.g_proj.weight.data_ptr() == merge.weight[16:].data_ptr()
+    assert torch.equal(owner.fused_qkv_a_proj.weight, a)
+    assert torch.equal(owner.g_proj.weight, g)
+
+
+@pytest.mark.parametrize(
+    "change", ["bias", "shuffled", "fp32", "padded", "gate_quant", "rows"]
+)
+def test_a_refused_qkvg_merge_keeps_the_two_weights(runtime, change):
+    owner, _, _ = _qkvg(runtime)
+    a, g = owner.fused_qkv_a_proj, owner.g_proj
+    if change == "bias":
+        g.bias = torch.zeros(6)
+    elif change == "shuffled":
+        a.weight.is_shuffled = True
+    elif change == "fp32":
+        g.weight = g.weight.float()
+    elif change == "padded":
+        g.is_output_padded = True
+    elif change == "gate_quant":
+        owner.fuse_sigmoid_mul_quant = True
+    else:
+        a.weight = a.weight[:12]
+    wa, wg = a.weight, g.weight
+    owner._qkvg_merge.process_weights_after_loading()
+    assert not owner._qkvg_merge.ready and owner._qkvg_merge.weight is None
+    assert a.weight is wa and g.weight is wg
+
+
+def test_a_short_step_runs_one_gemm_over_the_merged_weight(runtime):
+    owner, hidden, calls = _qkvg(runtime)
+    owner._qkvg_merge.process_weights_after_loading()
+    calls.clear()
+    both, q, kv, index_q = owner.dsa_front(hidden, with_gate=True)
+    full = hidden @ owner.fused_qkv_a_proj.weight.T
+    assert both.shape == (8, 22) and both.is_contiguous()
+    assert torch.equal(both[:, :16], full)
+    assert torch.equal(both[:, 16:], hidden @ owner.g_proj.weight.T)
+    assert torch.equal(q, full[:, :4] * owner.q_a_layernorm.weight)
+    assert torch.equal(kv, full[:, 4:8] * owner.kv_a_layernorm.weight)
+    assert torch.equal(index_q, q @ owner.indexer.wq_b.weight.T)
+    assert calls == [("tgemm", 8, 22), ("wq_b", 8, False)]
+
+
+def test_a_longer_step_runs_the_two_gemms_into_the_same_layout(runtime):
+    owner, hidden, calls = _qkvg(runtime)
+    merge = owner._qkvg_merge
+    merge.process_weights_after_loading()
+    short = owner.dsa_front(hidden, with_gate=True)
+    merge.MAX_ROWS = 7
+    calls.clear()
+    longer = owner.dsa_front(hidden, with_gate=True)
+    assert calls == [("fused", 8, False), ("g", 8, False), ("wq_b", 8, False)]
+    for got, want in zip(longer, short):
+        assert got.shape == want.shape and got.is_contiguous()
+        assert torch.equal(got, want)
+
+
+def test_the_plain_front_op_keeps_its_calls_beside_the_merge(runtime):
+    owner, hidden, calls = _qkvg(runtime)
+    owner._qkvg_merge.process_weights_after_loading()
+    calls.clear()
+    projected, *_ = owner.dsa_front(hidden)
+    assert projected.shape == (8, 16)
+    assert torch.equal(projected, hidden @ owner.fused_qkv_a_proj.weight.T)
+    assert calls == [("fused", 8, False), ("wq_b", 8, False)]
+
+
+def test_a_front_step_carries_every_rows_gate(runtime):
+    owner, hidden, calls = _qkvg(runtime)
+    owner._qkvg_merge.process_weights_after_loading()
+    full = owner.dsa_front(hidden, with_gate=True)
+    runtime.ctx.attn_metadata.dsa_row_parallel = SimpleNamespace(
+        front=True, first=2, end=5
+    )
+    calls.clear()
+    got = owner.dsa_front(hidden, with_gate=True)
+    own = slice(2, 5)
+    assert got[0].shape == (8, 22) and got[0].is_contiguous()
+    assert torch.equal(got[0][own], full[0][own])
+    assert torch.equal(got[0][:, 10:14], full[0][:, 10:14])
+    assert torch.equal(got[0][:, 16:], full[0][:, 16:])
+    assert calls[-1] == ("g", 8, False)
+
+
+@pytest.mark.parametrize("served", [False, True])
+def test_the_front_skips_wq_b_on_a_step_the_launch_serves(runtime, served):
+    runtime.envs.ATOM_FUSB_SKIP_WQB = True
+    owner, hidden, calls = _front(runtime)
+    assert owner._front_skips_wq_b
+    asked = []
+    runtime.namespace["_mono_serves"] = lambda m: asked.append(m) or served
+    runtime.ctx.attn_metadata.dsa_row_parallel = None
+    projected, q, kv, index_q = owner.dsa_front(hidden)
+    assert asked == [owner.indexer]
+    assert index_q.shape == (8, 8) and index_q.dtype == hidden.dtype
+    if served:
+        assert calls == [("fused", 8, False)]
+    else:
+        assert calls == [("fused", 8, False), ("wq_b", 8, False)]
+        assert torch.equal(index_q, q @ owner.indexer.wq_b.weight.T)
+    # A row-parallel front step is never one the launch serves.
+    runtime.ctx.attn_metadata.dsa_row_parallel = SimpleNamespace(
+        front=True, first=2, end=5
+    )
+    asked.clear()
+    calls.clear()
+    owner.dsa_front(hidden)
+    assert not asked and calls[-1] == ("wq_b", 3, True)
+
+
+@pytest.mark.parametrize("row_parallel", [False, True])
+def test_the_fusb_switches_off_build_nothing(runtime, row_parallel):
+    runtime.envs.ATOM_DSA_ROW_PARALLEL_PREFILL = row_parallel
+    owner = runtime.make()
+    assert (owner.dsa_front_name is not None) == row_parallel
+    assert owner._qkvg_merge is None and owner._front_skips_wq_b is False
+    assert "_qkvg_merge" not in dict(owner.named_children())
+
+
+def test_the_fusb_switches_act_only_where_the_front_op_runs(runtime):
+    runtime.envs.ATOM_FUSB_QKVG = runtime.envs.ATOM_FUSB_SKIP_WQB = True
+    owner = runtime.make()
+    assert owner.dsa_front_name is None
+    assert owner._qkvg_merge is None and owner._front_skips_wq_b is False
+
+
+@pytest.mark.parametrize("ready", [True, False])
+def test_gated_core_takes_the_gate_from_the_qkvg_op(runtime, ready):
+    owner, hidden, _calls = _qkvg(runtime)
+    if ready:
+        owner._qkvg_merge.process_weights_after_loading()
+    both = torch.arange(8 * 22.0).view(8, 22)
+    outs = (both, torch.ones(8, 4), torch.ones(8, 4) * 2, torch.ones(8, 8) * 3)
+    plain = (both[:, :16].contiguous(), *outs[1:])
+    ops, attended, gates = [], [], []
+
+    class Torch:
+        ops = SimpleNamespace(
+            aiter=SimpleNamespace(
+                kimi_k3_dsa_front=lambda *a: ops.append("front") or plain,
+                kimi_k3_dsa_front_qkvg=lambda *a: ops.append("qkvg") or outs,
+            )
+        )
+
+        def __getattr__(self, name):
+            return getattr(torch, name)
+
+    class Indexer(nn.Module):
+        def forward(self, *args, **kwargs):
+            pass
+
+    class Attn(nn.Module):
+        def forward(self, q, kv, k_rope, positions, q_scale=None, qkv=None):
+            attended.append((k_rope, qkv))
+            return "gated"
+
+    class Gate(nn.Module):
+        def forward(self, x, x_scale=None):
+            gates.append(x)
+            return "g_proj"
+
+    runtime.namespace["torch"] = Torch()
+    owner.indexer, owner.attn, owner.g_proj = Indexer(), Attn(), Gate()
+    owner.gate_in_merge = True
+    assert owner._gated_core(torch.arange(8), hidden) == ("gated", None)
+    ((k_rope, gate),) = attended
+    if ready:
+        assert ops == ["qkvg"] and not gates
+        assert torch.equal(gate, both[:, 16:])
+        assert gate.data_ptr() == both[:, 16:].data_ptr()
+        assert torch.equal(k_rope, both[:, 8:10])
+    else:
+        assert ops == ["front"] and gates == [hidden] and gate == "g_proj"
 
 
 @pytest.mark.parametrize("projected", [False, True])

@@ -367,6 +367,13 @@ class IndexerHook:
             _run_compiled(self._launcher, *args, torch.cuda.current_stream())
 
 
+def launch_serves(module) -> bool:
+    """Whether ``module``'s indexer runs the mono launch this step, which
+    projects ``qr`` itself and never reads a ``projected_q``."""
+    hooked = module.__dict__.get(_HOOKED)
+    return hooked is not None and hooked[0]._launcher is not None
+
+
 def _routed_forward(module):
     """``module``'s forward while hooked: its operands into the opaque op."""
 

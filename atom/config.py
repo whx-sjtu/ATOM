@@ -3816,6 +3816,10 @@ class Config:
             and self.decode_context_parallel_size > 1
         ):
             factors.append("dsa_row_parallel_front")
+            # ATOM_FUSB_QKVG: the front op that returns g_proj too, and the
+            # gate sliced from it.
+            if envs.ATOM_FUSB_QKVG:
+                factors.append("fusb_qkvg")
         # The sparse-attention indexer bakes max_model_len and max_num_seqs into
         # the graph as constants, so a cache built for a smaller max_model_len
         # faults on the first decode past the old width.

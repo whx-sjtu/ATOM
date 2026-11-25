@@ -152,6 +152,17 @@ def _log_row_tail_group_rs():
     )
 
 
+@lru_cache(maxsize=1)
+def _log_qkvg_merged(width: int, k: int, max_rows: int):
+    logging.getLogger("atom").info(
+        "ATOM_FUSB_QKVG: sparse layers run fused_qkv_a and g_proj as one "
+        "[%d, %d] GEMM on steps of at most %d rows",
+        width,
+        k,
+        max_rows,
+    )
+
+
 def _text_config(config):
     return getattr(config, "text_config", config)
 
@@ -1167,6 +1178,66 @@ class KimiSparseMoeBlock(nn.Module):
         return routed_output, None
 
 
+class _QkvgMerge(nn.Module):
+    """``ATOM_FUSB_QKVG``: ``fused_qkv_a`` and ``g_proj`` read the same hidden
+    rows, so `KimiFullAttention.dsa_front` runs a step of at most ``MAX_ROWS``
+    rows as one GEMM over ``weight`` = ``[fused_qkv_a | g_proj]``.
+
+    Registered after both projections, so the loader's parent-first walk runs
+    their own post-load hooks first; this one concatenates the final weights
+    and makes each projection's a view of the result, so their own GEMMs read
+    the same bytes and no second copy stays."""
+
+    # the decode buckets aiter's Kimi BF16 table has N = 3808 rows for
+    MAX_ROWS = 48
+
+    def __init__(self, attn: nn.Module):
+        super().__init__()
+        self._attn = (attn,)  # a tuple: not a child of this module
+        self.weight = None
+        self.split = 0  # fused_qkv_a's columns of the merged output
+        self.width = 0
+        self.ready = False
+
+    def process_weights_after_loading(self):
+        attn = self._attn[0]
+        a, g = attn.fused_qkv_a_proj, attn.g_proj
+        why = _qkvg_refusal(attn, a, g)
+        if why:
+            logging.getLogger("atom").warning(
+                "%s: ATOM_FUSB_QKVG off for this layer: %s", a.prefix, why
+            )
+            return
+        merged = torch.cat([a.weight.data, g.weight.data])
+        self.split, self.width = a.weight.shape[0], merged.shape[0]
+        a.weight.data = merged[: self.split]
+        g.weight.data = merged[self.split :]
+        self.weight = merged
+        self.ready = True
+        _log_qkvg_merged(self.width, merged.shape[1], self.MAX_ROWS)
+
+
+def _qkvg_refusal(attn, a, g) -> str:
+    """Why ``a`` and ``g`` cannot share one GEMM, '' if they can."""
+    if attn.fuse_input_norm_quant or attn.fuse_sigmoid_mul_quant:
+        return "the hidden rows or the output gate are quantized"
+    for lin in (a, g):
+        if not (lin.runs_bf16 or lin.quant_type.value == QuantType.No.value):
+            return f"{lin.prefix} is not a BF16 GEMM"
+        if lin.bias is not None or getattr(lin.weight, "is_shuffled", False):
+            return f"{lin.prefix} has a bias or a shuffled weight"
+        if getattr(lin, "is_output_padded", False):
+            return f"{lin.prefix} pads its output"
+        w = lin.weight
+        if w.dtype != torch.bfloat16 or w.dim() != 2 or not w.is_contiguous():
+            return f"{lin.prefix} weight {w.dtype} {tuple(w.shape)}"
+    if a.weight.shape[0] != sum(attn.projection_split_sizes):
+        return f"{a.prefix} has {a.weight.shape[0]} output rows"
+    if a.weight.shape[1] != g.weight.shape[1] or a.weight.device != g.weight.device:
+        return "the weights differ in K or device"
+    return ""
+
+
 class KimiFullAttention(nn.Module):
     def __init__(
         self,
@@ -1412,15 +1483,30 @@ class KimiFullAttention(nn.Module):
             if self.dsa_front_name in cc.static_forward_context:
                 raise ValueError(f"Duplicate layer: {self.dsa_front_name}")
             cc.static_forward_context[self.dsa_front_name] = self
+        # ATOM_FUSB_QKVG, ATOM_FUSB_SKIP_WQB: in that op only. Last child: its
+        # post-load hook runs after every projection's.
+        self._qkvg_merge = (
+            _QkvgMerge(self)
+            if self.dsa_front_name is not None and envs.ATOM_FUSB_QKVG
+            else None
+        )
+        self._front_skips_wq_b = (
+            self.dsa_front_name is not None and envs.ATOM_FUSB_SKIP_WQB
+        )
 
     def dsa_front(
-        self, hidden_states: torch.Tensor
+        self, hidden_states: torch.Tensor, with_gate: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """`kimi_k3_dsa_front`: ``fused_qkv_a``'s output, the normed q_a and
         kv_a, and the indexer's ``wq_b`` of q_a, each over every row. On a
         front row-parallel step (`DsaRowParallel.front`) they are this rank's
         rows' -- and the index keys every row's; the other rows are undefined,
-        and nothing reads them."""
+        and nothing reads them.
+
+        ``with_gate`` (`kimi_k3_dsa_front_qkvg`, ATOM_FUSB_QKVG): the first is
+        ``[fused_qkv_a | g_proj]`` over every row, one GEMM on a step of at
+        most ``_QkvgMerge.MAX_ROWS`` rows. ATOM_FUSB_SKIP_WQB: on a step the
+        mono launch serves the indexer, the last is left unwritten."""
 
         def norms(q_c, kv_c):
             (q, _), _, kv, _ = _fuse_rmsnorm_quant(
@@ -1445,9 +1531,23 @@ class KimiFullAttention(nn.Module):
         kv_end = q_end + self.kv_lora_rank
         plan = getattr(get_forward_context().attn_metadata, "dsa_row_parallel", None)
         if plan is None or not plan.front:
-            projected = self.fused_qkv_a_proj(hidden_states)
+            rows = hidden_states.shape[0]
+            merge = self._qkvg_merge if with_gate else None
+            if merge is not None and rows <= merge.MAX_ROWS:
+                out = tgemm.mm(hidden_states, merge.weight, None, otype=dtypes.bf16)
+                projected = out[:, : merge.split]
+            else:
+                projected = out = self.fused_qkv_a_proj(hidden_states)
+                if with_gate:
+                    out = torch.cat([projected, self.g_proj(hidden_states)], dim=1)
             q, kv = norms(projected[:, :q_end], projected[:, q_end:kv_end])
-            return projected, q, kv, self.indexer.wq_b(q)
+            if self._front_skips_wq_b and _mono_serves(self.indexer):
+                index_q = hidden_states.new_empty(
+                    rows, self.indexer.n_head * self.indexer.head_dim
+                )
+            else:
+                index_q = self.indexer.wq_b(q)
+            return out, q, kv, index_q
 
         own = slice(plan.first, plan.end)
         rows = hidden_states.shape[0]
@@ -1466,6 +1566,8 @@ class KimiFullAttention(nn.Module):
             rows, self.indexer.n_head * self.indexer.head_dim
         )
         _linear_into(self.indexer.wq_b, q_own, index_q[own])
+        if with_gate:
+            projected = torch.cat([projected, self.g_proj(hidden_states)], dim=1)
         return projected, q, kv, index_q
 
     def _gated_core(
@@ -1484,10 +1586,19 @@ class KimiFullAttention(nn.Module):
             hidden_states, hidden_states_scale = hidden_states
 
         index_q = None
+        gate = None
         if self.dsa_front_name is not None:
-            projected, q, kv, index_q = torch.ops.aiter.kimi_k3_dsa_front(
-                hidden_states, self.dsa_front_name
-            )
+            merge = self._qkvg_merge
+            if merge is not None and merge.ready:
+                both, q, kv, index_q = torch.ops.aiter.kimi_k3_dsa_front_qkvg(
+                    hidden_states, self.dsa_front_name
+                )
+                # Column slices of one result; their consumers take row strides.
+                projected, gate = both[:, : merge.split], both[:, merge.split :]
+            else:
+                projected, q, kv, index_q = torch.ops.aiter.kimi_k3_dsa_front(
+                    hidden_states, self.dsa_front_name
+                )
             projected = torch.split(projected, self.projection_split_sizes, dim=-1)
             k_rope, q_scale = projected[2], None
         else:
@@ -1535,11 +1646,13 @@ class KimiFullAttention(nn.Module):
                 projected_q=index_q,
             )
         if self.gate_in_merge:
-            gate = self.g_proj(hidden_states, hidden_states_scale)
+            if gate is None:
+                gate = self.g_proj(hidden_states, hidden_states_scale)
             gated = self.attn(q, kv, k_rope, positions, q_scale=q_scale, qkv=gate)
             return gated, None
         attn_out = self.attn(q, kv, k_rope, positions, q_scale=q_scale)
-        gate = self.g_proj(hidden_states, hidden_states_scale)
+        if gate is None:
+            gate = self.g_proj(hidden_states, hidden_states_scale)
         # BF16 output gating uses the shared fused sigmoid/mul. When o_proj
         # runs FP8, the same helper also folds in its activation quantization.
         attn_out, attn_scale = fused_sigmoid_mul_maybe_quant(
@@ -1565,6 +1678,13 @@ class KimiFullAttention(nn.Module):
         attn_out, attn_scale = self._gated_core(positions, hidden_states)
         assert attn_scale is None, "o_proj is quantized; K2 reads it as bf16"
         return attn_out
+
+
+def _mono_serves(indexer) -> bool:
+    """Whether the mono launch serves ``indexer`` this step."""
+    from atom.mono.dsa_indexer.bind import launch_serves
+
+    return launch_serves(indexer)
 
 
 def _kda_attention_with_output_fake(

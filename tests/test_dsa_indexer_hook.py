@@ -62,6 +62,19 @@ def test_the_hook_serves_a_step_with_the_launcher_and_otherwise_the_own_forward(
     assert modules[9].calls == ["q"]
 
 
+def test_launch_serves_a_hooked_indexer_only_inside_a_served_step(monkeypatch):
+    """ATOM_FUSB_SKIP_WQB's question: a step the launch projects q itself."""
+    modules, other = {4: _Indexer()}, _Indexer()
+    hook, _ = _hook(monkeypatch, modules)
+    assert not bind.launch_serves(modules[4]) and not bind.launch_serves(other)
+    with hook.serving("launcher"):
+        assert bind.launch_serves(modules[4]) and not bind.launch_serves(other)
+    assert not bind.launch_serves(modules[4])
+    hook.remove()
+    with hook.serving("launcher"):
+        assert not bind.launch_serves(modules[4])
+
+
 class _FrontIndexer:
     """``Indexer.forward``'s signature since PF3-RPA's front (``projected_q``)."""
 

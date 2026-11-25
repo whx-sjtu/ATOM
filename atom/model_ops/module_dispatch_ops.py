@@ -23,6 +23,7 @@ Currently registered:
   - torch.ops.aiter.maybe_dual_stream_split_forward — K3 MoE (routed/shared or sum/zeros)
   - torch.ops.aiter.kimi_k3_post_attention_forward — K3 layer after its attention
   - torch.ops.aiter.kimi_k3_dsa_front          — K3 sparse-MLA front (row-parallel)
+  - torch.ops.aiter.kimi_k3_dsa_front_qkvg     — the same with g_proj (ATOM_FUSB_QKVG)
   - torch.ops.aiter.indexer_score_topk         — V4 sparse indexer
 """
 
@@ -243,6 +244,42 @@ direct_register_custom_op(
     op_func=kimi_k3_dsa_front,
     mutates_args=(),
     fake_impl=_kimi_k3_dsa_front_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+# ATOM_FUSB_QKVG: the same front with g_proj's output after fused_qkv_a's in
+# the first, [T, split + g] (`dsa_front(..., with_gate=True)`), which a short
+# step computes as one GEMM.
+
+
+def kimi_k3_dsa_front_qkvg(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    self = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    return self.dsa_front(hidden_states, with_gate=True)
+
+
+def _kimi_k3_dsa_front_qkvg_fake(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    self = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    _, q, kv, index_q = _kimi_k3_dsa_front_fake(hidden_states, layer_name)
+    both = hidden_states.new_empty(hidden_states.shape[0], self._qkvg_merge.width)
+    return both, q, kv, index_q
+
+
+direct_register_custom_op(
+    op_name="kimi_k3_dsa_front_qkvg",
+    op_func=kimi_k3_dsa_front_qkvg,
+    mutates_args=(),
+    fake_impl=_kimi_k3_dsa_front_qkvg_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 

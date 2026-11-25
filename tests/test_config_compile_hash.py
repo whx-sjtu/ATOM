@@ -87,6 +87,29 @@ def test_hash_keys_the_row_parallel_front(monkeypatch):
     assert hashed(None, None, dcp=1) == hashed("0", "1", dcp=1)
 
 
+def test_hash_keys_the_qkvg_front_only_where_the_front_is(monkeypatch):
+    # ATOM_FUSB_QKVG swaps the front op for one that returns g_proj too; the
+    # wq_b skip stays inside the op.
+    parallel = SimpleNamespace(
+        decode_context_parallel_size=1, compute_hash=lambda: "native"
+    )
+    monkeypatch.delenv("ATOM_DSA_ROW_PARALLEL_PREFILL", raising=False)
+
+    def hashed(qkvg, front="1", dcp=8, skip=None):
+        monkeypatch.setenv("ATOM_DSA_ROW_PARALLEL_PREFILL_FRONT", front)
+        for name, value in (("ATOM_FUSB_QKVG", qkvg), ("ATOM_FUSB_SKIP_WQB", skip)):
+            if value is None:
+                monkeypatch.delenv(name, raising=False)
+            else:
+                monkeypatch.setenv(name, value)
+        return _hash(parallel_config=parallel, decode_context_parallel_size=dcp)
+
+    assert hashed("1") != hashed("0")
+    assert hashed(None) == hashed("0") == hashed("0", skip="1")
+    assert hashed("1", front="0") == hashed("0", front="0")
+    assert hashed("1", dcp=1) == hashed("0", dcp=1)
+
+
 def test_the_native_engine_kwargs_key_the_row_parallel_front(monkeypatch):
     # The kwargs LLMEngine builds Config from (-tp 8 -dcp <dcp>): the DCP
     # size is the top-level one, its ParallelConfig keeps the default.
