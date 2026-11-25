@@ -1181,6 +1181,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # must divide the q/k/v widths. Same per-element arithmetic, bit-identical.
     # Empty (default) keeps 16,512,4,1.
     "ATOM_PFX_KDA_CONV_TILE": lambda: os.getenv("ATOM_PFX_KDA_CONV_TILE", ""),
+    # A split step's block (ATOM_KDA_PREFILL_CKPT_SPLIT) whose rows all resume a
+    # state and are at most this many tokens long -- the tail after a prompt-end
+    # anchor -- runs the fp32 token recurrence (the decode kernel) instead of a
+    # FlashKDA call. Changes numerics (that block's rounding). 0 (default) off.
+    "ATOM_PFX_KDA_TAIL_RECURRENT": lambda: int(
+        os.getenv("ATOM_PFX_KDA_TAIL_RECURRENT", "0")
+    ),
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT": lambda: (
         os.getenv("ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT", "1") == "1"
     ),

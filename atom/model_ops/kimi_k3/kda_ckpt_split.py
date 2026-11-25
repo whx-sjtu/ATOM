@@ -98,9 +98,19 @@ class SplitBlock:
     """One FlashKDA call: tokens ``[start, end)`` of the step."""
 
     def __init__(
-        self, start, end, cu_seqlens, state_indices, has_initial_state, checkpoints
+        self,
+        start,
+        end,
+        cu_seqlens,
+        state_indices,
+        has_initial_state,
+        checkpoints,
+        longest=0,
+        resumes=False,
     ):
         self.start, self.end = start, end
+        #: The longest row in the block, and whether every row resumes a state.
+        self.longest, self.resumes = longest, resumes
         self.cu_seqlens = cu_seqlens
         self.state_indices = state_indices
         self.has_initial_state = has_initial_state
@@ -167,6 +177,7 @@ class CheckpointSplitPlan:
         self, tensors: dict[str, torch.Tensor], exact_only: bool
     ) -> CheckpointSplit:
         init = tensors["split_init"] != 0
+        host_init = self.values["split_init"]
         chunk_indices = tensors["split_chunks"].view(-1, 2)
         ck = [tensors[name] for name in _LISTS[4:]]
         blocks, row, chunk, target = [], 0, 0, 0
@@ -184,6 +195,8 @@ class CheckpointSplitPlan:
                     state_indices=tensors["split_slots"][rows],
                     has_initial_state=init[rows],
                     checkpoints=(tuple(t[targets] for t in ck) if b.targets else None),
+                    longest=max(e - s for s, e in b.bounds),
+                    resumes=all(host_init[rows]),
                 )
             )
             row += len(b.bounds)
@@ -275,9 +288,14 @@ def run_checkpoint_split(
     A block's checkpoints are written before the next block runs: that block
     moves the same runtime slots past them.
     """
+    from atom.model_ops.fla_ops.fused_sigmoid_gating import (
+        fused_sigmoid_gating_delta_rule_update,
+    )
     from atom.model_ops.fla_ops.state_checkpoint import write_state_checkpoints
+    from atom.utils import envs
 
     install_host_bounds()
+    tail_max = envs.ATOM_PFX_KDA_TAIL_RECURRENT
     if out is not None and out.shape[0] >= v.shape[1] and out.is_contiguous():
         out = out[: v.shape[1]].unsqueeze(0)
     else:
@@ -286,27 +304,46 @@ def run_checkpoint_split(
     query_start_loc = kda_metadata.non_spec_query_start_loc
     for block in split.blocks:
         rows = slice(block.start, block.end)
-        layer._chunk_kda(
-            q=q[:, rows],
-            k=k[:, rows],
-            v=v[:, rows],
-            g=gate[:, rows],
-            beta=beta[:, rows],
-            A_log=layer.A_log,
-            dt_bias=layer.dt_bias,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=True,
-            use_gate_in_kernel=True,
-            use_beta_sigmoid_in_kernel=True,
-            safe_gate=layer._kda_gate_lower_bound is not None,
-            lower_bound=layer._kda_gate_lower_bound,
-            cu_seqlens=block.cu_seqlens,
-            state_v_first=True,
-            out=out[:, rows],
-            state_cache=ssm_state,
-            state_indices=block.state_indices,
-            has_initial_state=block.has_initial_state,
-        )
+        if tail_max and block.resumes and block.longest <= tail_max:
+            fused_sigmoid_gating_delta_rule_update(
+                A_log=layer.A_log,
+                a=gate[:, rows],
+                b=beta[:, rows],
+                dt_bias=layer.dt_bias,
+                q=q[:, rows],
+                k=k[:, rows],
+                v=v[:, rows],
+                o=out[0, rows],
+                initial_state=ssm_state,
+                inplace_final_state=True,
+                cu_seqlens=block.cu_seqlens,
+                ssm_state_indices=block.state_indices,
+                use_qk_l2norm_in_kernel=True,
+                is_kda=True,
+                lower_bound=layer._kda_gate_lower_bound,
+            )
+        else:
+            layer._chunk_kda(
+                q=q[:, rows],
+                k=k[:, rows],
+                v=v[:, rows],
+                g=gate[:, rows],
+                beta=beta[:, rows],
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                output_final_state=False,
+                use_qk_l2norm_in_kernel=True,
+                use_gate_in_kernel=True,
+                use_beta_sigmoid_in_kernel=True,
+                safe_gate=layer._kda_gate_lower_bound is not None,
+                lower_bound=layer._kda_gate_lower_bound,
+                cu_seqlens=block.cu_seqlens,
+                state_v_first=True,
+                out=out[:, rows],
+                state_cache=ssm_state,
+                state_indices=block.state_indices,
+                has_initial_state=block.has_initial_state,
+            )
         if block.checkpoints is not None:
             write_state_checkpoints(
                 ssm_state,
