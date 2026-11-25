@@ -1173,14 +1173,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # A split step (ATOM_KDA_PREFILL_CKPT_SPLIT) writes its KDA output into the
     # token-graph region's buffer (ATOM_SPG_REGION_OUT) rather than a fresh
     # tensor the region then copies there. Bit-identical. Off by default.
-    "ATOM_PFX_KDA_SPLIT_OUT": lambda: (
-        os.getenv("ATOM_PFX_KDA_SPLIT_OUT", "0") == "1"
+    "ATOM_PFX_KDA_SPLIT_OUT": lambda: (os.getenv("ATOM_PFX_KDA_SPLIT_OUT", "0") == "1"),
+    # The tiled prefill conv (ATOM_CONV1D_TILED_PREFILL) at width 4 walks each
+    # program's rows as a sliding window, loading every input row once instead
+    # of once per tap. Same per-element arithmetic, bit-identical. Off by
+    # default.
+    "ATOM_PFX_KDA_CONV_SLIDE": lambda: (
+        os.getenv("ATOM_PFX_KDA_CONV_SLIDE", "0") == "1"
     ),
-    # The tiled prefill conv (ATOM_CONV1D_TILED_PREFILL) on this tile,
-    # "BLOCK_M,BLOCK_N,NUM_WARPS,CHANNEL_FAST" (e.g. "64,256,4,1"); BLOCK_N
-    # must divide the q/k/v widths. Same per-element arithmetic, bit-identical.
-    # Empty (default) keeps 16,512,4,1.
-    "ATOM_PFX_KDA_CONV_TILE": lambda: os.getenv("ATOM_PFX_KDA_CONV_TILE", ""),
     # A split step's block (ATOM_KDA_PREFILL_CKPT_SPLIT) whose rows all resume a
     # state and are at most this many tokens long -- the tail after a prompt-end
     # anchor -- runs the fp32 token recurrence (the decode kernel) instead of a

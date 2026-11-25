@@ -784,14 +784,209 @@ def _causal_conv1d_fwd_tiled_kernel(
             tl.store(st_ptrs, new_state, st_mask)
 
 
-def _tiled_conv1d_tile():
-    """``(BLOCK_M, BLOCK_N, NUM_WARPS, CHANNEL_FAST)``: ATOM_PFX_KDA_CONV_TILE
-    or the defaults."""
-    tile = envs.ATOM_PFX_KDA_CONV_TILE
-    if not tile:
-        return _TILED_BLOCK_M, _TILED_BLOCK_N, _TILED_NUM_WARPS, _TILED_CHANNEL_FAST
-    bm, bn, nw, cf = (int(x) for x in tile.split(","))
-    return bm, bn, nw, bool(cf)
+# Tile of the sliding-window prefill kernel (ATOM_PFX_KDA_CONV_SLIDE). Its
+# BLOCK_M is the tiled kernel's, so the two share one program map.
+_SLIDE_BLOCK_N = 256
+_SLIDE_NUM_WARPS = 1
+_SLIDE_NUM_STAGES = 2
+
+
+@triton.jit()
+def _slide_conv1d_prev_row(
+    x_base,
+    state_in,
+    src,
+    seqlen,
+    load_init,
+    stride_x_token,
+    stride_istate_token,
+    state_len: tl.constexpr,
+):
+    """Input row `src` of a sequence for a program starting at row `src` + 1..3:
+    x, or before the sequence the conv state (when it resumes one) or 0."""
+    xv = tl.load(
+        x_base + src * stride_x_token, mask=(src >= 0) & (src < seqlen), other=0.0
+    )
+    from_state = (src < 0) & load_init
+    sv = tl.load(
+        state_in + (src + state_len) * stride_istate_token, mask=from_state, other=0.0
+    )
+    return tl.where(from_state, sv, xv)
+
+
+@triton.jit()
+def _causal_conv1d_fwd_slide_kernel(
+    x_ptr,  # (dim, cu_seqlen), channel-last (feature stride 1)
+    w_ptr,  # (dim, width)
+    bias_ptr,
+    conv_states_ptr,  # (num_cache_lines, dim, >= width - 1)
+    cache_indices_ptr,  # (batch,) slot the final state is written to
+    cache_indices_in_ptr,  # (batch,) slot the initial state is read from
+    has_initial_states_ptr,
+    query_start_loc_ptr,
+    batch_ptr,
+    token_chunk_offset_ptr,
+    query_ptr,
+    key_ptr,
+    value_ptr,
+    k_dim_size: tl.constexpr,
+    num_cache_lines: tl.constexpr,
+    stride_x_token: tl.constexpr,
+    stride_w_dim: tl.constexpr,
+    stride_w_width: tl.constexpr,
+    stride_istate_seq: tl.constexpr,
+    stride_istate_dim: tl.constexpr,
+    stride_istate_token: tl.constexpr,
+    stride_cache_indices: tl.constexpr,
+    k_token_stride: tl.constexpr,
+    v_token_stride: tl.constexpr,
+    pad_slot_id: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    KERNEL_WIDTH: tl.constexpr,
+    SILU_ACTIVATION: tl.constexpr,
+    USE_PAD_SLOT: tl.constexpr,
+    NP2_STATELEN: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    # `_causal_conv1d_fwd_tiled_kernel` at width 4 (channel-fast grid), but a
+    # program walks its BLOCK_M rows with the three inputs before the current
+    # row in registers: each input row is loaded once, not once per tap. Every
+    # output is still bias or 0, then += x[t - 3 + j] * w[j] for j ascending
+    # with every product rounded (fp fusion off), so the two agree bit for bit.
+    tl.static_assert(KERNEL_WIDTH == 4)
+    state_len: tl.constexpr = KERNEL_WIDTH - 1
+    pid_m = tl.program_id(1)
+    pid_n = tl.program_id(0)
+    idx_seq = tl.load(batch_ptr + pid_m).to(tl.int64)
+    if idx_seq < 0:
+        return
+    chunk = tl.load(token_chunk_offset_ptr + pid_m)
+    seq_start = tl.load(query_start_loc_ptr + idx_seq).to(tl.int64)
+    seqlen = (tl.load(query_start_loc_ptr + idx_seq + 1) - seq_start).to(tl.int32)
+    slot_in = tl.load(cache_indices_in_ptr + idx_seq * stride_cache_indices).to(
+        tl.int64
+    )
+    if USE_PAD_SLOT:  # noqa
+        if slot_in == pad_slot_id:
+            return
+    slot_out = tl.load(cache_indices_ptr + idx_seq * stride_cache_indices).to(tl.int64)
+
+    feats = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    load_init = (chunk == 0) & tl.load(has_initial_states_ptr + idx_seq).to(tl.int1)
+
+    x_base = x_ptr + seq_start * stride_x_token + feats  # [BLOCK_N]
+    state_in = (
+        conv_states_ptr + slot_in * stride_istate_seq + feats * stride_istate_dim
+    )  # [BLOCK_N]
+    feat0 = pid_n * BLOCK_N
+
+    w0 = tl.load(w_ptr + feats * stride_w_dim)
+    w1 = tl.load(w_ptr + feats * stride_w_dim + stride_w_width)
+    w2 = tl.load(w_ptr + feats * stride_w_dim + 2 * stride_w_width)
+    w3 = tl.load(w_ptr + feats * stride_w_dim + 3 * stride_w_width)
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + feats).to(tl.float32)
+
+    r0 = chunk * BLOCK_M
+    xm3 = _slide_conv1d_prev_row(
+        x_base,
+        state_in,
+        r0 - 3,
+        seqlen,
+        load_init,
+        stride_x_token,
+        stride_istate_token,
+        state_len,
+    )
+    xm2 = _slide_conv1d_prev_row(
+        x_base,
+        state_in,
+        r0 - 2,
+        seqlen,
+        load_init,
+        stride_x_token,
+        stride_istate_token,
+        state_len,
+    )
+    xm1 = _slide_conv1d_prev_row(
+        x_base,
+        state_in,
+        r0 - 1,
+        seqlen,
+        load_init,
+        stride_x_token,
+        stride_istate_token,
+        state_len,
+    )
+    for i in tl.range(0, tl.minimum(BLOCK_M, seqlen - r0), num_stages=NUM_STAGES):
+        xt = tl.load(x_base + (r0 + i) * stride_x_token)
+        if HAS_BIAS:
+            acc = bias
+        else:
+            acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        acc += xm3 * w0
+        acc += xm2 * w1
+        acc += xm1 * w2
+        acc += xt * w3
+        if SILU_ACTIVATION:
+            acc = acc / (1 + tl.exp(-acc))
+        # BLOCK_N divides k_dim_size: one store per branch, as in the tiled
+        # kernel.
+        tok = seq_start + r0 + i
+        if feat0 < k_dim_size:
+            tl.store(query_ptr + tok * k_token_stride + feats, acc)
+        elif feat0 < 2 * k_dim_size:
+            tl.store(key_ptr + tok * k_token_stride + (feats - k_dim_size), acc)
+        else:
+            tl.store(value_ptr + tok * v_token_stride + (feats - 2 * k_dim_size), acc)
+        xm3 = xm2
+        xm2 = xm1
+        xm1 = xt
+
+    if chunk == 0:
+        # The tiled kernel's conv-state update.
+        state_out = (
+            conv_states_ptr + slot_out * stride_istate_seq + feats * stride_istate_dim
+        )
+        idx_conv = tl.arange(0, NP2_STATELEN)
+        st_mask = (idx_conv < state_len)[:, None]
+        st_ptrs = state_out[None, :] + (idx_conv * stride_istate_token)[:, None]
+        if state_len <= seqlen:
+            idx_last = seqlen - state_len + idx_conv
+            new_state = tl.load(
+                x_base[None, :] + (idx_last * stride_x_token)[:, None],
+                mask=(idx_last < seqlen)[:, None],
+                other=0.0,
+            )
+            tl.debug_barrier()
+            tl.store(st_ptrs, new_state, st_mask)
+        else:
+            shift = state_len - seqlen
+            x_part = tl.load(
+                x_base[None, :] + ((idx_conv - shift) * stride_x_token)[:, None],
+                mask=((idx_conv - shift >= 0) & (idx_conv - shift < seqlen))[:, None],
+                other=0.0,
+            )
+            if load_init:
+                keep = (
+                    (slot_in < num_cache_lines)
+                    & ((idx_conv + seqlen) < state_len)[:, None]
+                    & (feats >= 0)[None, :]
+                )
+                old_part = tl.load(
+                    state_in[None, :]
+                    + ((idx_conv + seqlen) * stride_istate_token)[:, None],
+                    mask=keep,
+                    other=0.0,
+                )
+                tl.debug_barrier()
+                new_state = tl.where(keep, old_part, x_part)
+            else:
+                tl.debug_barrier()
+                new_state = x_part
+            tl.store(st_ptrs, new_state, st_mask)
 
 
 def _tiled_conv1d_map(metadata, query_start_loc, num_tokens, block_m):
@@ -830,12 +1025,11 @@ def _causal_conv1d_fwd_tiled(
     num_warps=None,
     channel_fast=None,
 ):
-    tile = _tiled_conv1d_tile()
-    block_m = block_m or tile[0]
-    block_n = block_n or tile[1]
-    num_warps = num_warps or tile[2]
+    block_m = block_m or _TILED_BLOCK_M
+    block_n = block_n or _TILED_BLOCK_N
+    num_warps = num_warps or _TILED_NUM_WARPS
     if channel_fast is None:
-        channel_fast = tile[3]
+        channel_fast = _TILED_CHANNEL_FAST
     dim, cu_seqlen = x.shape
     width = weight.shape[1]
     entry = _tiled_conv1d_map(metadata, query_start_loc, cu_seqlen, block_m)
@@ -885,10 +1079,79 @@ def _causal_conv1d_fwd_tiled(
     return query, key, value
 
 
+def _causal_conv1d_fwd_slide(
+    x,
+    weight,
+    bias,
+    conv_states,
+    query_start_loc,
+    k_dim_size,
+    v_dim_size,
+    cache_indices,
+    cache_indices_in,
+    has_initial_state,
+    activation,
+    pad_slot_id,
+    metadata,
+    block_n=None,
+    num_warps=None,
+    num_stages=None,
+):
+    """`_causal_conv1d_fwd_tiled` at width 4 on the sliding-window kernel;
+    `block_n` must divide `k_dim_size` and `v_dim_size`."""
+    block_n = block_n or _SLIDE_BLOCK_N
+    num_warps = num_warps or _SLIDE_NUM_WARPS
+    num_stages = num_stages or _SLIDE_NUM_STAGES
+    dim, cu_seqlen = x.shape
+    width = weight.shape[1]
+    entry = _tiled_conv1d_map(metadata, query_start_loc, cu_seqlen, _TILED_BLOCK_M)
+    query = torch.empty([cu_seqlen, k_dim_size], dtype=x.dtype, device=x.device)
+    key = torch.empty([cu_seqlen, k_dim_size], dtype=x.dtype, device=x.device)
+    value = torch.empty([cu_seqlen, v_dim_size], dtype=x.dtype, device=x.device)
+    _causal_conv1d_fwd_slide_kernel[(dim // block_n, entry["tot"])](
+        x,
+        weight,
+        bias,
+        conv_states,
+        cache_indices,
+        cache_indices if cache_indices_in is None else cache_indices_in,
+        has_initial_state,
+        query_start_loc,
+        entry["batch_ptr"],
+        entry["token_chunk_offset_ptr"],
+        query,
+        key,
+        value,
+        k_dim_size,
+        conv_states.size(0),
+        x.stride(1),
+        weight.stride(0),
+        weight.stride(1),
+        conv_states.stride(0),
+        conv_states.stride(1),
+        conv_states.stride(2),
+        cache_indices.stride(0),
+        key.stride(0),
+        value.stride(0),
+        pad_slot_id,
+        HAS_BIAS=bias is not None,
+        KERNEL_WIDTH=width,
+        SILU_ACTIVATION=activation in ["silu", "swish"],
+        USE_PAD_SLOT=pad_slot_id is not None,
+        NP2_STATELEN=triton.next_power_of_2(width - 1),
+        BLOCK_M=_TILED_BLOCK_M,
+        BLOCK_N=block_n,
+        NUM_STAGES=num_stages,
+        num_warps=num_warps,
+        enable_fp_fusion=False,
+    )
+    return query, key, value
+
+
 def _tiled_conv1d_applies(
     x, weight, conv_states, k_dim_size, v_dim_size, cache_indices, has_initial_state
 ):
-    block_n = _tiled_conv1d_tile()[1]
+    block_n = _TILED_BLOCK_N
     return (
         conv_states is not None
         and cache_indices is not None
@@ -999,7 +1262,12 @@ def causal_conv1d_fn(
             has_initial_state,
         )
     ):
-        return _causal_conv1d_fwd_tiled(
+        fwd = (
+            _causal_conv1d_fwd_slide
+            if envs.ATOM_PFX_KDA_CONV_SLIDE and weight.shape[1] == 4
+            else _causal_conv1d_fwd_tiled
+        )
+        return fwd(
             x,
             weight,
             bias,
