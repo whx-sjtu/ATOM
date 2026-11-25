@@ -693,8 +693,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # projections' become views of (no extra memory). Needs aiter's Kimi BF16
     # table rows for N = 3808, K = 7168; without them aiter's untuned default
     # runs, slower than the two. Numerics change on those steps (another GEMM
-    # kernel); longer steps run the two GEMMs as before. Off by default.
-    "ATOM_FUSB_QKVG": lambda: os.getenv("ATOM_FUSB_QKVG", "0") == "1",
+    # kernel); longer steps run the two GEMMs as before. On by default
+    # (INT5's numerics bundle); 0 runs the two GEMMs.
+    "ATOM_FUSB_QKVG": lambda: os.getenv("ATOM_FUSB_QKVG", "1") == "1",
     # That front also projects the indexer's q (wq_b) on a step the mono
     # indexer launch serves, which projects q_a itself and never reads it. With
     # this, such a step skips the GEMM. Bit-exact. On by default; 0 projects
@@ -1197,9 +1198,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # A split step's block (ATOM_KDA_PREFILL_CKPT_SPLIT) whose rows all resume a
     # state and are at most this many tokens long -- the tail after a prompt-end
     # anchor -- runs the fp32 token recurrence (the decode kernel) instead of a
-    # FlashKDA call. Changes numerics (that block's rounding). 0 (default) off.
+    # FlashKDA call. Changes numerics (that block's rounding). 6 by default
+    # (INT5's numerics bundle, PFX-KDA's choice); 0 off.
     "ATOM_PFX_KDA_TAIL_RECURRENT": lambda: int(
-        os.getenv("ATOM_PFX_KDA_TAIL_RECURRENT") or "0"
+        os.getenv("ATOM_PFX_KDA_TAIL_RECURRENT") or "6"
     ),
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT": lambda: (
         os.getenv("ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT", "1") == "1"
