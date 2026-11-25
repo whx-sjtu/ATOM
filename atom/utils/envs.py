@@ -620,9 +620,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # AITER's sampled selector with ties to the smaller column, which reads
     # the band's logits about once where the one-block kernel reads a long row
     # twice, then each row's ids put in ascending order, -1 last: the stable
-    # emit's ids, bit for bit. Off by default.
+    # emit's ids, bit for bit. On by default (INT5); 0 keeps the one-block
+    # kernel.
     "ATOM_DSA_PREFILL_TOPK_SAMPLED": lambda: (
-        os.getenv("ATOM_DSA_PREFILL_TOPK_SAMPLED", "0") == "1"
+        os.getenv("ATOM_DSA_PREFILL_TOPK_SAMPLED", "1") == "1"
     ),
     # QREP decode of a NoPE layer: one kernel absorbs W_K into the FP8 q_out,
     # stores the rope half and writes the step's K, in place of the W_K bmm and
@@ -1180,14 +1181,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # A split step (ATOM_KDA_PREFILL_CKPT_SPLIT) writes its KDA output into the
     # token-graph region's buffer (ATOM_SPG_REGION_OUT) rather than a fresh
-    # tensor the region then copies there. Bit-identical. Off by default.
-    "ATOM_PFX_KDA_SPLIT_OUT": lambda: (os.getenv("ATOM_PFX_KDA_SPLIT_OUT", "0") == "1"),
+    # tensor the region then copies there. Bit-identical. On by default
+    # (INT5); 0 copies.
+    "ATOM_PFX_KDA_SPLIT_OUT": lambda: (os.getenv("ATOM_PFX_KDA_SPLIT_OUT", "1") == "1"),
     # The tiled prefill conv (ATOM_CONV1D_TILED_PREFILL) at width 4 walks each
     # program's rows as a sliding window, loading every input row once instead
-    # of once per tap. Same per-element arithmetic, bit-identical. Off by
-    # default.
+    # of once per tap. Same per-element arithmetic, bit-identical. On by
+    # default (INT5); 0 loads per tap.
     "ATOM_PFX_KDA_CONV_SLIDE": lambda: (
-        os.getenv("ATOM_PFX_KDA_CONV_SLIDE", "0") == "1"
+        os.getenv("ATOM_PFX_KDA_CONV_SLIDE", "1") == "1"
     ),
     # A split step's block (ATOM_KDA_PREFILL_CKPT_SPLIT) whose rows all resume a
     # state and are at most this many tokens long -- the tail after a prompt-end
