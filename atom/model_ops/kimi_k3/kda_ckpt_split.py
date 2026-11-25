@@ -105,12 +105,12 @@ class SplitBlock:
         state_indices,
         has_initial_state,
         checkpoints,
-        longest=0,
-        resumes=False,
+        tail=None,
     ):
         self.start, self.end = start, end
-        #: The longest row in the block, and whether every row resumes a state.
-        self.longest, self.resumes = longest, resumes
+        #: ``[2, rows, longest]`` read/write state slots when the block runs on
+        #: the token recurrence (``ATOM_PFX_KDA_TAIL_RECURRENT``), else None.
+        self.tail = tail
         self.cu_seqlens = cu_seqlens
         self.state_indices = state_indices
         self.has_initial_state = has_initial_state
@@ -159,6 +159,8 @@ class _HostBlock(NamedTuple):
     #: ``_seq_bounds`` gives them.
     bounds: tuple[tuple[int, int], ...]
     targets: int
+    #: The longest row when the block runs on the token recurrence, else 0.
+    tail: int = 0
 
     @property
     def chunks(self) -> int:
@@ -177,11 +179,15 @@ class CheckpointSplitPlan:
         self, tensors: dict[str, torch.Tensor], exact_only: bool
     ) -> CheckpointSplit:
         init = tensors["split_init"] != 0
-        host_init = self.values["split_init"]
         chunk_indices = tensors["split_chunks"].view(-1, 2)
         ck = [tensors[name] for name in _LISTS[4:]]
-        blocks, row, chunk, target = [], 0, 0, 0
+        blocks, row, chunk, target, tail_at = [], 0, 0, 0, 0
         for b in self.blocks:
+            tail = None
+            if b.tail:
+                n = 2 * len(b.bounds) * b.tail
+                tail = tensors["split_tail"][tail_at : tail_at + n].view(2, -1, b.tail)
+                tail_at += n
             rows = slice(row, row + len(b.bounds))
             targets = slice(target, target + b.targets)
             cu_seqlens = tensors["split_cu"][row + len(blocks) :][: len(b.bounds) + 1]
@@ -195,8 +201,7 @@ class CheckpointSplitPlan:
                     state_indices=tensors["split_slots"][rows],
                     has_initial_state=init[rows],
                     checkpoints=(tuple(t[targets] for t in ck) if b.targets else None),
-                    longest=max(e - s for s, e in b.bounds),
-                    resumes=all(host_init[rows]),
+                    tail=tail,
                 )
             )
             row += len(b.bounds)
@@ -230,6 +235,9 @@ def plan_checkpoint_split(targets, batch) -> CheckpointSplitPlan | None:
     cuts = sorted({starts[row] + off for row, _, off, _, _ in interior})
     if not cuts:
         return None
+    from atom.utils import envs
+
+    tail_max = envs.ATOM_PFX_KDA_TAIL_RECURRENT
     slots = [int(s) for s in batch.state_slots_committed]
     cached = [int(n) for n in batch.num_cached_tokens]
     values = {name: [] for name in _LISTS}
@@ -245,9 +253,20 @@ def plan_checkpoint_split(targets, batch) -> CheckpointSplitPlan | None:
         for i, (s, e) in enumerate(bounds):
             for c in range(-(-(e - s) // CHUNK)):
                 values["split_chunks"] += [i, c]
-        for r in rows:
+        resumes = [int(cached[r] > 0 or lo > starts[r]) for r in rows]
+        for r, resume in zip(rows, resumes):
             values["split_slots"].append(slots[r])
-            values["split_init"].append(int(cached[r] > 0 or lo > starts[r]))
+            values["split_init"].append(resume)
+        tail = max(e - s for s, e in bounds)
+        tail = tail if tail_max and all(resumes) and tail <= tail_max else 0
+        if tail:
+            # The recurrence reads column 0's slot and writes column t's after
+            # token t; -1 skips the write.
+            idx = values.setdefault("split_tail", [])
+            for r in rows:
+                idx += [slots[r]] * tail
+            for r, (s, e) in zip(rows, bounds):
+                idx += [-1] * (e - s - 1) + [slots[r]] + [-1] * (tail - (e - s))
         if hi == starts[-1]:
             here = [t for t in targets if t[3]]
         else:
@@ -258,7 +277,7 @@ def plan_checkpoint_split(targets, batch) -> CheckpointSplitPlan | None:
             values["split_ck_offs"].append(off)
             values["split_ck_ends"].append(1)
             values["split_ck_runtime"].append(runtime)
-        blocks.append(_HostBlock(lo, hi, bounds, len(here)))
+        blocks.append(_HostBlock(lo, hi, bounds, len(here), tail))
     return CheckpointSplitPlan(
         blocks,
         values,
@@ -292,10 +311,8 @@ def run_checkpoint_split(
         fused_sigmoid_gating_delta_rule_update,
     )
     from atom.model_ops.fla_ops.state_checkpoint import write_state_checkpoints
-    from atom.utils import envs
 
     install_host_bounds()
-    tail_max = envs.ATOM_PFX_KDA_TAIL_RECURRENT
     if out is not None and out.shape[0] >= v.shape[1] and out.is_contiguous():
         out = out[: v.shape[1]].unsqueeze(0)
     else:
@@ -304,7 +321,7 @@ def run_checkpoint_split(
     query_start_loc = kda_metadata.non_spec_query_start_loc
     for block in split.blocks:
         rows = slice(block.start, block.end)
-        if tail_max and block.resumes and block.longest <= tail_max:
+        if block.tail is not None:
             fused_sigmoid_gating_delta_rule_update(
                 A_log=layer.A_log,
                 a=gate[:, rows],
@@ -317,7 +334,8 @@ def run_checkpoint_split(
                 initial_state=ssm_state,
                 inplace_final_state=True,
                 cu_seqlens=block.cu_seqlens,
-                ssm_state_indices=block.state_indices,
+                ssm_state_indices=block.tail[1],
+                ssm_state_indices_in=block.tail[0],
                 use_qk_l2norm_in_kernel=True,
                 is_kda=True,
                 lower_bound=layer._kda_gate_lower_bound,

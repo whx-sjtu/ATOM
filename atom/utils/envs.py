@@ -1186,7 +1186,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # anchor -- runs the fp32 token recurrence (the decode kernel) instead of a
     # FlashKDA call. Changes numerics (that block's rounding). 0 (default) off.
     "ATOM_PFX_KDA_TAIL_RECURRENT": lambda: int(
-        os.getenv("ATOM_PFX_KDA_TAIL_RECURRENT", "0")
+        os.getenv("ATOM_PFX_KDA_TAIL_RECURRENT") or "0"
     ),
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT": lambda: (
         os.getenv("ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT", "1") == "1"
