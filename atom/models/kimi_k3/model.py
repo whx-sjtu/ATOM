@@ -167,8 +167,8 @@ def _log_qkvg_merged(width: int, k: int, max_rows: int):
 @lru_cache(maxsize=1)
 def _log_row_tail_side_rs():
     logging.getLogger("atom").info(
-        "Kimi-K3 row tail: the shared reduce-scatter runs on a second pynccl "
-        "communicator on a side stream, under the routed experts"
+        "Kimi-K3 row tail: the shared reduce-scatter runs on pynccl on a side "
+        "stream, under the routed experts"
     )
 
 

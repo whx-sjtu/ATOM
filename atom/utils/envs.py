@@ -1532,7 +1532,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Eager row-sharded steps of at least ..._SIDE_RS_MIN_TOKENS rows with the
     # custom collectives run the shared experts before the routed ones and
-    # reduce-scatter their partial on a second pynccl communicator on a
+    # reduce-scatter their partial on the TP group's pynccl communicator on a
     # priority -1 side stream, under the routed experts; it takes the place of
     # ..._GROUP_RS there. Changes the reduction order as ..._GROUP_RS=0 does.
     # Off by default.
@@ -1542,10 +1542,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_K3_ROW_SHARD_SIDE_RS_MIN_TOKENS": lambda: int(
         os.getenv("ATOM_KIMI_K3_ROW_SHARD_SIDE_RS_MIN_TOKENS", "4097")
     ),
+    # The side reduce on a second pynccl communicator of its own instead of
+    # the TP group's. Its RCCL buffers come out of the KV budget. Off by default.
+    "ATOM_KIMI_K3_ROW_SHARD_SIDE_RS_OWN_COMM": lambda: (
+        os.getenv("ATOM_KIMI_K3_ROW_SHARD_SIDE_RS_OWN_COMM", "0") == "1"
+    ),
     # Row-sharded steps keep the residual on its rows between layers: a row
     # tail skips its last gather and the next BF16 residual mix runs on this
     # rank's rows, then gathers its output. Bit-identical output. Read once
     # after load (one PP stage, no TBO, outside plugin hosts). Off by default.
+    # On those steps only this rank's rows of the residual and of the attn_res
+    # bank are valid, and the row tail's two zero addends are uninitialized:
+    # ATOM_FWD_DUMP dumps of them show garbage in the other rows.
     "ATOM_KIMI_K3_ROW_SHARD_RESIDUAL": lambda: (
         os.getenv("ATOM_KIMI_K3_ROW_SHARD_RESIDUAL", "0") == "1"
     ),

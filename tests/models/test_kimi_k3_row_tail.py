@@ -2,7 +2,10 @@
 """Kimi row-sharded residual and MoE tail on CPU-simulated TP ranks."""
 
 import ast
+import gc
+import sys
 import threading
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -1093,19 +1096,70 @@ def test_side_stream_runs_after_the_queued_work(monkeypatch):
     monkeypatch.setattr(torch.cuda, "Event", Event)
     side = sequence_parallel._SideStream()
     assert side.stream.priority == -1
-    x = SimpleNamespace(
-        record_stream=lambda s: log.append(("x", "record_stream", s.name))
-    )
+
+    class Held:
+        def record_stream(self, s):
+            log.append(("x", "record_stream", s.name))
+
+    x = Held()
+    alive = weakref.ref(x)
     wait = side.run(lambda: log.append((current[-1].name, "work")), x)
+    del x
+    gc.collect()
+    assert alive() is not None, "the input must outlive the side work"
     current[0] = Stream("later")
     wait()
+    gc.collect()
+    assert alive() is None, "the wait lets go of the input"
     assert log == [
         ("side", "wait_stream", "main"),
         ("side", "work"),
         ("side", "record"),
-        ("x", "record_stream", "side"),
         ("later", "wait_event", "side"),
     ]
+
+
+@pytest.mark.parametrize("own", [False, True], ids=["tp-comm", "own-comm"])
+def test_side_comm_is_the_tp_groups_unless_asked(monkeypatch, own):
+    """The side reduce runs on the TP group's pynccl communicator (no second
+    set of RCCL buffers); ..._SIDE_RS_OWN_COMM=1 builds one of its own, once."""
+    tp_comm = SimpleNamespace(disabled=False)
+    tp = SimpleNamespace(
+        cpu_group="cpu",
+        device="dev",
+        device_communicator=SimpleNamespace(pynccl_comm=tp_comm),
+    )
+    built = []
+
+    def own_comm(group, device):
+        built.append((group, device))
+        return SimpleNamespace(disabled=False)
+
+    monkeypatch.setattr(sequence_parallel, "get_tp_group", lambda: tp)
+    name = "aiter.dist.device_communicators.communicator_pynccl"
+    for parent in ("aiter", "aiter.dist", "aiter.dist.device_communicators"):
+        if parent not in sys.modules:
+            monkeypatch.setitem(sys.modules, parent, SimpleNamespace(__path__=[]))
+    monkeypatch.setitem(sys.modules, name, SimpleNamespace(PyNcclCommunicator=own_comm))
+    monkeypatch.setattr(sequence_parallel, "_SideStream", lambda: "side")
+    monkeypatch.setattr(sequence_parallel, "_SIDE", [])
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_SIDE_RS_OWN_COMM", "1" if own else "0")
+    nccl, stream = sequence_parallel._side_comm()
+    assert sequence_parallel._side_comm() == (nccl, stream)
+    assert stream == "side"
+    if own:
+        assert nccl is not tp_comm and built == [("cpu", "dev")]
+    else:
+        assert nccl is tp_comm and built == []
+
+
+def test_side_comm_refuses_without_a_tp_pynccl(monkeypatch):
+    tp = SimpleNamespace(device_communicator=SimpleNamespace(pynccl_comm=None))
+    monkeypatch.setattr(sequence_parallel, "get_tp_group", lambda: tp)
+    monkeypatch.setattr(sequence_parallel, "_SIDE", [])
+    monkeypatch.delenv("ATOM_KIMI_K3_ROW_SHARD_SIDE_RS_OWN_COMM", raising=False)
+    with pytest.raises(RuntimeError, match="pynccl"):
+        sequence_parallel._side_comm()
 
 
 @pytest.mark.parametrize("latent", ["0", "1"], ids=["latent-off", "latent-on"])

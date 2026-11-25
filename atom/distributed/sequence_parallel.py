@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """TP row sharding shared by residual and model-tail paths."""
 
+import logging
 from collections.abc import Callable
 
 import torch
@@ -41,35 +42,63 @@ class _SideStream:
 
     def run(self, fn: Callable[[], None], *uses: torch.Tensor) -> Callable[[], None]:
         """Queue `fn` here; `uses` are current-stream tensors it reads. The
-        returned callable makes the then-current stream wait for `fn`."""
+        returned callable makes the then-current stream wait for `fn`, and
+        only then lets go of `uses`: their blocks go back to the current
+        stream's pool after that wait, so later work there can reuse them at
+        once. (`record_stream` would hold each block until the side event is
+        seen complete; with the host layers ahead of the GPU that keeps one
+        `[T, H]` block per layer pending and grows the allocator's cache by
+        GBs on the first long prefill steps.) Call it before dropping them."""
         self.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.stream):
             fn()
             done = torch.cuda.Event()
             done.record()
-        for x in uses:
-            x.record_stream(self.stream)
-        return lambda: torch.cuda.current_stream().wait_event(done)
+        held = list(uses)
+
+        def wait() -> None:
+            torch.cuda.current_stream().wait_event(done)
+            held.clear()
+
+        return wait
 
 
 _SIDE: list = []
 
 
 def _side_comm():
-    """A second pynccl communicator over the TP group, and its side stream.
+    """The side reduce's pynccl communicator and its side stream.
 
-    Built on first use, which every TP rank reaches on the same step (its
-    construction is a collective), as `tbo_get_ubatch_tp_comm` does. Its own
-    communicator keeps the side reduce out of the TP group's issue order."""
+    By default the TP group's own pynccl communicator: NCCL runs the
+    operations of one communicator in issue order whatever their streams, and
+    the side reduce is issued before the routed one that follows it, so the
+    order costs nothing and no second set of RCCL buffers is allocated.
+    ATOM_KIMI_K3_ROW_SHARD_SIDE_RS_OWN_COMM=1 builds a second communicator
+    over the TP group instead (first use, which every TP rank reaches on the
+    same step, as `tbo_get_ubatch_tp_comm` does); its RCCL buffers come out
+    of the KV budget (2-3 GB per rank in the 11-25 serving run)."""
     if not _SIDE:
-        from aiter.dist.device_communicators.communicator_pynccl import (
-            PyNcclCommunicator,
-        )
-
         tp = get_tp_group()
-        _SIDE.append(
-            (PyNcclCommunicator(group=tp.cpu_group, device=tp.device), _SideStream())
+        if envs.ATOM_KIMI_K3_ROW_SHARD_SIDE_RS_OWN_COMM:
+            from aiter.dist.device_communicators.communicator_pynccl import (
+                PyNcclCommunicator,
+            )
+
+            nccl = PyNcclCommunicator(group=tp.cpu_group, device=tp.device)
+        else:
+            nccl = tp.device_communicator.pynccl_comm
+            if nccl is None or nccl.disabled:
+                raise RuntimeError(
+                    "ATOM_KIMI_K3_ROW_SHARD_SIDE_RS needs the TP group's pynccl "
+                    "communicator"
+                )
+        logging.getLogger("atom").info(
+            "Side reduce-scatter: %s",
+            "a second pynccl communicator over the TP group"
+            if envs.ATOM_KIMI_K3_ROW_SHARD_SIDE_RS_OWN_COMM
+            else "the TP group's pynccl communicator",
         )
+        _SIDE.append((nccl, _SideStream()))
     return _SIDE[0]
 
 
@@ -83,8 +112,8 @@ class SequenceParallel:
     on RCCL through torch.distributed. With ``custom``, reduce-scatter inputs
     above ``pynccl_rs_bytes`` (0: none) go straight to pynccl, and
     ``group_rs`` lets `scatter_pair` issue two reduce-scatters as one NCCL
-    group. ``side_rs`` (eager only) lets `scatter_side` reduce on a second
-    communicator on a side stream.
+    group. ``side_rs`` (eager only) lets `scatter_side` reduce on a side
+    stream.
     """
 
     def __init__(
@@ -143,10 +172,11 @@ class SequenceParallel:
         return self._scatter_padded(a), self._scatter_padded(b)
 
     def scatter_side(self, x: torch.Tensor) -> Callable[[], torch.Tensor]:
-        """`scatter(x)` on pynccl over a second communicator, on a side stream,
-        after the work queued so far. Returns a callable that makes the current
-        stream wait for the reduce and returns its rows. One side reduce at a
-        time: the side stream runs them in issue order."""
+        """`scatter(x)` on pynccl (`_side_comm`), on a side stream, after the
+        work queued so far. Returns a callable that makes the current stream
+        wait for the reduce and returns its rows; it holds the input until
+        then, so call it before the input's memory may be reused. One side
+        reduce at a time: the side stream runs them in issue order."""
         x = _pad_rows(x.contiguous(), self.pad)
         nccl, side = _side_comm()
         out = x.new_empty((x.shape[0] // self.tp_size, *x.shape[1:]))
