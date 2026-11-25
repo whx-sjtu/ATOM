@@ -1549,6 +1549,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_K3_ROW_SHARD_RESIDUAL": lambda: (
         os.getenv("ATOM_KIMI_K3_ROW_SHARD_RESIDUAL", "0") == "1"
     ),
+    # On an eager row-sharded step with pad rows, a Kimi layer's o_proj writes
+    # its partial into the leading rows of a buffer whose pad rows are zero,
+    # which the reduce-scatter takes as it is instead of copying the partial
+    # into a padded one (as the MoE partials do under
+    # ATOM_ROW_SHARD_PAD_IN_PLACE, which this needs). Bit-identical output.
+    # Read at construction. Off by default.
+    "ATOM_KIMI_K3_O_PROJ_PADDED_OUT": lambda: (
+        os.getenv("ATOM_KIMI_K3_O_PROJ_PADDED_OUT", "0") == "1"
+    ),
     # The next residual mix reads a row-sharded step's zero addends as one zero row.
     # Bit-identical output. On by default; 0 reads the zero tensors themselves.
     "ATOM_KIMI_K3_ATTN_RES_SKIP_ZERO_ADDENDS": lambda: (

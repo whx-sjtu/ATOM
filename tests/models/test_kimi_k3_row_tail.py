@@ -415,7 +415,7 @@ def logged(ranks, monkeypatch):
     return run
 
 
-def _layers(layer_num):
+def _layers(layer_num, attention=None, kda=True):
     w = _weights()
     gen = torch.Generator().manual_seed(layer_num)
     w_attn = (torch.randn(HIDDEN, HIDDEN, generator=gen) / HIDDEN**0.5).bfloat16()
@@ -427,7 +427,7 @@ def _layers(layer_num):
         num_experts=4,
         first_k_dense_replace=1,
         moe_layer_freq=1,
-        kimi_kda_layers=[layer_num],
+        kimi_kda_layers=[layer_num] if kda else [],
         attn_res_block_size=BLOCK,
     )
     layers = []
@@ -446,7 +446,8 @@ def _layers(layer_num):
                 stub = getattr(block, name)
                 stub.fn = _logs(name, stub.fn)
             patch.setattr(kimi, "KimiSparseMoeBlock", lambda *a, b=block, **k: b)
-            patch.setattr(kimi, "KimiKDAAttention", _Attention)
+            patch.setattr(kimi, "KimiKDAAttention", attention or _Attention)
+            patch.setattr(kimi, "KimiFullAttention", attention or _Attention)
             layer = kimi.KimiDecoderLayer(
                 SimpleNamespace(hf_config=config, quant_config=None),
                 prefix=f"rank{rank}.layers.{layer_num}",
@@ -1413,10 +1414,10 @@ def resident(logged, monkeypatch, stub_block_parts):
         )
     context = stub_block_parts.compilation_config.static_forward_context
 
-    def build(first):
+    def build(first, attention=None):
         stack = []
         for layer_num in (first, first + 1):
-            layers = _layers(layer_num)
+            layers = _layers(layer_num, attention)
             for layer in layers:
                 moe = layer.block_sparse_moe
                 moe.prefix = f"{layer.layer_name}.mlp"
@@ -1688,3 +1689,323 @@ def test_resident_rows_link_nothing_outside_one_eager_stage(monkeypatch, case):
         monkeypatch.setattr(plugin, "is_plugin_mode", lambda: True)
     kimi.KimiLinearModel._init_resident_rows(model, config)
     assert _linked(model) == [False] * 3
+
+
+# ---- ATOM_KIMI_K3_O_PROJ_PADDED_OUT (PKDA S2b): o_proj writes its partial
+# into the padded buffer the row tail's reduce-scatter takes.
+
+
+class _OProj:
+    """RowParallelLinear's call surface: this rank's share of the mixer
+    output, all-reduced unless the layer turns `reduce_results` off, and
+    written into `out` when given."""
+
+    runs_bf16 = False
+    output_size = HIDDEN
+
+    def __init__(self, attn) -> None:
+        self.attn = attn
+        self.reduce_results = True
+        self.out_ok = True
+        self.calls = []
+
+    def supports_out(self):
+        return self.out_ok
+
+    def __call__(self, x, x_scale=None, out=None):
+        assert x_scale is None
+        self.calls.append(out is not None)
+        y = (self.attn.share * x).to(x.dtype)
+        if self.reduce_results:
+            y = kimi.tensor_model_parallel_all_reduce(y)
+        return y if out is None else out.copy_(y)
+
+
+class _PaddedAttention(_Attention):
+    """`_Attention`, its o_proj called as the KDA mixer calls it."""
+
+    padded_out_rows = None  # as on KimiKDAAttention / KimiFullAttention
+    o_proj_layer_name = None
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__()
+        self.o_proj = _OProj(self)
+
+    def forward(self, x):
+        _events.log.append(("attention", x.shape[0]))
+        return kimi._o_proj_into_rows(self, torch.tanh(x @ self.w))
+
+
+class _RankSlot:
+    """`kimi._O_PROJ_ROWS` for each simulated rank: the ranks are threads
+    here, processes in the engine."""
+
+    def __init__(self) -> None:
+        self.local = threading.local()
+
+    def _items(self):
+        if not hasattr(self.local, "items"):
+            self.local.items = []
+        return self.local.items
+
+    def __bool__(self):
+        return bool(self._items())
+
+    def __len__(self):
+        return len(self._items())
+
+    def __setitem__(self, key, value):
+        self._items()[key] = value
+
+    def pop(self):
+        return self._items().pop()
+
+    def clear(self):
+        self._items().clear()
+
+
+@pytest.fixture
+def o_proj_slot(monkeypatch):
+    slot = _RankSlot()
+    monkeypatch.setattr(kimi, "_O_PROJ_ROWS", slot)
+    return slot
+
+
+def _padded_layers(monkeypatch, layer_num, kda=True):
+    monkeypatch.setenv("ATOM_KIMI_K3_O_PROJ_PADDED_OUT", "1")
+    layers = _layers(layer_num, _PaddedAttention, kda)
+    monkeypatch.delenv("ATOM_KIMI_K3_O_PROJ_PADDED_OUT")
+    return layers
+
+
+def _set_padded_out(layers, on):
+    for layer in layers:
+        attn = layer.self_attn
+        attn.padded_out_rows = layer.block_sparse_moe.padded_out_rows if on else None
+
+
+def test_o_proj_padded_out_is_off_unless_1(monkeypatch):
+    monkeypatch.delenv("ATOM_KIMI_K3_O_PROJ_PADDED_OUT", raising=False)
+    from atom.utils import envs
+
+    assert envs.ATOM_KIMI_K3_O_PROJ_PADDED_OUT is False
+    for layer in _layers(4, _PaddedAttention):
+        assert layer.self_attn.padded_out_rows is None
+        assert layer.self_attn.o_proj_layer_name is None
+
+
+@pytest.mark.parametrize("kda", [True, False], ids=["kda", "mla"])
+def test_o_proj_padded_out_wires_each_row_tail_layer(monkeypatch, kda):
+    for layer in _padded_layers(monkeypatch, 4, kda):
+        moe = layer.block_sparse_moe
+        assert layer.post_attention_op
+        assert layer.self_attn.padded_out_rows == moe.padded_out_rows
+        # The MLA attention is traced: it reaches o_proj through the op.
+        want = None if kda else layer.layer_name
+        assert layer.self_attn.o_proj_layer_name == want
+        assert moe not in list(layer.self_attn.modules())
+
+
+@pytest.mark.parametrize("layer_num", [4, 5], ids=["block-closes", "mid-block"])
+@pytest.mark.parametrize("tokens", [8, 13, 1027])
+def test_o_proj_padded_out_keeps_the_row_tail_bit_for_bit(
+    logged, monkeypatch, o_proj_slot, tokens, layer_num
+):
+    """On a step with pad rows o_proj writes into the padded buffer that the
+    attention reduce-scatter then takes as it is, as the routed and shared
+    partials are; without pad rows nothing changes. Outputs, collectives and
+    kernels stay the same."""
+    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "4")
+    layers = _padded_layers(monkeypatch, layer_num)
+    inputs = _inputs(tokens)
+    pad_rows, local = sequence_parallel._pad_rows, threading.local()
+
+    def recorded(x, missing):
+        out = pad_rows(x, missing)
+        if x.shape[0] == tokens:  # a reduce-scatter's input, not a shard
+            local.pads.append((x.shape[-1], out is getattr(x, "_padded_rows_of", 0)))
+        return out
+
+    monkeypatch.setattr(sequence_parallel, "_pad_rows", recorded)
+
+    def forward(rank):
+        local.pads = []
+        out = layers[rank](None, *(x.clone() for x in inputs))
+        return (
+            out,
+            local.pads,
+            list(layers[rank].self_attn.o_proj.calls),
+            len(o_proj_slot),
+        )
+
+    _set_padded_out(layers, False)
+    base = logged(forward)
+    for layer in layers:
+        layer.self_attn.o_proj.calls.clear()
+    _set_padded_out(layers, True)
+    got = logged(forward)
+
+    padded = tokens % WORLD != 0
+    for (want, want_log), (have, log) in zip(base, got):
+        (want_out, want_pads, want_calls, _), (out, pads, calls, left) = want, have
+        assert log == want_log
+        assert all(map(torch.equal, _bits(out), _bits(want_out)))
+        assert want_pads == [(HIDDEN, False), (LATENT, padded), (HIDDEN, padded)]
+        assert pads == [(HIDDEN, padded), (LATENT, padded), (HIDDEN, padded)]
+        assert want_calls == [False] and calls == [padded]
+        assert left == 0
+
+
+@pytest.mark.parametrize("first", [BLOCK - 1, BLOCK], ids=["mix-closes", "mid-block"])
+@pytest.mark.parametrize("tokens", [13, 1027])
+def test_o_proj_padded_out_keeps_the_resident_stack_bit_for_bit(
+    resident, monkeypatch, o_proj_slot, tokens, first
+):
+    """Under ATOM_KIMI_K3_ROW_SHARD_RESIDUAL as well: S2b on against off, with
+    both row tails keeping their residual on their rows."""
+    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "4")
+    monkeypatch.setenv("ATOM_KIMI_K3_O_PROJ_PADDED_OUT", "1")
+    model = resident.build(first, _PaddedAttention)
+    monkeypatch.delenv("ATOM_KIMI_K3_O_PROJ_PADDED_OUT")
+    resident.link(model)
+    layers = [
+        layer for first_layer, second, _ in model for layer in (first_layer, second)
+    ]
+    _set_padded_out(layers, False)
+    base = resident.forward(model, _inputs(tokens))
+    _set_padded_out(layers, True)
+    got = resident.forward(model, _inputs(tokens))
+    for rank, ((want, want_log), (have, log)) in enumerate(zip(base, got)):
+        hidden, aggregate, aux, (residual, _, _, bank) = have
+        assert log == want_log
+        assert torch.equal(hidden, want[0]) and not hidden.isnan().any()
+        assert torch.equal(aggregate, want[1]) and torch.equal(aux, want[2])
+        for kept_rows, want_rows in ((residual, want[3][0]), (bank, want[3][3])):
+            assert torch.equal(
+                _owned(tokens, rank, kept_rows), _owned(tokens, rank, want_rows)
+            )
+    for first_layer, second, _ in model:
+        for layer in (first_layer, second):
+            assert layer.self_attn.o_proj.calls == [False, True]
+
+
+def _one_layer_rows(monkeypatch, tokens, case):
+    """Per rank: (o_proj's result, whether it went to a padded buffer, what
+    the slot holds afterwards) for one call of `_o_proj_into_rows` in `case`."""
+    layers = _padded_layers(monkeypatch, 4)
+    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "4")
+    if case == "off":
+        _set_padded_out(layers, False)
+    elif case == "below-floor":
+        monkeypatch.setenv("ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS", str(tokens + 1))
+    elif case == "graph":
+        _in_graph(monkeypatch, token_graph=False)
+    elif case == "no-out":
+        for layer in layers:
+            layer.self_attn.o_proj.out_ok = False
+    elif case == "runs-bf16":
+        for layer in layers:
+            layer.self_attn.o_proj.runs_bf16 = True
+    elif case == "pad-in-place-off":
+        monkeypatch.setenv("ATOM_ROW_SHARD_PAD_IN_PLACE", "0")
+    x = torch.randn(tokens, HIDDEN, generator=torch.Generator().manual_seed(tokens))
+    return layers, x.bfloat16()
+
+
+@pytest.mark.parametrize(
+    "case,tokens",
+    [
+        ("on", 13),
+        ("on", 16),
+        ("off", 13),
+        ("below-floor", 13),
+        ("graph", 13),
+        ("no-out", 13),
+        ("runs-bf16", 13),
+        ("pad-in-place-off", 13),
+    ],
+)
+def test_o_proj_rows_gate(ranks, monkeypatch, o_proj_slot, case, tokens):
+    """Only an eager row tail with pad rows, an o_proj that writes `out=` and
+    in-place padding put the partial into a padded buffer; everywhere else
+    o_proj runs as before and nothing is registered."""
+    layers, x = _one_layer_rows(monkeypatch, tokens, case)
+    want_padded = case == "on" and tokens % WORLD != 0
+
+    def on_rank(rank):
+        attn = layers[rank].self_attn
+        attn.o_proj.reduce_results = False
+        y = kimi._o_proj_into_rows(attn, x)
+        buffer = getattr(y, "_padded_rows_of", None)
+        held = list(o_proj_slot._items())
+        o_proj_slot.clear()
+        return y, buffer, held, attn.o_proj.calls
+
+    for rank, (y, buffer, held, calls) in enumerate(ranks(on_rank)):
+        share = layers[rank].self_attn.share
+        assert torch.equal(y, (share * x).to(x.dtype))
+        assert calls == [want_padded]
+        if want_padded:
+            assert held == [y] and buffer.shape == (16, HIDDEN)
+            assert buffer.data_ptr() == y.data_ptr() and not buffer[tokens:].any()
+        else:
+            assert held == [] and buffer is None
+
+
+def test_o_proj_rows_taken_only_as_themselves(monkeypatch, ranks, o_proj_slot):
+    """The post-attention op takes the registered rows only when it is handed
+    them; a copy (as a compiler might make) pads as before. The slot is
+    emptied either way, and an empty slot hands its input back."""
+    layers, x = _one_layer_rows(monkeypatch, 13, "on")
+
+    def on_rank(rank):
+        attn = layers[rank].self_attn
+        attn.o_proj.reduce_results = False
+        y = kimi._o_proj_into_rows(attn, x)
+        copy = y.clone()
+        missed = kimi._take_o_proj_rows(copy)
+        after_miss = len(o_proj_slot)
+        y2 = kimi._o_proj_into_rows(attn, x)
+        view = y2.view(13, HIDDEN)
+        taken = kimi._take_o_proj_rows(view)
+        after_take = len(o_proj_slot)
+        again = kimi._take_o_proj_rows(view)
+        return copy, missed, after_miss, y2, taken, after_take, again, view
+
+    for copy, missed, after_miss, y2, taken, after_take, again, view in ranks(on_rank):
+        assert missed is copy and after_miss == 0
+        assert taken is y2 and after_take == 0
+        assert again is view
+
+
+def test_mla_o_proj_runs_through_the_op(
+    monkeypatch, ranks, o_proj_slot, stub_block_parts
+):
+    """A traced (MLA) attention reaches o_proj through `kimi_k3_o_proj_rows`,
+    which looks its layer up and runs `_o_proj_into_rows` on its attention;
+    its fake has o_proj's output shape."""
+    layers = _padded_layers(monkeypatch, 4, kda=False)
+    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "4")
+    x = torch.randn(13, HIDDEN, generator=torch.Generator().manual_seed(5)).bfloat16()
+    core = torch.tanh(x @ layers[0].self_attn.w)
+    fake = kimi._kimi_k3_o_proj_rows_fake(core, None, "unused", HIDDEN)
+    assert fake.shape == (13, HIDDEN) and fake.dtype == torch.bfloat16
+
+    def on_rank(rank):
+        layer = layers[rank]
+        attn = layer.self_attn
+        attn.o_proj.reduce_results = False
+        attn._gated_core = lambda positions, h: (torch.tanh(h @ attn.w), None)
+        y = kimi.KimiFullAttention.forward(attn, None, x)
+        held = list(o_proj_slot._items())
+        o_proj_slot.clear()
+        attn.o_proj_layer_name = None
+        plain = kimi.KimiFullAttention.forward(attn, None, x)
+        return y, held, plain, layer
+
+    context = stub_block_parts.compilation_config.static_forward_context
+    for y, held, plain, layer in ranks(on_rank):
+        assert context[layer.layer_name] is layer
+        assert held == [y] and y._padded_rows_of.shape == (16, HIDDEN)
+        assert torch.equal(_bits([y])[0], _bits([plain])[0])
+        assert layer.self_attn.o_proj.calls == [True, False]

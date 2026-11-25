@@ -96,6 +96,7 @@ from atom.models.utils import (
 from atom.plugin import is_plugin_mode
 from atom.quant_spec import effective_layer_quant
 from atom.utils import envs, mark_spliting_op
+from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
 from atom.utils.region_graph import (
@@ -169,6 +170,20 @@ def _log_row_tail_side_rs():
         "Kimi-K3 row tail: the shared reduce-scatter runs on a second pynccl "
         "communicator on a side stream, under the routed experts"
     )
+
+
+@lru_cache(maxsize=2)
+def _log_o_proj_rows(taken: bool):
+    if taken:
+        logging.getLogger("atom").info(
+            "Kimi-K3 row tail: o_proj writes its partial into the padded "
+            "reduce-scatter buffer"
+        )
+    else:
+        logging.getLogger("atom").warning(
+            "Kimi-K3 row tail: the post-attention op got a copy of o_proj's "
+            "padded rows, not the rows themselves; it pads the copy"
+        )
 
 
 @lru_cache(maxsize=1)
@@ -859,6 +874,20 @@ class KimiSparseMoeBlock(nn.Module):
         the same and every bank read is of this rank's rows."""
         return self.resident_rows and self.takes_row_tail(num_tokens)
 
+    def padded_out_rows(self, num_tokens: int):
+        """This step's rows when its row tail runs eagerly and has pad rows,
+        else None: where the attention's o_proj may write its partial into a
+        padded buffer (`_o_proj_into_rows`). Graph recordings keep o_proj's
+        own output."""
+        if (
+            get_forward_context().in_hipgraph
+            or torch.cuda.is_current_stream_capturing()
+            or not self.takes_row_tail(num_tokens)
+        ):
+            return None
+        rows = self.row_shards(num_tokens)
+        return rows if rows.pad else None
+
     def resident_attn_res(
         self,
         prefix_sum: torch.Tensor,
@@ -1369,6 +1398,11 @@ def _qkvg_refusal(attn, a, g) -> str:
 
 
 class KimiFullAttention(nn.Module):
+    # Under ATOM_KIMI_K3_O_PROJ_PADDED_OUT the decoder layer sets both: its MoE
+    # block's `padded_out_rows` and its own name, for `kimi_k3_o_proj_rows`.
+    padded_out_rows = None
+    o_proj_layer_name = None
+
     def __init__(
         self,
         atom_config: Config,
@@ -1797,6 +1831,10 @@ class KimiFullAttention(nn.Module):
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
         attn_out, attn_scale = self._gated_core(positions, hidden_states)
+        if self.o_proj_layer_name is not None:
+            return kimi_k3_o_proj_rows(
+                attn_out, attn_scale, self.o_proj_layer_name, self.o_proj.output_size
+            )
         return self.o_proj(attn_out, x_scale=attn_scale)
 
     def forward_pre_o(
@@ -1815,6 +1853,95 @@ def _mono_serves(indexer) -> bool:
     from atom.mono.dsa_indexer.bind import launch_serves
 
     return launch_serves(indexer)
+
+
+# ATOM_KIMI_K3_O_PROJ_PADDED_OUT: the o_proj rows an eager row tail with pad
+# rows is about to reduce-scatter, registered by `_o_proj_into_rows` and taken
+# back by the post-attention op (`_take_o_proj_rows`). One slot, which holds
+# the buffer alive, so a matching address is this buffer.
+_O_PROJ_ROWS: list[torch.Tensor] = []
+
+
+def _o_proj_into_rows(
+    attn: nn.Module, x: torch.Tensor, x_scale: torch.Tensor | None = None
+) -> torch.Tensor:
+    """``attn.o_proj(x, x_scale=x_scale)``, the layer's partial sum. On a step
+    whose row tail runs eagerly with pad rows (``attn.padded_out_rows``, set
+    under ATOM_KIMI_K3_O_PROJ_PADDED_OUT) it is written into the leading rows
+    of a buffer whose pad rows are zero (`SequenceParallel.padded_rows`), and
+    registered, so the reduce-scatter takes that buffer as it is instead of
+    copying the partial into a padded one. Same GEMM, same output layout."""
+    o_proj = attn.o_proj
+    rows_of = attn.padded_out_rows
+    # The KDA mixer's own calls: no x_scale keyword for a bf16 input.
+    scale = {} if x_scale is None else {"x_scale": x_scale}
+    if (
+        rows_of is not None
+        and x.dim() == 2
+        and o_proj.supports_out()
+        and not o_proj.runs_bf16
+    ):
+        rows = rows_of(x.shape[0])
+        out = (
+            None
+            if rows is None
+            else rows.padded_rows(
+                torch.empty(
+                    (0, o_proj.output_size), dtype=torch.bfloat16, device=x.device
+                )
+            )
+        )
+        if out is not None:
+            y = o_proj(x, **scale, out=out)
+            if y.data_ptr() == out.data_ptr() and y.shape == out.shape:
+                _O_PROJ_ROWS[:] = [out]
+                return out
+            _O_PROJ_ROWS.clear()
+            return y
+    return o_proj(x, **scale)
+
+
+def _take_o_proj_rows(x: torch.Tensor) -> torch.Tensor:
+    """`x`, or the registered o_proj rows when `x` is they (same address,
+    shape, strides and dtype): their padded buffer then reaches the
+    reduce-scatter uncopied. Either way the registration ends here."""
+    if not _O_PROJ_ROWS:
+        return x
+    rows = _O_PROJ_ROWS.pop()
+    taken = (
+        x.data_ptr() == rows.data_ptr()
+        and x.shape == rows.shape
+        and x.stride() == rows.stride()
+        and x.dtype == rows.dtype
+    )
+    _log_o_proj_rows(taken)
+    return rows if taken else x
+
+
+def _kimi_k3_o_proj_rows_fake(
+    x: torch.Tensor, x_scale: torch.Tensor | None, layer_name: str, out_size: int
+) -> torch.Tensor:
+    return torch.empty((x.shape[0], out_size), dtype=torch.bfloat16, device=x.device)
+
+
+def _kimi_k3_o_proj_rows(
+    x: torch.Tensor, x_scale: torch.Tensor | None, layer_name: str, out_size: int
+) -> torch.Tensor:
+    """`_o_proj_into_rows` for an attention torch.compile traces (the MLA
+    layers'), as one opaque call: the per-step choice and the registration
+    stay out of the graph. `out_size` is o_proj's output width."""
+    layer = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    return _o_proj_into_rows(layer.self_attn, x, x_scale)
+
+
+kimi_k3_o_proj_rows = direct_register_custom_op(
+    op_name="kimi_k3_o_proj_rows",
+    op_func=_kimi_k3_o_proj_rows,
+    mutates_args=[],
+    fake_impl=_kimi_k3_o_proj_rows_fake,
+)
 
 
 def _kda_attention_with_output_fake(
@@ -1961,6 +2088,9 @@ def _state_write_index(kda_metadata, state_indices: torch.Tensor) -> torch.Tenso
 
 
 class KimiKDAAttention(nn.Module):
+    # Set by the decoder layer under ATOM_KIMI_K3_O_PROJ_PADDED_OUT.
+    padded_out_rows = None
+
     @property
     def mamba_type(self) -> str:
         return "kimi_kda"
@@ -2946,8 +3076,8 @@ class KimiKDAAttention(nn.Module):
         # straight to o_proj's x_scale path. Otherwise it is a bf16 tensor.
         if isinstance(normed, tuple):
             o_fp8, o_scale = normed
-            return self.o_proj(o_fp8, x_scale=o_scale)
-        return self.o_proj(rearrange(normed, "t h d -> t (h d)"))
+            return _o_proj_into_rows(self, o_fp8, o_scale)
+        return _o_proj_into_rows(self, rearrange(normed, "t h d -> t (h d)"))
 
     # ---- The prefill split's steps (`_forward_prefill_split`): those of
     # `_forward_impl`'s prefill, apart so a token-graph recording can break
@@ -3215,6 +3345,11 @@ class KimiDecoderLayer(nn.Module):
             self.self_attn.o_proj.reduce_results = False
             cc = get_current_atom_config().compilation_config
             cc.static_forward_context[prefix] = self
+            if envs.ATOM_KIMI_K3_O_PROJ_PADDED_OUT:
+                # A bound method, not a module: no second path to the block.
+                self.self_attn.padded_out_rows = self.block_sparse_moe.padded_out_rows
+                if not self.is_linear_attn:
+                    self.self_attn.o_proj_layer_name = prefix
         # Fuse the activation quant into input_layernorm when the attention input
         # projection(s) run with a fusable quant scheme (self_attn decides and
         # exposes the flag + representative prefix). The normed output then flows
@@ -3385,7 +3520,7 @@ class KimiDecoderLayer(nn.Module):
         hidden_rows, prefix_rows = self.mlp_attn_res(
             None if prefix_sum is None else rows.shard(prefix_sum),
             None if window is None else rows.shard(window),
-            rows.scatter(attn_partial),
+            rows.scatter(_take_o_proj_rows(attn_partial)),
         )
         if moe.resident_rows:
             residual = moe.row_sharded_moe(
