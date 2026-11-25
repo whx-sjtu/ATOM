@@ -37,8 +37,8 @@ class _SideStream:
     """A priority -1 stream whose work starts after what the current stream
     has queued so far."""
 
-    def __init__(self) -> None:
-        self.stream = torch.cuda.Stream(priority=-1)
+    def __init__(self, stream: "torch.cuda.Stream | None" = None) -> None:
+        self.stream = torch.cuda.Stream(priority=-1) if stream is None else stream
 
     def run(self, fn: Callable[[], None], *uses: torch.Tensor) -> Callable[[], None]:
         """Queue `fn` here; `uses` are current-stream tensors it reads. The
@@ -100,6 +100,20 @@ def _side_comm():
         )
         _SIDE.append((nccl, _SideStream()))
     return _SIDE[0]
+
+
+_SIDE_ON: dict = {}
+
+
+def _side_on(stream: torch.cuda.Stream) -> _SideStream:
+    """A `_SideStream` over an existing stream (one per stream). Reusing a
+    stream that already has a HW queue saves the scratch ROCr backs a new
+    queue with when RCCL's first kernel runs there (360 MiB per GPU on MI355X
+    for a new priority -1 stream, PF-IRIS mb3)."""
+    side = _SIDE_ON.get(stream)
+    if side is None:
+        side = _SIDE_ON[stream] = _SideStream(stream)
+    return side
 
 
 class SequenceParallel:
@@ -171,14 +185,19 @@ class SequenceParallel:
             return out_a, out_b
         return self._scatter_padded(a), self._scatter_padded(b)
 
-    def scatter_side(self, x: torch.Tensor) -> Callable[[], torch.Tensor]:
+    def scatter_side(
+        self, x: torch.Tensor, stream: "torch.cuda.Stream | None" = None
+    ) -> Callable[[], torch.Tensor]:
         """`scatter(x)` on pynccl (`_side_comm`), on a side stream, after the
         work queued so far. Returns a callable that makes the current stream
         wait for the reduce and returns its rows; it holds the input until
         then, so call it before the input's memory may be reused. One side
-        reduce at a time: the side stream runs them in issue order."""
+        reduce at a time: the side stream runs them in issue order. `stream`:
+        run on that existing stream instead of the private priority -1 one."""
         x = _pad_rows(x.contiguous(), self.pad)
         nccl, side = _side_comm()
+        if stream is not None:
+            side = _side_on(stream)
         out = x.new_empty((x.shape[0] // self.tp_size, *x.shape[1:]))
         wait = side.run(lambda: nccl.reduce_scatter(out, x), x)
 

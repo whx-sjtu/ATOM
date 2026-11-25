@@ -1547,6 +1547,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_K3_ROW_SHARD_SIDE_RS_OWN_COMM": lambda: (
         os.getenv("ATOM_KIMI_K3_ROW_SHARD_SIDE_RS_OWN_COMM", "0") == "1"
     ),
+    # The side reduce runs on the model's alt_stream, whose HW queue exists
+    # already, instead of a new priority -1 stream: a new queue's first RCCL
+    # kernel makes ROCr allocate ~360 MiB of scratch per GPU, outside torch and
+    # before the KV budget. On by default; 0 uses the private stream.
+    "ATOM_KIMI_K3_ROW_SHARD_SIDE_RS_ON_ALT": lambda: (
+        os.getenv("ATOM_KIMI_K3_ROW_SHARD_SIDE_RS_ON_ALT", "1") == "1"
+    ),
     # Row-sharded steps keep the residual on its rows between layers: a row
     # tail skips its last gather and the next BF16 residual mix runs on this
     # rank's rows, then gathers its output. Bit-identical output. Read once

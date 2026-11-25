@@ -1006,7 +1006,8 @@ class KimiSparseMoeBlock(nn.Module):
         if rows.side_rs:
             _log_row_tail_side_rs()
             shared_rows = rows.scatter_side(
-                self._row_sharded_shared(hidden_states, rows)
+                self._row_sharded_shared(hidden_states, rows),
+                self.alt_stream if envs.ATOM_KIMI_K3_ROW_SHARD_SIDE_RS_ON_ALT else None,
             )
         routed_output = rows.padded_rows(routed_input)
         if routed_output is None:

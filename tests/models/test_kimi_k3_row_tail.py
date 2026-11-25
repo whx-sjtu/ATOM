@@ -993,6 +993,14 @@ def side(monkeypatch):
         return nccl, SimpleNamespace(run=run)
 
     monkeypatch.setattr(sequence_parallel, "_side_comm", side_comm)
+    on = []
+
+    def side_on(stream):
+        on.append(stream)
+        return SimpleNamespace(run=run)
+
+    monkeypatch.setattr(sequence_parallel, "_side_on", side_on)
+    return on
 
 
 def test_side_rs_defaults(monkeypatch):
@@ -2235,3 +2243,32 @@ def test_owned_mix_keeps_other_mixes_as_they_are(logged, owned_mix, monkeypatch,
     assert layer._owned_mix_fits(x, site.window(bank), x) == (
         case not in ("disabled", "fp8-out", "resident")
     )
+
+
+@pytest.mark.parametrize("on_alt", ["0", "1"], ids=["private", "alt"])
+def test_side_rs_runs_on_the_alt_stream(logged, side, monkeypatch, on_alt):
+    """The side reduce takes the block's alt_stream (an existing HW queue)
+    unless ..._SIDE_RS_ON_ALT=0; the sums are the same either way."""
+    forward = _row_layer_forward(monkeypatch, "0", 13)
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_CUSTOM_COMM", "1")
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB", _PYNCCL_RS_MIB)
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_GROUP_RS", "0")
+    apart = logged(forward)
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_SIDE_RS", "1")
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_SIDE_RS_MIN_TOKENS", "13")
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_SIDE_RS_ON_ALT", on_alt)
+    sided = logged(forward)
+    for (want, _), (got, log) in zip(apart, sided):
+        assert "side_stream" in [name for name, _ in log]
+        assert all(torch.equal(a, b) for a, b in zip(got, want))
+    if on_alt == "1":
+        assert len(side) == WORLD and all(s is not None for s in side)
+    else:
+        assert side == []
+
+
+def test_side_on_wraps_each_stream_once(monkeypatch):
+    monkeypatch.setattr(sequence_parallel, "_SIDE_ON", {})
+    s1, s2 = object(), object()
+    a, b, c = (sequence_parallel._side_on(s) for s in (s1, s1, s2))
+    assert a is b and a is not c and a.stream is s1 and c.stream is s2
