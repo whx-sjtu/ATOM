@@ -108,9 +108,26 @@ def _dcp_stage_indexer_fp4_mfma_fused(
     kv_cache: torch.Tensor,
     kv_cache_scale: torch.Tensor,
     prefill_metadata,
+    pull: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """`_dcp_stage_indexer_fp4_prefill`'s MFMA branch in two launches around
-    the all-gather, byte for byte (`fp4_stage`)."""
+    the all-gather, byte for byte (`fp4_stage`). With ``pull`` (the indexer's
+    `_dcp_index_pull`) around a barrier instead, when the call can: the second
+    reads every rank's rows from its peer memory (`fp4_stage.stage_from_peers`)."""
+    if pull:
+        staged = fp4_stage.stage_from_peers(
+            kv_cache,
+            kv_cache_scale,
+            prefill_metadata.dcp_indexer_fp4_read_page,
+            prefill_metadata.dcp_indexer_fp4_read_row,
+            prefill_metadata.dcp_indexer_fp4_read_scale_at,
+            prefill_metadata.dcp_indexer_local_total,
+            prefill_metadata.dcp_indexer_gather_index,
+            prefill_metadata.dcp_indexer_fp4_stage_row_of,
+            get_dcp_group(),
+        )
+        if staged is not None:
+            return staged
     rows = fp4_stage.pack_rows(
         kv_cache,
         kv_cache_scale,
@@ -634,7 +651,10 @@ def _index_cache(indexer, kv_cache, attn_metadata, is_prefill) -> IndexCache:
             and fp4_stage.supports(kv_cache, scales)
         ):
             kv_cache, scales = _dcp_stage_indexer_fp4_mfma_fused(
-                kv_cache, scales, attn_metadata
+                kv_cache,
+                scales,
+                attn_metadata,
+                getattr(indexer, "_dcp_index_pull", False),
             )
         else:
             kv_cache, scales = _dcp_stage_indexer_fp4_prefill(

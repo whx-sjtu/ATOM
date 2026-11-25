@@ -1251,21 +1251,20 @@ def _all_ranks_ok(ok: bool, group) -> bool:
     return bool(flag.item())
 
 
-class _PullWorkspace:
-    """This rank's values, LSE and signal buffers of one (group, heads, dim),
-    and every rank's address of each. Values and LSE are coarse-grained, as
-    hipMalloc's; the signal words are uncached. Kept until the process exits."""
+class PeerBuffers:
+    """This rank's buffers of ``sizes`` bytes, and every rank's address of each
+    (``tabs``: a [ranks] int64 table a buffer). The last holds a barrier's
+    signal words (`peer_barrier`) and is uncached; the others are
+    coarse-grained, as hipMalloc's, and 16-byte aligned. Collective over
+    ``cp_group``. Kept until the process exits."""
 
-    def __init__(self, cp_group, heads, dim, rows):
+    def __init__(self, cp_group, sizes):
         from aiter.ops.flydsl.ipc_heap import IpcHeap
 
         self.group = cp_group.cpu_group
         self.rank, self.ranks = cp_group.rank_in_group, cp_group.world_size
-        self.rows = rows
-        sizes = (heads * rows * dim * 2, heads * rows * 4, _PULL_SIGNAL_BYTES)
-        flags = (
-            IpcHeap._HIP_DEVICE_MALLOC_DEFAULT,
-            IpcHeap._HIP_DEVICE_MALLOC_DEFAULT,
+        self.sizes = tuple(sizes)
+        flags = (IpcHeap._HIP_DEVICE_MALLOC_DEFAULT,) * (len(sizes) - 1) + (
             IpcHeap._HIP_DEVICE_MALLOC_UNCACHED,
         )
         self.nbytes = sum(sizes)
@@ -1290,26 +1289,29 @@ class _PullWorkspace:
                         self._opened.append(addresses[peer][i])
         except RuntimeError as error:
             failure = error
-        # The combine declares the value pointers 16-byte aligned.
-        aligned = all(a[0] % 16 == 0 for a in addresses)
+        # The pull kernels declare these pointers 16-byte aligned.
+        aligned = all(x % 16 == 0 for a in addresses for x in a)
         if not _all_ranks_ok(failure is None and aligned, self.group):
             self.close()
             raise RuntimeError(
                 f"mapping failed on {'this' if failure or not aligned else 'another'} rank"
             ) from failure
-        device = torch.device("cuda", torch.cuda.current_device())
-        self.values_tab, self.lse_tab, self.signal_tab = (
-            torch.tensor([a[i] for a in addresses], dtype=torch.int64, device=device)
-            for i in range(3)
+        self.device = torch.device("cuda", torch.cuda.current_device())
+        self.tabs = tuple(
+            torch.tensor(
+                [a[i] for a in addresses], dtype=torch.int64, device=self.device
+            )
+            for i in range(len(sizes))
         )
-        self.values = torch.as_tensor(
-            _DeviceBytes(self._local[0], sizes[0]), device=device
-        ).view(torch.bfloat16)
-        self.lse = torch.as_tensor(
-            _DeviceBytes(self._local[1], sizes[1]), device=device
-        ).view(torch.float32)
-        torch.cuda.synchronize(device)
+        self.signal_tab = self.tabs[-1]
+        torch.cuda.synchronize(self.device)
         torch.distributed.barrier(group=self.group)
+
+    def local(self, i, dtype) -> torch.Tensor:
+        """This rank's buffer ``i``, flat, as ``dtype``."""
+        return torch.as_tensor(
+            _DeviceBytes(self._local[i], self.sizes[i]), device=self.device
+        ).view(dtype)
 
     def close(self) -> None:
         from aiter.ops.flydsl.ipc_heap import IpcHeap
@@ -1320,6 +1322,20 @@ class _PullWorkspace:
         local, self._local = self._local, []
         for ptr in local:
             IpcHeap.free_device_mem(ptr)
+
+
+class _PullWorkspace(PeerBuffers):
+    """This rank's values, LSE and signal buffers of one (group, heads, dim),
+    and every rank's address of each."""
+
+    def __init__(self, cp_group, heads, dim, rows):
+        self.rows = rows
+        super().__init__(
+            cp_group, (heads * rows * dim * 2, heads * rows * 4, _PULL_SIGNAL_BYTES)
+        )
+        self.values_tab, self.lse_tab = self.tabs[:2]
+        self.values = self.local(0, torch.bfloat16)
+        self.lse = self.local(1, torch.float32)
 
 
 def _bmm_chunks_keep_bits(heads, dim, lora_rank) -> bool:
@@ -1487,6 +1503,15 @@ def _dcp_pull_combine_kernel(
 def _pull_barrier(ws, key) -> None:
     _PULL_LAUNCHES[key] = _PULL_LAUNCHES.get(key, 0) + 1
     _dcp_pull_barrier_kernel[(1,)](ws.signal_tab, ws.rank, N_RANKS=ws.ranks)
+
+
+def peer_barrier(buffers: PeerBuffers) -> None:
+    """On the current stream, return once every rank of ``buffers``' group has
+    launched this barrier on its own buffers as often as this rank: work each
+    rank queued before it is then done and visible to every peer."""
+    _dcp_pull_barrier_kernel[(1,)](
+        buffers.signal_tab, buffers.rank, N_RANKS=buffers.ranks
+    )
 
 
 def dcp_prefill_pull_project_merge(

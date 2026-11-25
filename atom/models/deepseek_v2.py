@@ -1513,6 +1513,10 @@ direct_register_custom_op(
 
 @IndexerDecoratorForPluginMode
 class Indexer(nn.Module):
+    # Whether its DCP prefill FP4 index-key staging reads peer memory
+    # (`_prepare_dcp_index_pull`).
+    _dcp_index_pull = False
+
     def __init__(
         self,
         atom_config: Config,
@@ -1670,6 +1674,31 @@ class Indexer(nn.Module):
         self.register_buffer("_empty_rope_cache", torch.empty(0), persistent=False)
 
         self.sparse_attn_indexer_impl = torch.ops.aiter.sparse_attn_indexer
+        # Collective, once per DCP group: every DCP rank builds the same
+        # indexers in the same order, as for the weights.
+        if envs.ATOM_DCP_PREFILL_INDEX_PULL and self._indexer_opus:
+            self._prepare_dcp_index_pull()
+
+    def _prepare_dcp_index_pull(self):
+        """Map the DCP prefill index-key staging's peer memory while every rank
+        builds the same indexer (collective, and before the KV cache is sized).
+        Only the MFMA staging of ATOM_SPG_INDEXER_STAGE reads it. Plugin mode
+        sizes the KV cache elsewhere, a TBO step may stage two micro-batches at
+        once on one workspace, and PCP stages its own way: all keep the
+        all-gather."""
+        from atom.distributed.dcp_utils import get_dcp_group, get_dcp_world_size
+        from atom.model_ops.indexer import fp4_stage
+        from atom.plugin import is_plugin_mode
+
+        if (
+            get_dcp_world_size() < 2
+            or not envs.ATOM_SPG_INDEXER_STAGE
+            or is_plugin_mode()
+            or self.atom_config.enable_tbo
+            or pcp_is_enabled()
+        ):
+            return
+        self._dcp_index_pull = fp4_stage.prepare_pull(get_dcp_group())
 
     def forward(
         self,

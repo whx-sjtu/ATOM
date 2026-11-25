@@ -606,6 +606,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DCP_PREFILL_PULL_EPILOGUE": lambda: (
         os.getenv("ATOM_DCP_PREFILL_PULL_EPILOGUE", "0") == "1"
     ),
+    # The DCP prefill FP4 index-key staging (ATOM_SPG_INDEXER_STAGE's MFMA
+    # staging) reads every rank's packed rows from its peer memory after one
+    # barrier instead of all-gathering them. Bit-identical. Off by default.
+    "ATOM_DCP_PREFILL_INDEX_PULL": lambda: (
+        os.getenv("ATOM_DCP_PREFILL_INDEX_PULL", "0") == "1"
+    ),
     # Row-parallel DSA prefill under DCP (atom/model_ops/dsa_row_parallel.py):
     # a sparse prefill step of at least _MIN_TOKENS new tokens splits its rows
     # across the DCP group instead of replicating the query side: each rank
