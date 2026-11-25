@@ -103,6 +103,7 @@ from atom.model_ops.sparse_indexer_fp4 import (
 )
 from atom.model_ops.sparse_mla_work_plan import (
     plan_whole_rows,
+    sparse_mtp_templates,
     whole_row_plan_rows_per_cu,
 )
 from atom.utils import CpuGpuBuffer, envs, upload_numpy
@@ -1362,25 +1363,46 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         reduce_indptr = var["sparse_mtp_reduce_indptr"]
         reduce_final_map = var["sparse_mtp_reduce_final_map"]
         reduce_partial_map = var["sparse_mtp_reduce_partial_map"]
-        get_mla_metadata_v1(
-            var["sparse_cu_seqlens_q"].gpu[: rows + 1],
-            # Unit placeholders give even empty rows their own workgroup.
-            var["sparse_cu_seqlens_q" if plan else "sparse_kv_indptr"].gpu[: rows + 1],
-            var["sparse_kv_last_page_lens"].gpu[:rows],
-            heads,
-            1,  # nhead_kv
-            True,
-            work_meta_data,
+        # A template is a function of these alone (TemplatePlans); any other
+        # plan depends on the step's key ranges.
+        template = (
+            (plan, tuple(split_params.items()), work_indptr.numel())
+            if plan is not None and envs.ATOM_MLA_SPARSE_MTP_PLAN_REUSE
+            else None
+        )
+        buffers = (
             work_info_set,
-            work_indptr,
+            work_meta_data,
+            var["sparse_mtp_work_indptr"],
             reduce_indptr,
             reduce_final_map,
             reduce_partial_map,
-            page_size=self.block_size,
-            dtype_q=self.dtype_q,
-            dtype_kv=self.dtype_kv,
-            **split_params,
+            var["sparse_cu_seqlens_q"].gpu,
+            var["sparse_kv_last_page_lens"].gpu,
         )
+        if not sparse_mtp_templates.holds(buffers, template):
+            get_mla_metadata_v1(
+                var["sparse_cu_seqlens_q"].gpu[: rows + 1],
+                # Unit placeholders give even empty rows their own workgroup.
+                var["sparse_cu_seqlens_q" if plan else "sparse_kv_indptr"].gpu[
+                    : rows + 1
+                ],
+                var["sparse_kv_last_page_lens"].gpu[:rows],
+                heads,
+                1,  # nhead_kv
+                True,
+                work_meta_data,
+                work_info_set,
+                work_indptr,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+                page_size=self.block_size,
+                dtype_q=self.dtype_q,
+                dtype_kv=self.dtype_kv,
+                **split_params,
+            )
+        sparse_mtp_templates.wrote(buffers, template)
         return {
             "sparse_mtp_work_meta_data": work_meta_data,
             "sparse_mtp_work_info_set": work_info_set,
@@ -2817,6 +2839,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         return work
 
     def _finish_prefill_batch(self, batch, attn_metadata, prefix=""):
+        sparse_mtp_templates.forget()
         super()._finish_prefill_batch(batch, attn_metadata, prefix)
         bs = batch.scheduled_bs
         var = self.model_runner.forward_vars
@@ -4124,9 +4147,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         if is_sparse_mtp:
             # Two sets: normal for dense layers, sparse_mtp for sparse layers
             ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_q_len)
+            # A capture may record the planner without running it.
+            sparse_mtp_templates.forget()
             ctx_mla_ps_sparse = self._set_mla_persistent_worker_buffers_sparse_mtp(
                 scheduled_tokens
             )
+            sparse_mtp_templates.forget()
         else:
             ctx_mla_ps = self.set_mla_persistent_worker_buffers(
                 bs, max_q_len, is_cp_round_robin=cp_round_robin

@@ -16,6 +16,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from atom.model_ops.sparse_mla_work_plan import TemplatePlans
+
 WORK = (
     "work_meta_data",
     "work_indptr",
@@ -70,6 +72,7 @@ def runtime():
             ATOM_DMLA_MLA_HEAD_SPLIT=False,
             ATOM_DMLA_MLA_NO_REDUCE=False,
             ATOM_DMLA_QTAIL_PLAN_PATCH=False,
+            ATOM_MLA_SPARSE_MTP_PLAN_REUSE=False,
         ),
         "triton": SimpleNamespace(next_power_of_2=lambda n: 1 << (n - 1).bit_length()),
         "logger": logging.getLogger(__name__),
@@ -154,6 +157,7 @@ def runtime():
         patch_work_kv_ranges=patch,
         mla_decode_fwd=launch,
         _skipping_mla_decode_reduce=skipping_reduce,
+        sparse_mtp_templates=TemplatePlans(),
         calls=calls,
         patches=patches,
         reduce_skips=reduce_skips,

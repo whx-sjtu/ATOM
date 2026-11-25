@@ -67,6 +67,51 @@ def patch_work_kv_ranges(
     )
 
 
+class TemplatePlans:
+    """Which native decode template each set of persistent work buffers holds,
+    by the address of its ``work_info_set``.
+
+    The builder plans a template from its geometry alone (rows, heads, head
+    groups, dtypes and split parameters) over constant inputs: unit query and
+    key ranges and unit last pages. A layer then rewrites only its items' KV
+    start and end, from each item's batch_idx and the item count
+    (`patch_work_kv_ranges`, the q tail's plan patch), so buffers that held a
+    geometry's template still hold it on the next step over that geometry.
+    Anything that may leave them otherwise must forget them. It keeps the
+    buffers it vouches for, so no reallocation can pass for them at their
+    address.
+    """
+
+    def __init__(self):
+        self._held = {}
+
+    def holds(self, buffers: tuple[torch.Tensor, ...], template) -> bool:
+        """Whether ``buffers`` (``work_info_set`` first, then the planner's
+        other outputs and inputs) hold ``template``; never for None."""
+        held = self._held.get(buffers[0].data_ptr())
+        return (
+            template is not None
+            and held is not None
+            and held[0] == template
+            and all(a is b for a, b in zip(held[1], buffers, strict=True))
+        )
+
+    def wrote(self, buffers: tuple[torch.Tensor, ...], template) -> None:
+        """Record a planner write into ``buffers``: a template, or None for
+        any other plan."""
+        if template is None:
+            self._held.pop(buffers[0].data_ptr(), None)
+        else:
+            self._held[buffers[0].data_ptr()] = (template, buffers)
+
+    def forget(self) -> None:
+        self._held.clear()
+
+
+# The target's sparse MTP verify templates (ATOM_MLA_SPARSE_MTP_PLAN_REUSE).
+sparse_mtp_templates = TemplatePlans()
+
+
 @triton.jit
 def _plan_whole_rows(
     work_info,
