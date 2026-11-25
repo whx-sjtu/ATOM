@@ -757,7 +757,7 @@ def _select(monkeypatch, plan, row_parallel=True, rows=None):
     tokens, topk = plan.num_tokens, 128
     scored, indexed = [], []
 
-    def score_topk(query, weights, cache, rows, *, topk, weight_scale, stable, out):
+    def score_topk(query, weights, cache, rows, *, topk, weight_scale, stable, out, sampled_topk=False):
         scored.append(rows)
         out[rows.split.first : rows.split.end] = 5
         return out

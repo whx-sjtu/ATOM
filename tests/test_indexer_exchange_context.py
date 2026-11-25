@@ -107,8 +107,11 @@ def test_exchange_scores_local_rows_then_gathers_and_filters_on_its_stream(fp4):
             ),
             "get_dcp_rank": lambda: 0,
             "get_dcp_world_size": lambda: 2,
+            # PFX-DSA S1: the switch off here (its own tests cover it on)
+            "envs": SimpleNamespace(ATOM_DSA_PREFILL_TOPK_SAMPLED=False),
         },
         "_dcp_prefill_exchange",
+        "_sampled_topk",
     )
     ns["_dcp_prefill_exchange"](
         exchange,
@@ -205,6 +208,9 @@ def test_only_eligible_prefill_dispatches_the_exchange(prefill, dcp, stream, pac
         "_exchange_stream": exchange,
         "_dcp_prefill_exchange": lambda *a: calls.append("exchange"),
         "score_topk": lambda *a, **k: scores.append(k) or [0],
+        # PFX-DSA S1: the switch off here (its own tests cover it on)
+        "envs": SimpleNamespace(ATOM_DSA_PREFILL_TOPK_SAMPLED=False),
+        "_sampled_topk": lambda on: {"sampled_topk": True} if on else {},
         "indexer_fp4": False,
         "q_quant": None,
         "q_fp4_scale": None,
