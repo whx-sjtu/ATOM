@@ -492,6 +492,14 @@ def test_dmla_decode_switches_default_on(monkeypatch, name):
     assert getattr(_get_envs(), name) is False
 
 
+def test_fusb_skip_wqb_default_on(monkeypatch):
+    """The bit-exact skip of the DSA front's unread wq_b is on unless set to 0."""
+    monkeypatch.delenv("ATOM_FUSB_SKIP_WQB", raising=False)
+    assert _get_envs().ATOM_FUSB_SKIP_WQB is True
+    monkeypatch.setenv("ATOM_FUSB_SKIP_WQB", "0")
+    assert _get_envs().ATOM_FUSB_SKIP_WQB is False
+
+
 def test_dmla_qtail_plan_patch_default_on(monkeypatch):
     """The bit-exact q tail plan patch is on unless set to 0."""
     monkeypatch.delenv("ATOM_DMLA_QTAIL_PLAN_PATCH", raising=False)

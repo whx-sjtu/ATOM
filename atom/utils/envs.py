@@ -686,8 +686,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSB_QKVG": lambda: os.getenv("ATOM_FUSB_QKVG", "0") == "1",
     # That front also projects the indexer's q (wq_b) on a step the mono
     # indexer launch serves, which projects q_a itself and never reads it. With
-    # this, such a step skips the GEMM. Bit-exact. Off by default.
-    "ATOM_FUSB_SKIP_WQB": lambda: os.getenv("ATOM_FUSB_SKIP_WQB", "0") == "1",
+    # this, such a step skips the GEMM. Bit-exact. On by default; 0 projects
+    # it on every step.
+    "ATOM_FUSB_SKIP_WQB": lambda: os.getenv("ATOM_FUSB_SKIP_WQB", "1") == "1",
     # DCP sparse decode: kernel that merges the exchanged top-k candidates into
     # this rank's owned KV slots. "aiter" (default) is flydsl_dcp_topk_merge;
     # "atom" is atom/model_ops/dcp_topk_merge.py. Same output bit for bit.
