@@ -1530,6 +1530,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_K3_ROW_SHARD_GROUP_RS": lambda: (
         os.getenv("ATOM_KIMI_K3_ROW_SHARD_GROUP_RS", "1") == "1"
     ),
+    # Eager row-sharded steps of at least ..._SIDE_RS_MIN_TOKENS rows with the
+    # custom collectives run the shared experts before the routed ones and
+    # reduce-scatter their partial on a second pynccl communicator on a
+    # priority -1 side stream, under the routed experts; it takes the place of
+    # ..._GROUP_RS there. Changes the reduction order as ..._GROUP_RS=0 does.
+    # Off by default.
+    "ATOM_KIMI_K3_ROW_SHARD_SIDE_RS": lambda: (
+        os.getenv("ATOM_KIMI_K3_ROW_SHARD_SIDE_RS", "0") == "1"
+    ),
+    "ATOM_KIMI_K3_ROW_SHARD_SIDE_RS_MIN_TOKENS": lambda: int(
+        os.getenv("ATOM_KIMI_K3_ROW_SHARD_SIDE_RS_MIN_TOKENS", "4097")
+    ),
     # The next residual mix reads a row-sharded step's zero addends as one zero row.
     # Bit-identical output. On by default; 0 reads the zero tensors themselves.
     "ATOM_KIMI_K3_ATTN_RES_SKIP_ZERO_ADDENDS": lambda: (

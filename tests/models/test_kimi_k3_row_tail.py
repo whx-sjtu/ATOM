@@ -4,6 +4,7 @@
 import ast
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 
@@ -971,6 +972,138 @@ def test_pynccl_cap_and_group_need_the_custom_collectives(logged, monkeypatch):
         assert log == want_log
         assert _comm_log(log) == [("reduce_scatter", 16)] * 3
         assert all(torch.equal(a, b) for a, b in zip(got, want))
+
+
+@pytest.fixture
+def side(monkeypatch):
+    """`_side_comm` on the logged pynccl stub, its side stream run inline."""
+
+    def run(fn, *uses):
+        _events.log.append(("side_stream", 0))
+        fn()
+        return lambda: _events.log.append(("side_wait", 0))
+
+    def side_comm():
+        nccl = sequence_parallel.get_tp_group().device_communicator.pynccl_comm
+        return nccl, SimpleNamespace(run=run)
+
+    monkeypatch.setattr(sequence_parallel, "_side_comm", side_comm)
+
+
+def test_side_rs_defaults(monkeypatch):
+    """The side reduce-scatter is off unless 1, from 4097 rows."""
+    monkeypatch.delenv("ATOM_KIMI_K3_ROW_SHARD_SIDE_RS", raising=False)
+    monkeypatch.delenv("ATOM_KIMI_K3_ROW_SHARD_SIDE_RS_MIN_TOKENS", raising=False)
+    assert kimi.envs.ATOM_KIMI_K3_ROW_SHARD_SIDE_RS is False
+    assert kimi.envs.ATOM_KIMI_K3_ROW_SHARD_SIDE_RS_MIN_TOKENS == 4097
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_SIDE_RS", "1")
+    assert kimi.envs.ATOM_KIMI_K3_ROW_SHARD_SIDE_RS is True
+
+
+@pytest.mark.parametrize("latent", ["0", "1"], ids=["latent-off", "latent-on"])
+@pytest.mark.parametrize("tokens", [13, 16])
+def test_side_rs_reduces_shared_beside_the_routed_experts(
+    logged, side, monkeypatch, latent, tokens
+):
+    """The shared experts run first and their reduce-scatter is queued on the
+    side stream before the routed experts, in place of the NCCL group; the
+    main stream waits for it after the routed scatter. Same sums as the two
+    scatters apart on the main stream."""
+    forward = _row_layer_forward(monkeypatch, latent, tokens)
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_CUSTOM_COMM", "1")
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB", _PYNCCL_RS_MIB)
+    apart = logged(forward)
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_GROUP_RS", "1")
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_SIDE_RS", "1")
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_SIDE_RS_MIN_TOKENS", str(tokens))
+    sided = logged(forward)
+    rows = -(-tokens // WORLD) * WORLD
+    for (want, _), (got, log) in zip(apart, sided):
+        names = [name for name, _ in log]
+        queued = names.index("side_stream")
+        assert names.index("shared_experts") < queued < names.index("experts")
+        assert log[queued + 1] == ("pynccl_reduce_scatter", rows)
+        assert names.index("routed_expert_up_proj") < names.index("side_wait")
+        assert "nccl_group_start" not in names
+        assert _comm_log(log) == [
+            ("pynccl_reduce_scatter", rows),
+            ("pynccl_reduce_scatter", rows),
+            ("custom_reduce_scatter", rows),
+        ]
+        assert all(torch.equal(a, b) for a, b in zip(got, want))
+
+
+@pytest.mark.parametrize("case", ["below-floor", "rccl", "token-graph"])
+def test_side_rs_gate(logged, side, monkeypatch, case):
+    """Below its row floor, on RCCL or in a token-graph recording the switch
+    leaves the row tail as it was."""
+    forward = _row_layer_forward(monkeypatch, "1", 16)
+    if case != "rccl":
+        monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_CUSTOM_COMM", "1")
+    if case == "token-graph":
+        monkeypatch.setenv("ATOM_KIMI_K3_MOE_ROW_SHARD_MIN_TOKENS", "100000")
+        monkeypatch.setenv("ATOM_KIMI_K3_MOE_ROW_SHARD_GRAPH_MIN_TOKENS", "8")
+        _in_graph(monkeypatch)
+    base = logged(forward)
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_SIDE_RS", "1")
+    floor = "17" if case == "below-floor" else "16"
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_SIDE_RS_MIN_TOKENS", floor)
+    gated = logged(forward)
+    for (want, want_log), (got, log) in zip(base, gated):
+        assert log == want_log
+        assert all(torch.equal(a, b) for a, b in zip(got, want))
+
+
+def test_side_stream_runs_after_the_queued_work(monkeypatch):
+    """The side stream (priority -1) waits for the current stream, runs the
+    work and records its end there, keeps the inputs alive for it, and the
+    wait lands on the stream current when it is called."""
+    log = []
+
+    class Stream:
+        def __init__(self, name, priority=0):
+            self.name, self.priority = name, priority
+
+        def wait_stream(self, other):
+            log.append((self.name, "wait_stream", other.name))
+
+        def wait_event(self, event):
+            log.append((self.name, "wait_event", event.stream))
+
+    current = [Stream("main")]
+
+    class Event:
+        def record(self):
+            self.stream = current[-1].name
+            log.append((self.stream, "record"))
+
+    @contextmanager
+    def on(stream):
+        current.append(stream)
+        yield
+        current.pop()
+
+    monkeypatch.setattr(
+        torch.cuda, "Stream", lambda priority=0: Stream("side", priority)
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: current[-1])
+    monkeypatch.setattr(torch.cuda, "stream", on)
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    side = sequence_parallel._SideStream()
+    assert side.stream.priority == -1
+    x = SimpleNamespace(
+        record_stream=lambda s: log.append(("x", "record_stream", s.name))
+    )
+    wait = side.run(lambda: log.append((current[-1].name, "work")), x)
+    current[0] = Stream("later")
+    wait()
+    assert log == [
+        ("side", "wait_stream", "main"),
+        ("side", "work"),
+        ("side", "record"),
+        ("x", "record_stream", "side"),
+        ("later", "wait_event", "side"),
+    ]
 
 
 @pytest.mark.parametrize("latent", ["0", "1"], ids=["latent-off", "latent-on"])

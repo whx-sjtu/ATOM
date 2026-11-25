@@ -163,6 +163,14 @@ def _log_qkvg_merged(width: int, k: int, max_rows: int):
     )
 
 
+@lru_cache(maxsize=1)
+def _log_row_tail_side_rs():
+    logging.getLogger("atom").info(
+        "Kimi-K3 row tail: the shared reduce-scatter runs on a second pynccl "
+        "communicator on a side stream, under the routed experts"
+    )
+
+
 def _text_config(config):
     return getattr(config, "text_config", config)
 
@@ -823,6 +831,9 @@ class KimiSparseMoeBlock(nn.Module):
             custom=envs.ATOM_KIMI_K3_ROW_SHARD_CUSTOM_COMM or graph,
             pynccl_rs_bytes=int(envs.ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB * (1 << 20)),
             group_rs=envs.ATOM_KIMI_K3_ROW_SHARD_GROUP_RS and not graph,
+            side_rs=envs.ATOM_KIMI_K3_ROW_SHARD_SIDE_RS
+            and not graph
+            and num_tokens >= envs.ATOM_KIMI_K3_ROW_SHARD_SIDE_RS_MIN_TOKENS,
         )
         if rows.pynccl_rs_bytes:
             _log_row_tail_pynccl_rs(envs.ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB)
@@ -850,17 +861,30 @@ class KimiSparseMoeBlock(nn.Module):
         from the next attn_res's FP32 fold and can move MoE routing.
         `hidden_rows` is this rank's shard of `hidden_states`, if at hand.
         Under `rows.group_rs` the shared experts run before the routed scatter
-        so that both scatters can share one NCCL group.
+        so that both scatters can share one NCCL group. Under `rows.side_rs`
+        they run before the routed experts, which their side-stream scatter
+        overlaps.
         `before_gather` runs just before the gather is queued."""
         router_logits, routed_input = self._row_sharded_front(
             hidden_states, rows, hidden_rows
         )
+        shared_rows = None
+        if rows.side_rs:
+            _log_row_tail_side_rs()
+            shared_rows = rows.scatter_side(
+                self._row_sharded_shared(hidden_states, rows)
+            )
         routed_output = rows.padded_rows(routed_input)
         if routed_output is None:
             routed_output = self.experts(routed_input, router_logits)
         else:
             self.experts(routed_input, router_logits, out=routed_output)
-        if rows.group_rs:
+        if shared_rows is not None:
+            output = (
+                self._apply_routed_norm_and_up_proj(rows.scatter(routed_output))
+                + shared_rows()
+            )
+        elif rows.group_rs:
             _log_row_tail_group_rs()
             routed_rows, shared_rows = rows.scatter_pair(
                 routed_output, self._row_sharded_shared(hidden_states, rows)
