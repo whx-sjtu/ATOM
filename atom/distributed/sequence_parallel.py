@@ -115,6 +115,10 @@ class SequenceParallel:
         rows = x[self.start : self.start + self.chunk]
         return _pad_rows(rows, self.chunk - rows.shape[0])
 
+    def owned(self, x: torch.Tensor) -> torch.Tensor:
+        """`[T, ...]` -> this rank's real rows, as a view; empty past T."""
+        return x[self.start : self.start + self.chunk]
+
     def gather(self, x: torch.Tensor) -> torch.Tensor:
         """This rank's rows -> all `[T, ...]` rows."""
         if self.custom:

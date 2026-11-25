@@ -1542,6 +1542,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_K3_ROW_SHARD_SIDE_RS_MIN_TOKENS": lambda: int(
         os.getenv("ATOM_KIMI_K3_ROW_SHARD_SIDE_RS_MIN_TOKENS", "4097")
     ),
+    # Row-sharded steps keep the residual on its rows between layers: a row
+    # tail skips its last gather and the next BF16 residual mix runs on this
+    # rank's rows, then gathers its output. Bit-identical output. Read once
+    # after load (one PP stage, no TBO, outside plugin hosts). Off by default.
+    "ATOM_KIMI_K3_ROW_SHARD_RESIDUAL": lambda: (
+        os.getenv("ATOM_KIMI_K3_ROW_SHARD_RESIDUAL", "0") == "1"
+    ),
     # The next residual mix reads a row-sharded step's zero addends as one zero row.
     # Bit-identical output. On by default; 0 reads the zero tensors themselves.
     "ATOM_KIMI_K3_ATTN_RES_SKIP_ZERO_ADDENDS": lambda: (

@@ -171,6 +171,14 @@ def _log_row_tail_side_rs():
     )
 
 
+@lru_cache(maxsize=1)
+def _log_row_tail_resident():
+    logging.getLogger("atom").info(
+        "Kimi-K3 row tail: the residual stays on its rows; the next residual "
+        "mix runs on them and gathers its output"
+    )
+
+
 def _text_config(config):
     return getattr(config, "text_config", config)
 
@@ -638,6 +646,9 @@ class KimiSparseMoeBlock(nn.Module):
             and not tbo_active
         )
         self._use_dispatch_op = self._use_dual_stream or self.row_shardable
+        # Set after load when the next residual mix can read this block's
+        # residual by rows (`holds_rows`).
+        self.resident_rows = False
         if self._use_dispatch_op:
             # Register self so `maybe_dual_stream_split_forward` can look this module up
             # by prefix from static_forward_context (the op is Dynamo-opaque).
@@ -839,6 +850,89 @@ class KimiSparseMoeBlock(nn.Module):
             _log_row_tail_pynccl_rs(envs.ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB)
         return rows
 
+    def holds_rows(self, num_tokens: int) -> bool:
+        """Whether this step's row tail leaves its residual on its rows: it
+        writes only this rank's rows of the `[T, H]` residual, its two addends
+        are never written, and the next residual mix (`resident_attn_res`)
+        and draft tap (`resident_aux`) read this rank's rows alone. The row
+        tail's own gate is step-wide, so on such a step every row tail does
+        the same and every bank read is of this rank's rows."""
+        return self.resident_rows and self.takes_row_tail(num_tokens)
+
+    def resident_attn_res(
+        self,
+        prefix_sum: torch.Tensor,
+        block_residual: torch.Tensor,
+        score_weight: torch.Tensor,
+        eps: float,
+        add_hidden: torch.Tensor,
+        out_norm_weight: torch.Tensor | None,
+        out_eps: float,
+        add_hidden2: torch.Tensor,
+        num_blocks: int | None,
+        gather: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The BF16 residual mix after this block. A resident step mixes this
+        rank's rows over zero addends, gathers the mix and keeps the prefix
+        on its rows; any other step runs the mix it always runs. Without
+        `gather` a resident step keeps the mix on its rows too, for a
+        consumer that reads this rank's rows itself."""
+        from atom.model_ops.kimi_k3 import apply_attn_res, apply_attn_res_rows
+
+        tokens = prefix_sum.shape[0]
+        if not self.holds_rows(tokens):
+            return apply_attn_res(
+                prefix_sum,
+                block_residual,
+                score_weight,
+                eps,
+                add_hidden,
+                out_norm_weight,
+                out_eps,
+                add_hidden2,
+                None,
+                num_blocks,
+            )
+        _log_row_tail_resident()
+        rows = self.row_shards(tokens)
+        width = prefix_sum.shape[1:]
+        mixed = prefix_sum.new_empty((rows.chunk if gather else tokens, *width))
+        prefix_out = torch.empty_like(prefix_sum)
+        owned = rows.owned(prefix_sum)
+        real = owned.shape[0]
+        if real:
+            apply_attn_res_rows(
+                owned,
+                rows.owned(block_residual),
+                score_weight,
+                eps,
+                out_norm_weight,
+                out_eps,
+                num_blocks,
+                mixed[:real] if gather else rows.owned(mixed),
+                rows.owned(prefix_out),
+            )
+        return (rows.gather(mixed) if gather else mixed), prefix_out
+
+    def resident_aux(
+        self,
+        prefix_sum: torch.Tensor,
+        add_hidden: torch.Tensor,
+        add_hidden2: torch.Tensor,
+        prefix_out: torch.Tensor,
+    ) -> torch.Tensor:
+        """The plain residual after this block for a draft tap, given the next
+        mix's inputs and `prefix_out`: gathered from this rank's rows of
+        `prefix_out` on a resident step (its addends are zeros), else summed
+        as `KimiDecoderLayer.aux_hidden_state` sums it."""
+        tokens = prefix_sum.shape[0]
+        if self.holds_rows(tokens):
+            rows = self.row_shards(tokens)
+            return rows.gather(rows.shard(prefix_out))
+        return KimiDecoderLayer.aux_hidden_state(
+            (prefix_sum, add_hidden, add_hidden2, None)
+        )
+
     def _row_sharded_split_moe_forward(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -855,6 +949,7 @@ class KimiSparseMoeBlock(nn.Module):
         prefix_rows: torch.Tensor | None = None,
         hidden_rows: torch.Tensor | None = None,
         before_gather: Callable[[], None] | None = None,
+        resident: bool = False,
     ) -> torch.Tensor:
         """Scatter routed/shared partials, normalize and project local rows,
         add the optional prefix, then gather the sum. Its BF16 rounding differs
@@ -864,7 +959,9 @@ class KimiSparseMoeBlock(nn.Module):
         so that both scatters can share one NCCL group. Under `rows.side_rs`
         they run before the routed experts, which their side-stream scatter
         overlaps.
-        `before_gather` runs just before the gather is queued."""
+        `before_gather` runs just before the gather is queued. `resident`
+        skips the gather: the sum lands in this rank's rows of a `[T, H]`
+        tensor whose other rows are never written (see `holds_rows`)."""
         router_logits, routed_input = self._row_sharded_front(
             hidden_states, rows, hidden_rows
         )
@@ -897,6 +994,15 @@ class KimiSparseMoeBlock(nn.Module):
             output = routed_output + rows.scatter(
                 self._row_sharded_shared(hidden_states, rows)
             )
+        if resident:
+            residual = output.new_empty((rows.num_tokens, *output.shape[1:]))
+            owned = rows.owned(residual)
+            real = owned.shape[0]
+            if prefix_rows is None:
+                owned.copy_(output[:real])
+            else:
+                torch.add(output[:real], prefix_rows[:real], out=owned)
+            return residual
         if prefix_rows is not None:
             output += prefix_rows
         if before_gather is not None:
@@ -3267,6 +3373,8 @@ class KimiDecoderLayer(nn.Module):
         Sharded steps gather the normalized MoE input, then its tail gathers
         the whole residual. Both addends are real zeros so auxiliary readers
         and compiler-created clones can load them without pointer markers.
+        A resident block's tail (`holds_rows`) writes only this rank's rows of
+        the residual and neither addend.
         """
         moe = self.block_sparse_moe
         if not moe.takes_row_tail(attn_partial.shape[0]):
@@ -3279,6 +3387,11 @@ class KimiDecoderLayer(nn.Module):
             None if window is None else rows.shard(window),
             rows.scatter(attn_partial),
         )
+        if moe.resident_rows:
+            residual = moe.row_sharded_moe(
+                rows.gather(hidden_rows), rows, prefix_rows, hidden_rows, resident=True
+            )
+            return residual, torch.empty_like(residual), torch.empty_like(residual)
         alt = self._zero_addends_stream(attn_partial)
         if alt is None:
             residual = moe.row_sharded_moe(
@@ -3346,7 +3459,8 @@ class KimiDecoderLayer(nn.Module):
             hidden_states = self.self_attn(positions, hidden_states)
 
         # Replicated steps leave routed/shared adds to the next attn_res.
-        # A row-sharded step returns the whole residual with real zero addends.
+        # A row-sharded step returns the whole residual with real zero addends,
+        # or, kept on its rows (`holds_rows`), those rows and unwritten ones.
         prefix_sum, hidden_states, shared = self._post_attention(
             hidden_states, prefix_sum, block_residual
         )
@@ -3418,11 +3532,31 @@ class KimiDecoderLayer(nn.Module):
         prefix_sum, pending_add, pending_add2, block_residual = output
         if prefix_sum is None:
             return None
+        res = next_layer.self_attention_attn_res
+        resident = (
+            res.resident_from
+            and isinstance(pending_add, torch.Tensor)
+            and pending_add2 is not None
+        )
         pending_add = materialize_column_output(pending_add)
         pending_add2 = materialize_column_output(pending_add2)
-        res = next_layer.self_attention_attn_res
         if block_residual is None:
             raise RuntimeError("aggregate expected a bank")
+        if resident:
+            mixed, _ = torch.ops.aiter.kimi_k3_resident_attn_res(
+                prefix_sum,
+                block_residual,
+                res.score_weight,
+                res.eps,
+                pending_add,
+                None,
+                res.out_eps,
+                pending_add2,
+                res.num_blocks,
+                res.resident_from,
+                True,
+            )
+            return mixed
         from atom.model_ops.kimi_k3 import apply_attn_res
 
         mixed, _ = apply_attn_res(
@@ -3438,7 +3572,7 @@ class KimiDecoderLayer(nn.Module):
         return mixed
 
 
-def _aux_from_next_residual(output: tuple, _site: nn.Module) -> torch.Tensor | None:
+def _aux_from_next_residual(output: tuple, site: nn.Module) -> torch.Tensor | None:
     inputs, residual_output = output
     prefix, bank = inputs[:2]
     if prefix is None:
@@ -3447,6 +3581,11 @@ def _aux_from_next_residual(output: tuple, _site: nn.Module) -> torch.Tensor | N
     second = inputs[3] if len(inputs) > 3 else None
     if isinstance(first, ColumnTail):
         return residual_output[1]
+    resident_from = getattr(site, "resident_from", "")
+    if resident_from and first is not None and second is not None:
+        return torch.ops.aiter.kimi_k3_resident_aux(
+            prefix, first, second, residual_output[1], resident_from
+        )
     # The fallback's original BF16 additions keep their original rounding order.
     return KimiDecoderLayer.aux_hidden_state((prefix, first, second, bank))
 
@@ -3540,6 +3679,10 @@ class KimiLinearModel(nn.Module):
         self._column_gather_setup = _ColumnGatherSetup(
             lambda: self._init_column_gather(atom_config, prefix)
         )
+        # After every site's out_norm has settled its quant at load.
+        self._resident_rows_setup = _ColumnGatherSetup(
+            lambda: self._init_resident_rows(atom_config)
+        )
 
     def make_empty_intermediate_tensors(
         self, batch_size: int, dtype: torch.dtype, device: torch.device
@@ -3617,6 +3760,67 @@ class KimiLinearModel(nn.Module):
             for moe in self._column_gather_blocks:
                 moe.column_gather_name = ""
             self._column_gather = None
+
+    def _init_resident_rows(self, atom_config: Config) -> None:
+        """Under ATOM_KIMI_K3_ROW_SHARD_RESIDUAL, link each row-tail MoE block
+        to the residual mix that reads its return (the next layer's, or the
+        output's) when that mix is a BF16 one over a non-empty bank.
+
+        A linked mix keeps its prefix on its rows, so the layer it opens must
+        take the row tail too; one that closes a block banks those rows only,
+        so every mix after it must be linked as well."""
+        from atom.plugin import is_plugin_mode
+
+        if (
+            not envs.ATOM_KIMI_K3_ROW_SHARD_RESIDUAL
+            or is_plugin_mode()
+            or atom_config.enable_tbo
+            or get_pp_group().world_size != 1
+        ):
+            return
+        context = atom_config.compilation_config.static_forward_context
+        resident = list(self.layers[self.start_layer : self.end_layer])
+        links = []
+        for layer, following in zip(resident, [*resident[1:], None]):
+            moe = getattr(layer, "block_sparse_moe", None)
+            site = (
+                self.output_attn_res
+                if following is None
+                else following.self_attention_attn_res
+            )
+            closes = bool(site.block_size) and site.layer_idx % site.block_size == 0
+            links.append(
+                (
+                    layer,
+                    site,
+                    closes,
+                    moe is not None
+                    and layer.post_attention_op
+                    and context.get(moe.prefix) is moe
+                    and (following is None or following.post_attention_op)
+                    and site.enabled
+                    and site.num_blocks != 0
+                    and site.out_quant_dtype is None,
+                )
+            )
+        linked = []
+        rest_linked = True
+        for layer, site, closes, ok in reversed(links):
+            ok = ok and (rest_linked or not closes)
+            rest_linked = rest_linked and ok
+            if ok:
+                layer.block_sparse_moe.resident_rows = True
+                site.resident_from = layer.block_sparse_moe.prefix
+                linked.append(layer.layer_idx)
+        linked.reverse()
+        if linked:
+            logging.getLogger("atom").info(
+                "Kimi-K3 row tail: %d MoE layers (%d-%d) keep their residual "
+                "on its rows",
+                len(linked),
+                linked[0],
+                linked[-1],
+            )
 
     def aux_tap_site(self, layer_id: int, spec):
         """Move only plain post-layer taps to the next complete residual sum."""

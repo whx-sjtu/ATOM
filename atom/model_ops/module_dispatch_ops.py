@@ -22,6 +22,8 @@ Currently registered:
   - torch.ops.aiter.maybe_dual_stream_forward  — V2/V3.2/V4 MoE (summed)
   - torch.ops.aiter.maybe_dual_stream_split_forward — K3 MoE (routed/shared or sum/zeros)
   - torch.ops.aiter.kimi_k3_post_attention_forward — K3 layer after its attention
+  - torch.ops.aiter.kimi_k3_resident_attn_res  — K3 residual mix after a row tail
+  - torch.ops.aiter.kimi_k3_resident_aux       — K3 draft tap after a row tail
   - torch.ops.aiter.kimi_k3_dsa_front          — K3 sparse-MLA front (row-parallel)
   - torch.ops.aiter.kimi_k3_dsa_front_qkvg     — the same with g_proj (ATOM_FUSB_QKVG)
   - torch.ops.aiter.indexer_score_topk         — V4 sparse indexer
@@ -203,6 +205,99 @@ direct_register_custom_op(
     op_func=kimi_k3_post_attention_forward,
     mutates_args=(),
     fake_impl=_kimi_k3_post_attention_forward_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+# K3 residual mix after a row tail that may keep its residual on its rows.
+# The registered MoE block decides per step (`holds_rows`); a resident step's
+# prefix holds only this rank's rows, so it mixes those and gathers the mix
+# (or, without `gather`, leaves it on its rows too).
+
+
+def kimi_k3_resident_attn_res(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+    add_hidden: torch.Tensor,
+    out_norm_weight: torch.Tensor | None,
+    out_eps: float,
+    add_hidden2: torch.Tensor,
+    num_blocks: int | None,
+    layer_name: str,
+    gather: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    self = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    return self.resident_attn_res(
+        prefix_sum,
+        block_residual,
+        score_weight,
+        eps,
+        add_hidden,
+        out_norm_weight,
+        out_eps,
+        add_hidden2,
+        num_blocks,
+        gather,
+    )
+
+
+def _kimi_k3_resident_attn_res_fake(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+    add_hidden: torch.Tensor,
+    out_norm_weight: torch.Tensor | None,
+    out_eps: float,
+    add_hidden2: torch.Tensor,
+    num_blocks: int | None,
+    layer_name: str,
+    gather: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(prefix_sum), torch.empty_like(prefix_sum)
+
+
+direct_register_custom_op(
+    op_name="kimi_k3_resident_attn_res",
+    op_func=kimi_k3_resident_attn_res,
+    mutates_args=(),
+    fake_impl=_kimi_k3_resident_attn_res_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+def kimi_k3_resident_aux(
+    prefix_sum: torch.Tensor,
+    add_hidden: torch.Tensor,
+    add_hidden2: torch.Tensor,
+    prefix_out: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    self = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    return self.resident_aux(prefix_sum, add_hidden, add_hidden2, prefix_out)
+
+
+def _kimi_k3_resident_aux_fake(
+    prefix_sum: torch.Tensor,
+    add_hidden: torch.Tensor,
+    add_hidden2: torch.Tensor,
+    prefix_out: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    return torch.empty_like(prefix_sum)
+
+
+direct_register_custom_op(
+    op_name="kimi_k3_resident_aux",
+    op_func=kimi_k3_resident_aux,
+    mutates_args=(),
+    fake_impl=_kimi_k3_resident_aux_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 

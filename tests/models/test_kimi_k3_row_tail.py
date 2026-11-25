@@ -325,7 +325,7 @@ def _torch_attn_res(
     quant_dtype=None,
     num_blocks=None,
 ):
-    """Attention residual and output RMS norm in FP32 torch."""
+    """Attention residual and optional output RMS norm in FP32 torch."""
     assert quant_dtype is None
     if num_blocks is not None:
         block_residual = block_residual[:, :num_blocks]
@@ -336,8 +336,9 @@ def _torch_attn_res(
     cands = torch.cat([block_residual.float(), ps[:, None]], 1)
     scores = (cands * score_weight).sum(-1) * torch.rsqrt(cands.pow(2).mean(-1) + eps)
     y = (scores.softmax(-1)[..., None] * cands).sum(1)
-    y = y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + out_eps)
-    y = y * out_norm_weight.float()
+    if out_norm_weight is not None:
+        y = y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + out_eps)
+        y = y * out_norm_weight.float()
     return y.to(prefix.dtype), prefix if add_hidden is None else ps.to(prefix.dtype)
 
 
@@ -1360,3 +1361,330 @@ def test_pad_switch_is_on_unless_0(monkeypatch):
     assert kimi.envs.ATOM_ROW_SHARD_PAD_IN_PLACE
     monkeypatch.setenv("ATOM_ROW_SHARD_PAD_IN_PLACE", "0")
     assert not kimi.envs.ATOM_ROW_SHARD_PAD_IN_PLACE
+
+
+def test_resident_residual_is_off_unless_1(monkeypatch):
+    monkeypatch.delenv("ATOM_KIMI_K3_ROW_SHARD_RESIDUAL", raising=False)
+    assert kimi.envs.ATOM_KIMI_K3_ROW_SHARD_RESIDUAL is False
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_RESIDUAL", "1")
+    assert kimi.envs.ATOM_KIMI_K3_ROW_SHARD_RESIDUAL is True
+
+
+@pytest.mark.parametrize("tokens", [13, 16])
+def test_owned_rows_are_the_real_rows_of_the_shard(monkeypatch, tokens):
+    monkeypatch.setattr(sequence_parallel, "get_tp_group", lambda: None)
+    x = torch.arange(tokens * 2).view(tokens, 2)
+    seen = []
+    for rank in range(WORLD):
+        rows = sequence_parallel.SequenceParallel(tokens, WORLD, rank)
+        owned = rows.owned(x)
+        assert owned.shape[0] == max(0, min(rows.chunk, tokens - rows.start))
+        assert owned.shape[0] == 0 or owned.data_ptr() == x[rows.start].data_ptr()
+        seen.append(owned)
+    assert torch.equal(torch.cat(seen), x)
+
+
+def _attn_res_rows(prefix, bank, score_weight, eps, norm, out_eps, blocks, out, pref):
+    """`apply_attn_res_rows` as the torch reference over two zero addends."""
+    _events.log.append(("attn_res_rows", prefix.shape[0]))
+    zeros = torch.zeros_like(prefix)
+    y, summed = _torch_attn_res(
+        prefix, bank, score_weight, eps, zeros, norm, out_eps, zeros, None, blocks
+    )
+    out.copy_(y)
+    pref.copy_(summed)
+
+
+@pytest.fixture
+def resident(logged, monkeypatch, stub_block_parts):
+    """Two KDA layers and the output mix per rank; `link` keeps each row
+    tail's residual on its rows as `_init_resident_rows` would."""
+    empty = torch.Tensor.new_empty
+
+    def poisoned_new_empty(self, *args, **kwargs):
+        out = empty(self, *args, **kwargs)
+        return out.fill_(float("nan")) if out.is_floating_point() else out
+
+    monkeypatch.setattr(torch.Tensor, "new_empty", poisoned_new_empty)
+    monkeypatch.setattr(kimi_k3_ops, "apply_attn_res_rows", _attn_res_rows)
+    for name in ("kimi_k3_resident_attn_res", "kimi_k3_resident_aux"):
+        monkeypatch.setattr(
+            torch.ops.aiter, name, getattr(module_dispatch_ops, name), raising=False
+        )
+    context = stub_block_parts.compilation_config.static_forward_context
+
+    def build(first):
+        stack = []
+        for layer_num in (first, first + 1):
+            layers = _layers(layer_num)
+            for layer in layers:
+                moe = layer.block_sparse_moe
+                moe.prefix = f"{layer.layer_name}.mlp"
+                context[moe.prefix] = moe
+            stack.append(layers)
+        gen = torch.Generator().manual_seed(first)
+        score_weight = torch.randn(HIDDEN, generator=gen)
+        norm_weight = (1 + 0.1 * torch.randn(HIDDEN, generator=gen)).bfloat16()
+        outputs = []
+        for _ in range(WORLD):
+            out_norm = _Stub()
+            out_norm.weight = norm_weight
+            site = kimi.AttnRes(_Stub(), _Stub(), out_norm=out_norm)
+            site.score_weight = score_weight
+            outputs.append(site)
+        return [(*layers, site) for *layers, site in zip(*stack, outputs)]
+
+    def link(model, on=True):
+        for first, second, site in model:
+            pairs = (
+                (first.block_sparse_moe, second.self_attention_attn_res),
+                (second.block_sparse_moe, site),
+            )
+            for moe, next_site in pairs:
+                moe.resident_rows = on
+                next_site.resident_from = moe.prefix if on else ""
+
+    def forward(model, inputs):
+        def on_rank(rank):
+            first, second, site = model[rank]
+            x, bank, add, add2 = (t.clone() for t in inputs)
+            out = first(None, x, bank, add, add2)
+            aggregate = first.aggregate_hidden_state(out, second)
+            prefix, add, add2, bank = out
+            mixed = second.self_attention_attn_res(prefix, bank, add, add2)
+            aux = kimi._aux_from_next_residual(
+                ((prefix, bank, add, add2), mixed), second.self_attention_attn_res
+            )
+            out = second(None, prefix, bank, add, add2)
+            hidden, _ = site(out[0], out[3], out[1], out[2])
+            return hidden, aggregate, aux, out
+
+        try:
+            return logged(on_rank)
+        finally:
+            attention_residual._ZERO_ADDENDS.clear()
+
+    return SimpleNamespace(build=build, link=link, forward=forward)
+
+
+def _owned(tokens, rank, x):
+    chunk = -(-tokens // WORLD)
+    return x[rank * chunk : (rank + 1) * chunk]
+
+
+@pytest.mark.parametrize("first", [BLOCK - 1, BLOCK], ids=["mix-closes", "mid-block"])
+@pytest.mark.parametrize("tokens", [8, 13, 1027])
+def test_resident_rows_keep_the_stack_bit_for_bit(resident, monkeypatch, tokens, first):
+    """A row tail that keeps its residual on its rows changes no output bit:
+    not the next layer's, the output mix's or either draft tap's. Its gather
+    goes; each mix after it runs on this rank's rows and gathers its output."""
+    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "4")
+    model = resident.build(first)
+    inputs = _inputs(tokens)
+    gathered = resident.forward(model, inputs)
+    resident.link(model)
+    kept = resident.forward(model, inputs)
+
+    chunk = -(-tokens // WORLD)
+    mixes = ("all_gather", "attn_res", "attn_res_rows")
+    for rank, ((want, want_log), (got, log)) in enumerate(zip(gathered, kept)):
+        hidden, aggregate, aux, (residual, _, _, bank) = got
+        assert torch.equal(hidden, want[0]) and not hidden.isnan().any()
+        assert torch.equal(aggregate, want[1]) and torch.equal(aux, want[2])
+        for kept_rows, want_rows in ((residual, want[3][0]), (bank, want[3][3])):
+            assert torch.equal(
+                _owned(tokens, rank, kept_rows), _owned(tokens, rank, want_rows)
+            )
+        assert [e for e in log if e[0] not in mixes] == [
+            e for e in want_log if e[0] not in mixes
+        ]
+        # Full mixes: the first layer's input, the aggregate tap, the second
+        # layer's input (once for the plain tap, once in its forward) and the
+        # output. All but the first run on rows.
+        real = max(0, min(chunk, tokens - rank * chunk))
+        assert want_log.count(("attn_res", tokens)) == 5
+        assert log.count(("attn_res", tokens)) == 1
+        assert log.count(("attn_res_rows", real)) == (4 if real else 0)
+        # Gathered: two layers' MoE inputs and residuals, or their MoE inputs,
+        # four row mixes and the plain tap's prefix rows.
+        assert want_log.count(("all_gather", chunk)) == 4
+        assert log.count(("all_gather", chunk)) == 7
+
+
+@pytest.mark.parametrize("tokens", [13, 1027])
+def test_resident_mix_without_gather_keeps_its_rows(
+    resident, logged, monkeypatch, tokens
+):
+    """Without `gather` a resident mix hands back this rank's rows of the
+    gathered mix and writes no other row."""
+    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "4")
+    model = resident.build(BLOCK)
+    resident.link(model)
+    inputs = _inputs(tokens)
+    chunk = -(-tokens // WORLD)
+
+    def on_rank(rank):
+        first, second, _ = model[rank]
+        x, bank, add, add2 = (t.clone() for t in inputs)
+        prefix, add, add2, bank = first(None, x, bank, add, add2)
+        site = second.self_attention_attn_res
+        args = (prefix, bank, site.score_weight, site.eps, add)
+        args += (site.out_norm.weight, site.out_eps, add2, site.num_blocks)
+        moe = first.block_sparse_moe
+        return moe.resident_attn_res(*args), moe.resident_attn_res(*args, gather=False)
+
+    try:
+        results = logged(on_rank)
+    finally:
+        attention_residual._ZERO_ADDENDS.clear()
+    for rank, (((mixed, prefix), (kept, kept_prefix)), log) in enumerate(results):
+        assert kept.shape == mixed.shape
+        assert torch.equal(_owned(tokens, rank, kept), _owned(tokens, rank, mixed))
+        assert torch.equal(
+            _owned(tokens, rank, kept_prefix), _owned(tokens, rank, prefix)
+        )
+        others = torch.ones(tokens, dtype=torch.bool)
+        others[rank * chunk : (rank + 1) * chunk] = False
+        assert kept[others].isnan().all()
+        # The layer's MoE input and the gathered mix; no residual, no second mix.
+        assert log.count(("all_gather", chunk)) == 2
+
+
+@pytest.mark.parametrize(
+    "threshold,capturing,tbo_step",
+    [("13", False, False), ("4", True, False), ("4", False, True)],
+    ids=["at-threshold", "graph-capture", "tbo-step"],
+)
+def test_resident_rows_leave_other_steps_alone(
+    resident, monkeypatch, threshold, capturing, tbo_step
+):
+    monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", threshold)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    monkeypatch.setattr(ubatching, "tbo_active", lambda: tbo_step)
+    model = resident.build(BLOCK - 1)
+    inputs = _inputs(13)
+    base = resident.forward(model, inputs)
+    resident.link(model)
+    for (want, want_log), (got, log) in zip(base, resident.forward(model, inputs)):
+        assert log == want_log
+        assert all(torch.equal(a, b) for a, b in zip(got[:3], want[:3]))
+        assert all(torch.equal(a, b) for a, b in zip(got[3], want[3]))
+
+
+def _resident_model(monkeypatch, layout, out_quant=None):
+    """`layout`: per layer, (moe, post-attention op, input-mix quant dtype)."""
+    from atom import plugin
+
+    monkeypatch.setattr(plugin, "is_plugin_mode", lambda: False)
+    monkeypatch.setattr(kimi, "get_pp_group", lambda: SimpleNamespace(world_size=1))
+    context = {}
+
+    def site(layer_idx, quant=None, block_size=BLOCK):
+        return SimpleNamespace(
+            enabled=True,
+            block_size=block_size,
+            layer_idx=layer_idx,
+            num_blocks=None if block_size is None else -(-layer_idx // block_size),
+            out_quant_dtype=quant,
+            resident_from="",
+        )
+
+    layers = []
+    for idx, (has_moe, op, quant) in enumerate(layout):
+        layer = SimpleNamespace(
+            layer_idx=idx,
+            post_attention_op=op,
+            self_attention_attn_res=site(idx, quant),
+        )
+        if has_moe:
+            layer.block_sparse_moe = SimpleNamespace(
+                prefix=f"layers.{idx}.mlp", resident_rows=False
+            )
+            context[layer.block_sparse_moe.prefix] = layer.block_sparse_moe
+        layers.append(layer)
+    model = SimpleNamespace(
+        layers=layers,
+        start_layer=0,
+        end_layer=len(layers),
+        output_attn_res=site(0, out_quant, None),
+    )
+    config = SimpleNamespace(
+        enable_tbo=False,
+        compilation_config=SimpleNamespace(static_forward_context=context),
+    )
+    return model, config
+
+
+def _linked(model):
+    return [
+        getattr(
+            layer, "block_sparse_moe", SimpleNamespace(resident_rows=False)
+        ).resident_rows
+        for layer in model.layers
+    ]
+
+
+MOE, DENSE, FP8 = (True, True, None), (False, False, None), torch.float8_e4m3fn
+
+
+@pytest.mark.parametrize(
+    "layout,out_quant,expected",
+    [
+        ([DENSE, MOE, MOE, MOE, MOE, MOE], None, [False] + [True] * 5),
+        # Layer 4's mix banks its rows, so every mix after it must link.
+        (
+            [DENSE, MOE, MOE, MOE, MOE, MOE],
+            FP8,
+            [False, True, True, False, True, False],
+        ),
+        (
+            [DENSE, MOE, MOE, MOE, MOE, (True, True, FP8)],
+            None,
+            [False, True, True, False, False, True],
+        ),
+        # A mix ahead of layer 4 banks nothing: later links stand alone.
+        (
+            [DENSE, MOE, (True, True, FP8), MOE, MOE, MOE],
+            None,
+            [False, False] + [True] * 4,
+        ),
+        # The mix ahead of a layer without the row tail would hand it rows.
+        ([DENSE, MOE, (True, False, None), MOE], None, [False, False, False, True]),
+        ([DENSE, MOE, DENSE, MOE], None, [False, False, False, True]),
+    ],
+    ids=[
+        "all",
+        "fp8-output",
+        "fp8-after-close",
+        "fp8-before-close",
+        "no-op-next",
+        "dense-next",
+    ],
+)
+def test_resident_rows_link_only_where_every_reader_reads_rows(
+    monkeypatch, layout, out_quant, expected
+):
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_RESIDUAL", "1")
+    model, config = _resident_model(monkeypatch, layout, out_quant)
+    kimi.KimiLinearModel._init_resident_rows(model, config)
+    assert _linked(model) == expected
+    sites = [layer.self_attention_attn_res for layer in model.layers[1:]]
+    for layer, site in zip(model.layers, [*sites, model.output_attn_res]):
+        moe = getattr(layer, "block_sparse_moe", None)
+        assert site.resident_from == (moe.prefix if moe and moe.resident_rows else "")
+
+
+@pytest.mark.parametrize("case", ["off", "tbo", "pp", "plugin"])
+def test_resident_rows_link_nothing_outside_one_eager_stage(monkeypatch, case):
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_RESIDUAL", "0" if case == "off" else "1")
+    model, config = _resident_model(monkeypatch, [DENSE, MOE, MOE])
+    if case == "tbo":
+        config.enable_tbo = True
+    elif case == "pp":
+        monkeypatch.setattr(kimi, "get_pp_group", lambda: SimpleNamespace(world_size=2))
+    elif case == "plugin":
+        from atom import plugin
+
+        monkeypatch.setattr(plugin, "is_plugin_mode", lambda: True)
+    kimi.KimiLinearModel._init_resident_rows(model, config)
+    assert _linked(model) == [False] * 3

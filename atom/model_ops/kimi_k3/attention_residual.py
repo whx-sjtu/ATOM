@@ -671,6 +671,9 @@ def _apply_attn_res_impl(
     quant_dtype: torch.dtype | None = None,  # folded: y = per-token quant(y)
     column_gather: str = "",
     num_blocks: int | None = None,
+    zero_addends: bool = False,  # both addends are zeros: read one zero row
+    out: torch.Tensor | None = None,  # [T, H] BF16, written in place of a new y
+    prefix_out: torch.Tensor | None = None,  # [T, H], written in place of a new sum
 ) -> (
     tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 ):
@@ -703,10 +706,14 @@ def _apply_attn_res_impl(
             raise ValueError("num_blocks must fit the supplied block bank")
         B = num_blocks
     Bp = B + 1
+    if zero_addends and (column_gather or add_hidden is not None):
+        raise ValueError("zero_addends stands in for both addends")
     # A zero pair (see `zero_addends`) is read as one shared zero row.
-    zero_pair = _take_zero_addends(add_hidden, add_hidden2) and not column_gather
-    do_add = add_hidden is not None
-    do_add2 = add_hidden2 is not None
+    zero_pair = zero_addends or (
+        _take_zero_addends(add_hidden, add_hidden2) and not column_gather
+    )
+    do_add = zero_addends or add_hidden is not None
+    do_add2 = zero_addends or add_hidden2 is not None
     gather = None
     if column_gather:
         from atom.config import get_current_atom_config
@@ -735,10 +742,16 @@ def _apply_attn_res_impl(
     )
     ps = prefix_sum.contiguous()
     sw = score_weight.contiguous()
-    y = torch.empty(
-        (T, H),
-        device=block_residual.device,
-        dtype=quant_dtype if quant else prefix_sum.dtype,
+    if out is not None and (quant or out.shape != ps.shape or out.dtype != ps.dtype):
+        raise ValueError("out must be a [T, H] mix in the prefix dtype")
+    y = (
+        out
+        if out is not None
+        else torch.empty(
+            (T, H),
+            device=block_residual.device,
+            dtype=quant_dtype if quant else prefix_sum.dtype,
+        )
     )
     # Always allocated (triton needs a tensor); size 1 and never dereferenced
     # when QUANT is False.
@@ -754,7 +767,11 @@ def _apply_attn_res_impl(
     else:
         hs = add_hidden.contiguous() if load_add else ps
         hs2 = add_hidden2.contiguous() if do_add2 else ps
-    pref = torch.empty_like(ps) if do_add else ps
+    if prefix_out is not None and (not do_add or prefix_out.shape != ps.shape):
+        raise ValueError("prefix_out must be a [T, H] sum of addends")
+    pref = ps
+    if do_add:
+        pref = torch.empty_like(ps) if prefix_out is None else prefix_out
 
     nw, ns, bl = (
         _attn_res_bf16_config(Bp, gather is not None)
@@ -1088,4 +1105,37 @@ def apply_attn_res(
         add_hidden2,
         column_gather,
         num_blocks,
+    )
+
+
+def apply_attn_res_rows(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+    out_norm_weight: torch.Tensor | None,
+    out_eps: float,
+    num_blocks: int | None,
+    out: torch.Tensor,
+    prefix_out: torch.Tensor,
+) -> None:
+    """The BF16 mix of rows whose two pending addends are zero, written into
+    ``out`` and ``prefix_out``: a row-sharded step's mix of this rank's rows.
+
+    The zeros are read as one shared zero row, and the BF16 layout is keyed on
+    the step kind rather than on T, so each row runs the kernel a full mix over
+    the registered zero pair runs on it. For use inside an opaque op."""
+    if prefix_sum.dtype != torch.bfloat16:
+        raise ValueError("row mixes are BF16")
+    _apply_attn_res_impl(
+        prefix_sum,
+        block_residual,
+        score_weight,
+        eps,
+        out_norm_weight=out_norm_weight,
+        out_eps=out_eps,
+        num_blocks=num_blocks,
+        zero_addends=True,
+        out=out,
+        prefix_out=prefix_out,
     )

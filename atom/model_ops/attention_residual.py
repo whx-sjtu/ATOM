@@ -117,6 +117,13 @@ class AttnRes(nn.Module):
         self.block_size = block_size
         self.layer_idx = layer_idx
         self.num_blocks = None if block_size is None else -(-layer_idx // block_size)
+        # Set after load to the MoE block (its static forward context name)
+        # whose row-sharded steps hand this site only its own rows of the
+        # residual; that op then mixes the rows and gathers the result, or
+        # without `resident_gather` keeps the mix on its rows for a consumer
+        # that reads this rank's rows itself.
+        self.resident_from = ""
+        self.resident_gather = True
 
     @property
     def out_quant_dtype(self) -> torch.dtype | None:
@@ -192,6 +199,24 @@ class AttnRes(nn.Module):
             if score_weight is None:  # loader hook did not run (plugin hosts)
                 self.process_weights_after_loading()
                 score_weight = self.score_weight
+            if (
+                self.resident_from
+                and isinstance(add_hidden, torch.Tensor)
+                and add_hidden2 is not None
+            ):
+                return torch.ops.aiter.kimi_k3_resident_attn_res(
+                    prefix_sum,
+                    block_residual,
+                    score_weight,
+                    self.eps,
+                    add_hidden,
+                    None if self.out_norm is None else self.out_norm.weight,
+                    self.out_eps,
+                    add_hidden2,
+                    self.num_blocks,
+                    self.resident_from,
+                    self.resident_gather,
+                )
             from atom.model_ops.kimi_k3 import apply_attn_res
 
             return apply_attn_res(
