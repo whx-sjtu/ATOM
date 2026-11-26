@@ -129,6 +129,9 @@ def stub_block_parts(monkeypatch):
     monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_CUSTOM_COMM", "0")
     monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_PYNCCL_RS_MIB", "0")
     monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_GROUP_RS", "0")
+    # INT6 turns these three on by default; the tests below that need them set 1.
+    for name in ("ATOM_KIMI_K3_ROW_SHARD_RESIDUAL", "ATOM_KIMI_K3_O_PROJ_PADDED_OUT", "ATOM_KIMI_K3_ROW_TAIL_OWNED_MIX"):
+        monkeypatch.setenv(name, "0")
     empty_like = torch.empty_like
 
     def poisoned_empty_like(*args, **kwargs):
@@ -1428,6 +1431,8 @@ def test_pad_switch_is_on_unless_0(monkeypatch):
 
 def test_resident_residual_is_off_unless_1(monkeypatch):
     monkeypatch.delenv("ATOM_KIMI_K3_ROW_SHARD_RESIDUAL", raising=False)
+    assert kimi.envs.ATOM_KIMI_K3_ROW_SHARD_RESIDUAL is True  # INT6 default
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_RESIDUAL", "0")
     assert kimi.envs.ATOM_KIMI_K3_ROW_SHARD_RESIDUAL is False
     monkeypatch.setenv("ATOM_KIMI_K3_ROW_SHARD_RESIDUAL", "1")
     assert kimi.envs.ATOM_KIMI_K3_ROW_SHARD_RESIDUAL is True
@@ -1850,6 +1855,8 @@ def test_o_proj_padded_out_is_off_unless_1(monkeypatch):
     monkeypatch.delenv("ATOM_KIMI_K3_O_PROJ_PADDED_OUT", raising=False)
     from atom.utils import envs
 
+    assert envs.ATOM_KIMI_K3_O_PROJ_PADDED_OUT is True  # INT6 default
+    monkeypatch.setenv("ATOM_KIMI_K3_O_PROJ_PADDED_OUT", "0")
     assert envs.ATOM_KIMI_K3_O_PROJ_PADDED_OUT is False
     for layer in _layers(4, _PaddedAttention):
         assert layer.self_attn.padded_out_rows is None
@@ -2124,6 +2131,8 @@ def test_owned_mix_is_off_unless_1(monkeypatch):
     monkeypatch.delenv("ATOM_KIMI_K3_ROW_TAIL_OWNED_MIX", raising=False)
     from atom.utils import envs
 
+    assert envs.ATOM_KIMI_K3_ROW_TAIL_OWNED_MIX is True  # INT6 default
+    monkeypatch.setenv("ATOM_KIMI_K3_ROW_TAIL_OWNED_MIX", "0")
     assert envs.ATOM_KIMI_K3_ROW_TAIL_OWNED_MIX is False
     assert not any(layer.owned_mix for layer in _layers(4))
     assert all(layer.owned_mix for layer in _owned_layers(monkeypatch, 4))
