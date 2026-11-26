@@ -1585,29 +1585,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Row-sharded steps keep the residual on its rows between layers: a row
     # tail skips its last gather and the next BF16 residual mix runs on this
     # rank's rows, then gathers its output. Bit-identical output. Read once
-    # after load (one PP stage, no TBO, outside plugin hosts). Off by default.
+    # after load (one PP stage, no TBO, outside plugin hosts). On by default
+    # (INT6); 0 gathers every row tail.
     # On those steps only this rank's rows of the residual and of the attn_res
     # bank are valid, and the row tail's two zero addends are uninitialized:
     # ATOM_FWD_DUMP dumps of them show garbage in the other rows.
     "ATOM_KIMI_K3_ROW_SHARD_RESIDUAL": lambda: (
-        os.getenv("ATOM_KIMI_K3_ROW_SHARD_RESIDUAL", "0") == "1"
+        os.getenv("ATOM_KIMI_K3_ROW_SHARD_RESIDUAL", "1") == "1"
     ),
     # On an eager row-sharded step with pad rows, a Kimi layer's o_proj writes
     # its partial into the leading rows of a buffer whose pad rows are zero,
     # which the reduce-scatter takes as it is instead of copying the partial
     # into a padded one (as the MoE partials do under
     # ATOM_ROW_SHARD_PAD_IN_PLACE, which this needs). Bit-identical output.
-    # Read at construction. Off by default.
+    # Read at construction. On by default (INT6).
     "ATOM_KIMI_K3_O_PROJ_PADDED_OUT": lambda: (
-        os.getenv("ATOM_KIMI_K3_O_PROJ_PADDED_OUT", "0") == "1"
+        os.getenv("ATOM_KIMI_K3_O_PROJ_PADDED_OUT", "1") == "1"
     ),
     # On a row-sharded step with pad rows, the rank whose rows run past the
     # step's end (the last) mixes the MoE input of its real rows only, reading
     # its prefix and bank rows in place, into buffers of its row count whose
     # pad rows are zero, instead of first copying those rows into padded ones.
-    # Bit-identical output. Read at construction. Off by default.
+    # Bit-identical output. Read at construction. On by default (INT6).
     "ATOM_KIMI_K3_ROW_TAIL_OWNED_MIX": lambda: (
-        os.getenv("ATOM_KIMI_K3_ROW_TAIL_OWNED_MIX", "0") == "1"
+        os.getenv("ATOM_KIMI_K3_ROW_TAIL_OWNED_MIX", "1") == "1"
     ),
     # The next residual mix reads a row-sharded step's zero addends as one zero row.
     # Bit-identical output. On by default; 0 reads the zero tensors themselves.
